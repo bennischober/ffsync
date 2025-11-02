@@ -1,5 +1,9 @@
 mod types;
-mod stream;
+mod chunker;
+mod hasher;
+mod pipeline;
 
 pub use types::{Chunk, ChunkEvent};
-pub use stream::{chunk_and_hash, ChunkConfig};
+pub use chunker::{Chunker, FixedChunker, FastCDCChunker};
+pub use hasher::{Hasher, Blake3Hasher};
+pub use pipeline::{process_file, PipelineConfig};

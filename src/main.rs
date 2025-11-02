@@ -1,7 +1,6 @@
 mod chunking;
-
-use tokio::fs::{File, OpenOptions};
-use chunking::{chunk_and_hash, ChunkConfig, ChunkEvent};
+use crate::chunking::*;
+use std::time::Instant;
 
 fn create_large_file() -> std::io::Result<()> {
     use std::fs::OpenOptions;
@@ -33,25 +32,46 @@ fn create_large_file() -> std::io::Result<()> {
 async fn main() -> std::io::Result<()> {
     // let result = create_large_file();
 
-    let file = File::open("large_file.bin").await?;
+    let path = std::path::Path::new("D:\\Video\\LORD OF WAR\\title_t00.mkv");
+    let config = PipelineConfig::default();
 
-    let config = ChunkConfig::default();
-    let start_time = tokio::time::Instant::now();
-    let mut rx = chunk_and_hash(file, config, 100).await?;
+    // Test Fixed-size chunking
+    {
+        let start = Instant::now();
+        let chunker = FixedChunker::new(700 * 1024); // 700KB chunks
+        let hasher = Blake3Hasher;
+        let rx = process_file(path, chunker, hasher, &config)?;
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            ChunkEvent::Chunk(chunk) => {
-                // println!("Chunk at offset {}: {} bytes, hash: {:?}",
-                //          chunk.offset, chunk.length, chunk.hash);
-            }
-            ChunkEvent::Done => {
-                let duration = start_time.elapsed();
-                println!("Chunking finished in: {:?}", duration);
-                break;
+        let mut count = 0;
+        while let Ok(event) = rx.recv() {
+            if matches!(event, ChunkEvent::Chunk(_)) {
+                count += 1;
             }
         }
+
+        println!("Fixed (700KB): {} chunks in {:?}", count, start.elapsed());
     }
+
+    // Test FastCDC chunking
+    // {
+    //     let start = Instant::now();
+    //     let chunker = FastCDCChunker::new(
+    //         256 * 1024,
+    //         1024 * 1024,
+    //         4 * 1024 * 1024,
+    //     );
+    //     let hasher = Blake3Hasher;
+    //     let rx = process_file(path, chunker, hasher, &config)?;
+    //
+    //     let mut count = 0;
+    //     while let Ok(event) = rx.recv() {
+    //         if matches!(event, ChunkEvent::Chunk(_)) {
+    //             count += 1;
+    //         }
+    //     }
+    //
+    //     println!("FastCDC: {} chunks in {:?}", count, start.elapsed());
+    // }
 
     Ok(())
 }
