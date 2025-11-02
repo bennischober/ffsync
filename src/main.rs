@@ -35,33 +35,16 @@ async fn main() -> std::io::Result<()> {
     let path = std::path::Path::new("D:\\Video\\LORD OF WAR\\title_t00.mkv");
     let config = PipelineConfig::default();
 
-    // Test Fixed-size chunking
-    {
-        let start = Instant::now();
-        let chunker = FixedChunker::new(700 * 1024); // 700KB chunks
-        let hasher = Blake3Hasher;
-        let rx = process_file(path, chunker, hasher, &config)?;
-
-        let mut count = 0;
-        while let Ok(event) = rx.recv() {
-            if matches!(event, ChunkEvent::Chunk(_)) {
-                count += 1;
-            }
-        }
-
-        println!("Fixed (700KB): {} chunks in {:?}", count, start.elapsed());
-    }
-
-    // Test FastCDC chunking
+    // // Test Fixed-size chunking
     // {
     //     let start = Instant::now();
-    //     let chunker = FastCDCChunker::new(
-    //         256 * 1024,
-    //         1024 * 1024,
-    //         4 * 1024 * 1024,
-    //     );
     //     let hasher = Blake3Hasher;
-    //     let rx = process_file(path, chunker, hasher, &config)?;
+    //     let rx = process_file(
+    //         path,
+    //         || FixedChunker::new(700 * 1024), // Factory closure
+    //         hasher,
+    //         &config
+    //     )?;
     //
     //     let mut count = 0;
     //     while let Ok(event) = rx.recv() {
@@ -70,8 +53,28 @@ async fn main() -> std::io::Result<()> {
     //         }
     //     }
     //
-    //     println!("FastCDC: {} chunks in {:?}", count, start.elapsed());
+    //     println!("Fixed (700KB): {} chunks in {:?}", count, start.elapsed());
     // }
+
+    // Test FastCDC chunking
+    {
+        let start = Instant::now();
+        let rx = process_file(
+            path,
+            || FastCDCChunker::new(256 * 1024, 1024 * 1024, 4 * 1024 * 1024),
+            Blake3Hasher,
+            &config
+        )?;
+
+        let mut count = 0;
+        while let Ok(event) = rx.recv() {
+            if matches!(event, ChunkEvent::Chunk(_)) {
+                count += 1;
+            }
+        }
+
+        println!("FastCDC: {} chunks in {:?}", count, start.elapsed());
+    }
 
     Ok(())
 }
