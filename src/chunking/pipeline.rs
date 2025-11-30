@@ -22,7 +22,7 @@ impl Default for PipelineConfig {
         Self {
             read_buffer_size: 256 * 1024 * 1024,
             chunk_queue_size: 2000,
-            hash_workers: cores + cores / 2,
+            hash_workers: cores,
         }
     }
 }
