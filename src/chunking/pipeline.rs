@@ -11,17 +11,18 @@ use super::hasher::Hasher;
 use super::types::{Chunk, ChunkEvent};
 
 pub struct PipelineConfig {
-    pub read_buffer_size: usize,  // Size of read chunks from mmap
+    pub read_buffer_size: usize,
     pub chunk_queue_size: usize,
     pub hash_workers: usize,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
+        let cores = num_cpus::get();
         Self {
-            read_buffer_size: 256 * 1024 * 1024, // Process 128MB at a time
+            read_buffer_size: 256 * 1024 * 1024,
             chunk_queue_size: 2000,
-            hash_workers: num_cpus::get(),
+            hash_workers: cores + cores / 2,
         }
     }
 }
@@ -48,9 +49,8 @@ where
     let (chunk_tx, chunk_rx) = channel::bounded(config.chunk_queue_size);
     let (result_tx, result_rx) = channel::bounded(config.chunk_queue_size);
 
-    // Parallel chunking threads (FastCDC can process independent regions)
     let total_size = mmap.len();
-    let chunk_threads = config.hash_workers; // Use same as hash workers
+    let chunk_threads = config.hash_workers;
     let region_size = config.read_buffer_size;
 
     for thread_id in 0..chunk_threads {
@@ -68,10 +68,13 @@ where
                 for boundary in chunker.chunk(buffer) {
                     let chunk_offset = buffer_start as u64 + boundary.offset as u64;
 
-                    if chunk_tx.send(ChunkWork {
-                        offset: chunk_offset,
-                        length: boundary.length,
-                    }).is_err() {
+                    if chunk_tx
+                        .send(ChunkWork {
+                            offset: chunk_offset,
+                            length: boundary.length,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -81,7 +84,6 @@ where
 
     drop(chunk_tx);
 
-    // Parallel hashing workers
     let hasher = Arc::new(hasher);
     let hash_workers = config.hash_workers;
 
@@ -93,8 +95,9 @@ where
 
         thread::spawn(move || {
             while let Ok(work) = chunk_rx.recv() {
-                let data = &mmap_clone[work.offset as usize..(work.offset + work.length as u64) as usize];
-                let hash = hasher.hash(&data);
+                let data =
+                    &mmap_clone[work.offset as usize..(work.offset + work.length as u64) as usize];
+                let hash = hasher.hash(data);
 
                 let chunk = Chunk {
                     offset: work.offset,
@@ -103,16 +106,14 @@ where
                 };
 
                 if result_tx.send(ChunkEvent::Chunk(chunk)).is_err() {
-                    break;
+                    return;
                 }
             }
         });
     }
 
-    // Drop original senders so receivers know when done
     drop(chunk_rx);
 
-    // Completion monitor thread
     thread::spawn(move || {
         drop(result_tx);
     });

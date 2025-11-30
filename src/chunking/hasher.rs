@@ -10,6 +10,12 @@ pub struct Blake3Hasher;
 
 impl Hasher for Blake3Hasher {
     fn hash(&self, data: &[u8]) -> Hash {
-        blake3::hash(data)
+        if data.len() > 512 * 1024 {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_rayon(data);
+            hasher.finalize()
+        } else {
+            blake3::hash(data)
+        }
     }
 }
