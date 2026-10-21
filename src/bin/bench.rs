@@ -18,11 +18,11 @@ use ffsync::chunking::{
 use ffsync::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
 use rand::RngCore;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// FastCDC lower bound used for every scan.
 const CHUNK_MIN: u32 = 256 * 1024;
@@ -134,11 +134,38 @@ struct RsyncRow {
     mode: &'static str,
     wall: Duration,
     transferred: Option<u64>,
+    matched: Option<u64>,
+}
+
+/// How the rsync comparison is executed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RsyncMode {
+    /// `rsync` binary on the Windows PATH (also the only mode on Linux).
+    Native,
+    /// `rsync` inside a WSL distro, invoked via `wsl.exe --exec`.
+    Wsl,
+}
+
+impl RsyncMode {
+    /// Label used in the report header and the JSON output.
+    fn label(self) -> &'static str {
+        match self {
+            RsyncMode::Native => "native",
+            RsyncMode::Wsl => "wsl",
+        }
+    }
+}
+
+/// Outcome of probing for an rsync to compare against.
+enum RsyncProbe {
+    Available(RsyncMode),
+    Unavailable(String),
 }
 
 /// Result of the optional rsync comparison.
 struct RsyncResults {
-    available: bool,
+    /// `Some` when the comparison ran, `None` when it was skipped.
+    mode: Option<RsyncMode>,
     rows: Vec<RsyncRow>,
 }
 
@@ -152,7 +179,7 @@ Options:
   --size-mib <N>   fixture size in MiB (default: {})
   --quick          use a {} MiB fixture for a fast run
   --out-dir <path> directory for fixtures and scratch output (default: {})
-  --rsync          additionally compare against rsync (needs rsync on PATH)
+  --rsync          additionally compare against rsync (native, or via WSL)
   --json           print a machine-readable JSON summary as the last line
   -h, --help       show this help",
         DEFAULT_SIZE_MIB, QUICK_SIZE_MIB, DEFAULT_OUT_DIR
@@ -596,26 +623,181 @@ fn print_summary(results: &[ScenarioResult]) {
     }
 }
 
+/// Probes for an rsync to compare against, in order of preference:
+///
+/// 1. native: `rsync --version` on the PATH (also the only mode on Linux),
+/// 2. WSL: `wsl.exe --exec rsync --version` (Windows fallback),
+/// 3. neither: a reason string for the skip message.
+fn probe_rsync() -> RsyncProbe {
+    let native = Command::new("rsync").arg("--version").output();
+    match native {
+        Ok(out) if out.status.success() => return RsyncProbe::Available(RsyncMode::Native),
+        // Found but failing is treated as absent so the WSL fallback applies.
+        _ => {}
+    }
+
+    // Sentinel: every distro has /bin/true. If this fails, WSL is absent,
+    // broken, or has no installed distro at all.
+    match wsl_command().arg("/bin/true").output() {
+        Err(_) => {
+            return RsyncProbe::Unavailable(
+                "rsync not found on PATH and WSL (wsl.exe) is unavailable \
+                 (this comparison can be run on Linux, or on Windows inside WSL)"
+                    .to_string(),
+            );
+        }
+        Ok(out) if !out.status.success() => {
+            return RsyncProbe::Unavailable(
+                "rsync not found on PATH and WSL has no usable distro \
+                 (install one with `wsl.exe --install`, then install rsync inside it)"
+                    .to_string(),
+            );
+        }
+        Ok(_) => {}
+    }
+
+    if let Ok(out) = wsl_command().args(["rsync", "--version"]).output() {
+        if out.status.success() {
+            return RsyncProbe::Available(RsyncMode::Wsl);
+        }
+        return RsyncProbe::Unavailable(
+            "rsync is not installed inside the WSL distro \
+             (install it there, e.g. `wsl.exe sudo apt install rsync`)"
+                .to_string(),
+        );
+    }
+    RsyncProbe::Unavailable(
+        "rsync not found on PATH and it could not be probed inside WSL \
+         (this comparison can be run on Linux, or on Windows inside WSL)"
+            .to_string(),
+    )
+}
+
+/// Builds a `wsl.exe --exec <program> <args...>` command. `--exec` bypasses
+/// the default shell (`/bin/sh -c`), which would otherwise mangle backslashes
+/// and verbatim `\\?\` path prefixes in the arguments.
+fn wsl_command() -> Command {
+    let mut cmd = Command::new("wsl.exe");
+    cmd.arg("--exec");
+    cmd
+}
+
+/// Translates a Windows path to its WSL (`/mnt/...`) equivalent.
+///
+/// Preferred: canonicalize to an absolute Windows path, then ask the distro
+/// itself via `wslpath -a -u`, so drive mapping comes from WSL's own rules.
+/// Falls back to a manual `X:\dir\file` -> `/mnt/x/dir/file` translation if
+/// `wslpath` fails. Never invokes a shell: arguments stay separate.
+fn to_wsl_path(path: &Path) -> io::Result<String> {
+    // Canonicalize the deepest existing ancestor: the file itself may not
+    // exist yet (the destination is (re)written for every mode), but its
+    // parent directory is created up front.
+    let canonical = match fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                io::Error::other(format!("{} has no parent directory", path.display()))
+            })?;
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| io::Error::other(format!("{} has no file name", path.display())))?;
+            fs::canonicalize(parent)?.join(file_name)
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot canonicalize {} for WSL: {}", path.display(), e),
+            ));
+        }
+    };
+    // Forward slashes: wslpath accepts them, and they survive any shell-free
+    // argument passing. Strip the verbatim `\\?\` prefix that canonicalize
+    // produces on Windows, which wslpath cannot interpret.
+    let windows = canonical.to_string_lossy().replace('\\', "/");
+    let windows = windows
+        .strip_prefix("//?/")
+        .map(|rest| rest.to_string())
+        .unwrap_or(windows);
+
+    let mut cmd = wsl_command();
+    cmd.args(["wslpath", "-a", "-u", &windows]);
+    if let Ok(out) = cmd.output()
+        && out.status.success()
+    {
+        let converted = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if converted.starts_with('/') {
+            return Ok(converted);
+        }
+    }
+
+    // Manual fallback: `X:/dir/file` -> `/mnt/x/dir/file`.
+    let bytes = windows.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        let mut manual = String::from("/mnt/");
+        manual.push(bytes[0].to_ascii_lowercase() as char);
+        manual.push_str(&windows[2..]);
+        return Ok(manual);
+    }
+    Err(io::Error::other(format!(
+        "wslpath failed and {:?} is not a drive-letter path",
+        windows
+    )))
+}
+
+/// Runs one timed rsync invocation (`rsync -a --stats <extra> src dst`),
+/// returning (stats stdout, wall time).
+fn run_rsync_once(
+    mode: RsyncMode,
+    mode_name: &str,
+    extra_args: &[&str],
+    src: &str,
+    dst: &str,
+) -> io::Result<(String, Duration)> {
+    let mut cmd = match mode {
+        RsyncMode::Native => {
+            let mut cmd = Command::new("rsync");
+            cmd.args(["-a", "--stats"]).args(extra_args);
+            cmd
+        }
+        RsyncMode::Wsl => {
+            let mut cmd = wsl_command();
+            cmd.args(["rsync", "-a", "--stats"]).args(extra_args);
+            cmd
+        }
+    };
+    cmd.arg(src).arg(dst);
+
+    let start = Instant::now();
+    let out = cmd.output()?;
+    let wall = start.elapsed();
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "rsync ({}) failed: {}",
+            mode_name,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok((String::from_utf8_lossy(&out.stdout).to_string(), wall))
+}
+
 /// Runs the optional rsync comparison for the modified scenario.
 fn run_rsync_comparison(
     cfg: &BenchConfig,
     source: &Path,
     variants: &[(Scenario, PathBuf)],
 ) -> io::Result<RsyncResults> {
-    // Probe for rsync; on plain Windows it is typically absent.
-    let probe = Command::new("rsync").arg("--version").output();
-    if probe.is_err() || !probe.as_ref().unwrap().status.success() {
-        println!();
-        println!(
-            "rsync comparison skipped: rsync not found on PATH. \
-             This comparison must be run on Linux/WSL \
-             (e.g. `cargo run --bin bench -- --quick --rsync` inside WSL)."
-        );
-        return Ok(RsyncResults {
-            available: false,
-            rows: Vec::new(),
-        });
-    }
+    let probe = probe_rsync();
+    let mode = match probe {
+        RsyncProbe::Available(mode) => mode,
+        RsyncProbe::Unavailable(reason) => {
+            println!();
+            println!("rsync comparison skipped: {}.", reason);
+            return Ok(RsyncResults {
+                mode: None,
+                rows: Vec::new(),
+            });
+        }
+    };
 
     let variant = &variants
         .iter()
@@ -623,6 +805,8 @@ fn run_rsync_comparison(
         .expect("modified variant fixture")
         .1;
 
+    // In WSL mode, every path handed to rsync must be translated first, so
+    // the working directories are materialized before that point.
     let src_dir = cfg.out_dir.join("rsync_src");
     let dst_dir = cfg.out_dir.join("rsync_dst");
     fs::create_dir_all(&src_dir)?;
@@ -631,79 +815,117 @@ fn run_rsync_comparison(
     let dst_file = dst_dir.join("A.bin");
     fs::copy(source, &src_file)?;
 
-    let modes: [(&str, &[&str]); 3] = [
+    let (src_arg, dst_arg) = match mode {
+        RsyncMode::Native => (
+            src_file.to_string_lossy().to_string(),
+            dst_file.to_string_lossy().to_string(),
+        ),
+        RsyncMode::Wsl => (to_wsl_path(&src_file)?, to_wsl_path(&dst_file)?),
+    };
+
+    let modes: [(&str, &[&str]); 4] = [
         ("default", &[]),
         ("whole-file", &["--whole-file"]),
         ("checksum", &["--checksum"]),
+        // Force delta transmission: rsync disables its delta algorithm for
+        // same-host (local) copies, so the default row would otherwise be a
+        // full-file copy and say nothing about rsync's delta behavior. This
+        // is the closest same-host analog to a real network transfer.
+        ("delta (--no-W)", &["--no-whole-file", "--no-implied-dirs"]),
     ];
 
     let mut rows = Vec::new();
-    for (mode, extra_args) in modes {
+    for (mode_name, extra_args) in modes {
         // Reset the destination to the variant (old state) for every mode.
         fs::copy(variant, &dst_file)?;
-        let start = Instant::now();
-        let out = Command::new("rsync")
-            .arg("-a")
-            .arg("--stats")
-            .args(extra_args)
-            .arg(&src_file)
-            .arg(&dst_file)
-            .output()?;
-        let wall = start.elapsed();
-        if !out.status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "rsync ({}) failed: {}",
-                    mode,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            ));
-        }
+        // Separate mtimes: `fs::copy` preserves the source's mtime on Windows,
+        // so src and dst can share the same whole-second timestamp and rsync's
+        // size+mtime quick check would skip the file and report a bogus
+        // `0 B transferred`. Backdate the destination relative to the source.
+        let src_mtime = fs::metadata(&src_file)?.modified()?;
+        let older = src_mtime
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let times = FileTimes::new().set_accessed(older).set_modified(older);
+        let dst = OpenOptions::new().write(true).open(&dst_file)?;
+        dst.set_times(times).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot backdate mtime of {}: {}", dst_file.display(), e),
+            )
+        })?;
+        let (stdout, wall) = run_rsync_once(mode, mode_name, extra_args, &src_arg, &dst_arg)?;
 
-        // Best-effort extraction of the transferred size from --stats output.
+        // Extract rsync's wire-bytes metric from --stats output.
+        //
+        // Careful: "Total transferred file size" is the total size of the
+        // files that were transferred, NOT the bytes put on the wire — it
+        // reports the full file size even when the delta algorithm matched
+        // 98% of the data. The actual payload rsync sent as data is
+        // "Literal data" (the complement of "Matched data"); "Total bytes
+        // sent" additionally includes file-list and protocol overhead.
         let mut transferred = None;
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut matched = None;
         for line in stdout.lines() {
-            if let Some(rest) = line.strip_prefix("Total transferred file size:") {
-                let digits = rest
-                    .trim()
+            let parse = |prefix: &str| -> Option<u64> {
+                let rest = line.strip_prefix(prefix)?;
+                rest.trim()
                     .trim_end_matches("bytes")
                     .trim()
-                    .replace(',', "");
-                transferred = digits.parse::<u64>().ok();
+                    .replace(',', "")
+                    .parse::<u64>()
+                    .ok()
+            };
+            if transferred.is_none() {
+                transferred = parse("Literal data:");
+            }
+            if matched.is_none() {
+                matched = parse("Matched data:");
             }
         }
         rows.push(RsyncRow {
-            mode,
+            mode: mode_name,
             wall,
             transferred,
+            matched,
         });
     }
     Ok(RsyncResults {
-        available: true,
+        mode: Some(mode),
         rows,
     })
 }
 
 /// Prints the rsync comparison table.
 fn print_rsync_report(rsync: &RsyncResults) {
-    if !rsync.available {
-        return; // skip line was already printed by the comparison itself
-    }
+    let mode = match rsync.mode {
+        Some(mode) => mode,
+        None => return, // skip line was already printed by the comparison itself
+    };
     println!();
-    println!("==== rsync comparison (scenario: modified) ====");
-    println!("{:<12} {:>10} {:>14}", "mode", "wall", "transferred");
+    println!(
+        "==== rsync comparison (scenario: modified, via {}) ====",
+        mode.label()
+    );
+    println!(
+        "{:<16} {:>10} {:>14} {:>14}",
+        "mode", "wall", "transferred", "matched"
+    );
     for row in &rsync.rows {
         let transferred = match row.transferred {
             Some(bytes) => fmt_bytes(bytes),
             None => "n/a".to_string(),
         };
+        let matched = match row.matched {
+            Some(bytes) => fmt_bytes(bytes),
+            None => "n/a".to_string(),
+        };
         println!(
-            "{:<12} {:>10} {:>14}",
+            "{:<16} {:>10} {:>14} {:>14}",
             row.mode,
             fmt_ms(row.wall),
-            transferred
+            transferred,
+            matched
         );
     }
 }
@@ -751,9 +973,12 @@ fn emit_json(cfg: &BenchConfig, results: &[ScenarioResult], rsync: Option<&Rsync
     out.push_str("],\"rsync\":");
     match rsync {
         None => out.push_str("null"),
-        Some(r) if !r.available => out.push_str("{\"available\":false}"),
+        Some(r) if r.mode.is_none() => out.push_str("{\"available\":false}"),
         Some(r) => {
-            out.push_str("{\"available\":true,\"rows\":[");
+            out.push_str(&format!(
+                "{{\"available\":true,\"via\":\"{}\",\"rows\":[",
+                r.mode.unwrap().label()
+            ));
             for (i, row) in r.rows.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
