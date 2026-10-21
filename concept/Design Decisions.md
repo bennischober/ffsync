@@ -110,6 +110,26 @@ temp file is deleted and the original untouched.
 `.a.mkv.ffsync-tmp` from the concept doc. Accepted for now; revisit when the
 network layer lands (a hidden-file convention may be preferable).
 
+## D13 — Transport plan: plain TCP in v0.1, QUIC as the v0.2 default
+
+**Decision:** v0.1 runs over one plain TCP stream (plaintext, LAN or inside an
+SSH tunnel). QUIC — not raw TCP hardening — is the default v0.2 transport plan.
+
+**Reasoning:** QUIC solves problems v0.1 does not have (packet-loss
+resilience on lossy WANs via per-stream recovery, 0-RTT reconnects, connection
+migration across network changes) and its UDP basis is also the foundation for
+NAT traversal in the peer-to-peer direction. The deep-research analysis
+(`Deep Research Digest.md`, document 2) quantifies what direct-only
+connectivity costs: ~20–25% of internet peer pairs need a relay (symmetric
+NATs), so v0.1's TCP/SSH-tunnel scope keeps that entire second project out
+until the core engine is proven. Deferring QUIC is a scope decision, not a
+rejection; connection migration alone makes it the right fit for the
+"friend over the internet" scenario v0.1 cannot serve.
+
+**Wire mapping:** the framing in `concept/Protocol v0.1.md` §3 is
+transport-agnostic by construction; §14.4 reserves parallel streams, and the
+digest's F3 registers the v0.2 evaluation (quinn vs. iroh vs. ant-quic).
+
 ## D7 — Reconstruction I/O will need batching and parallelism (known flaw)
 
 **Decision:** accept the current single-threaded `Reconstructor` for now; do
