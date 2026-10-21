@@ -15,3 +15,8 @@ crossbeam = "0.8.4"
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
