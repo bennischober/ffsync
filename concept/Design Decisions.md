@@ -72,7 +72,10 @@ also keeps the door open for zero-copy sends from the mmap during transfer.
 **Decision:** the BLAKE3 root hash of a file serves simultaneously as (a) the
 Phase-2 identity check, (b) the end-to-end integrity verification after
 reconstruction, and (c) a "trust mode" equivalent of rsync's `-c` /
-`--checksum` flag.
+`--checksum` flag. Progress and phase reporting (chunks hashed, bytes matched
+vs. missing, effective throughput) is part of this decision: the pipeline
+already produces these signals, and the tool must surface them — silent
+hashing was the original motivation for this project.
 
 **Reasoning:** rsync's default mtime/size change detection is a heuristic that
 can miss changes (or force pointless transfers). rsync users pay a full extra

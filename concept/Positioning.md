@@ -16,6 +16,20 @@ network was silent. The tool gave almost no visibility into this, even in
 verbose mode. The conclusion that started this project: *it should not take that
 long to just hash a file and then send it.*
 
+Two separate lessons came out of this:
+
+1. **Cold starts repeat.** Five runs meant five full scans of the same data.
+   rsync is amnesiac — it rescans everything from scratch every run, even if
+   nothing changed. A tool that *remembers* (persistent chunk/root-hash index)
+   turns the second and every subsequent sync into a near-instant operation.
+   This, not raw hashing speed, is the core product insight.
+2. **Visibility is a feature.** A sync tool that spends 12 minutes hashing must
+   say so: phase, progress (chunks hashed / total), bytes matched vs. missing,
+   effective throughput, and an honest estimate of what is left. Content-
+   addressed chunking makes all of these metrics fall out of the pipeline for
+   free — progress reporting should be designed in from the protocol up, not
+   bolted on.
+
 ## What is actually slow in rsync
 
 rsync's delta algorithm is single-threaded per file. The sender computes a
