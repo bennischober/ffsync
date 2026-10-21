@@ -6,12 +6,17 @@ Guidance for AI coding agents (and humans) working in this repository.
 
 `ffsync` is a file synchronization tool written in Rust that syncs data at the
 chunk level to minimize transfer and I/O, similar in spirit to rsync. It is in
-an early prototype stage: the chunking/hashing pipeline and file reconstruction
-exist; metadata exchange, sync-plan generation, and the network protocol are not
-implemented yet.
+an early prototype stage: the chunking/hashing pipeline, file reconstruction,
+and a benchmark harness exist; metadata exchange, sync-plan generation, and the
+network protocol are not implemented yet.
 
 Design documents (read before making architectural changes):
 
+- `concept/Positioning.md` — why this project exists, the niche, the decision
+  framework (link speed decides what matters), and the rejected
+  "build around rsync" alternatives
+- `concept/Design Decisions.md` — recorded decisions with reasoning and
+  alternatives; add new decisions there, do not silently change old ones
 - `concept/File Synchronisation Workflow.md` — the four-phase sync pipeline
   (shallow → medium → deep diff, then pipelined transfer and reconstruction)
 - `concept/File Reconstruction.md` — out-of-place reconstruction with a
@@ -27,10 +32,16 @@ Design documents (read before making architectural changes):
 | `cargo check --tests` | Fast compile check including tests |
 | `cargo test` | Run unit and integration tests (`tests/integration.rs`) |
 | `cargo run` | Run `main.rs` (currently a manual benchmark harness with a hardcoded local file path) |
+| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--rsync`, `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
 | `cargo clippy` | Lint (no `clippy.toml`) |
 
-Toolchain: current stable Rust, edition 2024.
+Toolchain: current stable Rust, edition 2024. The crate is a lib + two bins
+(`ffsync`, `bench`); tests import via `ffsync::chunking` / `ffsync::reconstruction`.
+
+The `--rsync` bench flag compares against rsync when available; on Windows it
+falls back to WSL (`wsl.exe` + `wslpath` translation). Paths are passed as
+separate args (never through a shell) so spaces are safe.
 
 The crate may be mid-refactor and fail to compile. Before starting work, run
 `cargo check --tests` to establish a baseline so you know which errors are
@@ -38,8 +49,16 @@ pre-existing.
 
 ## Architecture
 
+- `src/lib.rs` — lib target exposing `chunking` and `reconstruction` (the
+  integration test and the bench binary import through it).
 - `src/main.rs` — binary entry point; currently a scratch/benchmark harness,
   not a stable API.
+- `src/bin/bench.rs` — the benchmark harness: generates fixture variants
+  (identical / modified / appended / fresh), scans both sides through the real
+  pipeline, simulates the delta against a hash set, reconstructs the target
+  through the real `Reconstructor` with hash verification, and projects
+  transfer times across link speeds and zstd ratios. Optional `--rsync`
+  comparison (native or via WSL). Zero dependencies beyond the crate's own.
 - `src/chunking/` — the core data pipeline. The public API is re-exported from
   `mod.rs`.
   - `pipeline.rs` — `process_file()` is the entry point: it memory-maps the
@@ -87,15 +106,18 @@ pre-existing.
 - The reconstructor's temp path is derived with
   `Path::with_extension("ffsync-tmp")`, which *replaces* the last extension
   (`a.mkv` → `a.ffsync-tmp`). This differs from the `<.file.ext.ffsync-tmp>`
-  naming in the concept doc.
+  naming in the concept doc (recorded as D6 in `concept/Design Decisions.md`).
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
-- Never commit generated artifacts (`large_file.bin`, `partial_file.bin`,
-  `test_*.bin`) or credentials (`.opencode/` holds local-only configuration).
+- Never commit generated artifacts. `.gitignore` covers `*.bin` and
+  `/bench_tmp/` (bench fixtures); `.opencode/` holds local-only configuration
+  and credentials.
 
 ## Roadmap (from the concept docs)
 
 Not yet implemented: metadata scan and triage (Phase 1), file-level BLAKE3
 root-hash exchange (Phase 2), live chunk diffing and `SyncPlan` generation
 (Phase 3), and the network transfer/protocol layer including Zstd compression
-(Phase 4).
+(Phase 4). See `concept/Design Decisions.md` D5 (checksum-based change
+detection), D8 (link-adaptive diff strategy), and D10 (resume state, open) for
+the design questions the protocol work must answer.
