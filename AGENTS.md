@@ -17,6 +17,10 @@ Design documents (read before making architectural changes):
   "build around rsync" alternatives
 - `concept/Design Decisions.md` — recorded decisions with reasoning and
   alternatives; add new decisions there, do not silently change old ones
+- `concept/Protocol v0.1.md` — draft wire protocol for the first working
+  sync: framing, handshake, manifest/plan/data flow, verification, resume.
+  Implementation should follow it; deviations are protocol bugs unless the
+  spec is updated first
 - `concept/File Synchronisation Workflow.md` — the four-phase sync pipeline
   (shallow → medium → deep diff, then pipelined transfer and reconstruction)
 - `concept/File Reconstruction.md` — out-of-place reconstruction with a

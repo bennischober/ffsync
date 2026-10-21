@@ -174,3 +174,37 @@ mid-phase disconnect leaves partial state on both ends. Options:
 
 A mid-transfer disconnect simulation (planned harness extension) should be
 built before deciding.
+
+## D11 — mtime/size fast path, with a checksum-only trust mode
+
+**Decision:** by default, sync skips files whose (size, mtime) match on both
+peers — rsync's standard semantics, including its mtime trust caveats (FAT
+2-second granularity, network filesystem clocks). An explicit `--checksum`-style
+mode ignores metadata entirely and always compares BLAKE3 root hashes.
+
+**Reasoning:** the fast path makes "nothing changed" syncs cost zero file I/O,
+which matters for repeated syncs and directory syncs later. Because the root
+hash falls out of the chunking pipeline for free (D5), the paranoid mode is
+also free — users pay only in scan time, never in an extra pass.
+
+**Wire mapping:** a `trust_times` flag in the protocol handshake
+(`concept/Protocol v0.1.md` §4). Protocol-level framing decisions (little-
+endian framing, exact-match rule) are recorded there and in D12.
+
+## D12 — Exact (hash, length) matching for local chunk reuse
+
+**Decision:** a sender-side chunk is reusable locally on the receiver only on
+an exact `(hash, length)` match against a manifest entry. The receiver never
+sub-slices or merges manifest entries; chunks that do not match exactly fall
+back to remote transfer.
+
+**Reasoning:** content inside a chunk cannot be verified without re-hashing it,
+and sub-slicing would reintroduce rsync-style offset matching through the back
+door — complexity with no measurable win at megabyte chunk sizes.
+
+**Accepted cost:** after a modification, CDC boundaries shift for roughly one
+max-chunk-size until the rolling window re-synchronizes; chunks in that window
+over-send even though the bytes exist locally. The over-send is bounded
+(~2 × max_chunk_size near modification regions) and correctness is unaffected;
+identical CDC parameters on both peers maximize local reuse.
+
