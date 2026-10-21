@@ -1,11 +1,10 @@
-mod chunking;
-use crate::chunking::*;
+use ffsync::chunking::*;
 use std::time::Instant;
 
 fn create_large_file() -> std::io::Result<()> {
+    use rand::Rng;
     use std::fs::OpenOptions;
     use std::io::Write;
-    use rand::Rng;
 
     let mut rng = rand::rng();
 
@@ -63,7 +62,7 @@ async fn main() -> std::io::Result<()> {
             path,
             || FastCDCChunker::new(256 * 1024, 1024 * 1024, 4 * 1024 * 1024),
             Blake3Hasher,
-            &config
+            &config,
         )?;
 
         let mut count = 0;
