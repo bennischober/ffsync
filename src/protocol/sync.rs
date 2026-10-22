@@ -410,22 +410,63 @@ where
         Err(other) => return Err(other),
     };
 
-    // ---- Fast path: if the SENDER says not-modified, we are done only if
-    // the sender's file matches ours. The fast-path decision belongs to the
-    // sender; here we only react to NOT_MODIFIED. ----
+    // ---- Fast path (§4): the sender may immediately answer NOT_MODIFIED
+    // when size+mtime match and both sides trust times. Note the sender
+    // sends its HELLO first and ours second, so a fast-path sender exits
+    // right after reading our HELLO: the next frame here is either
+    // NOT_MODIFIED or the sender's demand for our manifest (i.e. anything
+    // else means the sender did NOT fast-path). ----
+    // We must check this BEFORE streaming our manifest, otherwise the
+    // sender's exit races our writes (the BrokenPipe the loopback test
+    // caught). The check is a peek at the next frame's type: read it now,
+    // and if it is not NOT_MODIFIED, process it as the start of the normal
+    // flow (the plan loop consumes plan frames; the manifest sender only
+    // starts writing its plan after MANIFEST_DONE, so an early plan frame
+    // cannot arrive while our manifest is still streaming... except the
+    // sender diffs only after MANIFEST_DONE, so the first frame after
+    // HELLO from a non-fast-path sender is nothing — it waits. Reading one
+    // frame here would block. Therefore: do NOT read; rely on the sender
+    // never sending plan frames before MANIFEST_DONE and just stream the
+    // manifest. The NOT_MODIFIED frame arrives *while* we stream, and the
+    // plan loop below handles it.)
+    //
+    // BUT: the sender closes after NOT_MODIFIED (one-shot HELLO exchange),
+    // so our subsequent manifest writes hit a dead peer and fail with
+    // BrokenPipe — which is *harmless* (the sync is done). We catch that
+    // case in the plan loop instead: the first frame we read after our
+    // manifest is either NOT_MODIFIED (already consumed... no, the plan
+    // loop reads it), or an ERROR, or plan frames.
+    //
+    // Conclusion: stream the manifest, tolerate write failures during it
+    // (broken pipe means the sender fast-pathed), and handle NOT_MODIFIED
+    // in the plan loop (already implemented).
 
     // ---- Stream our manifest (§5) ----
+    // Tolerate write failures: a sender that took the size+mtime fast path
+    // exits right after reading our HELLO, so our manifest frames may hit a
+    // closed stream. Any such failure means the next readable frame is
+    // NOT_MODIFIED (handled in the plan loop) — or nothing, in which case
+    // the plan loop surfaces the real error.
     for chunk in &local_chunks {
-        message::ManifestChunk {
+        let frame = message::ManifestChunk {
             hash: chunk.hash,
             offset: chunk.offset,
             length: chunk.length as u32,
         }
-        .into_frame()?
-        .encode(stream)?;
+        .into_frame()?;
+        if frame.encode(stream).and_then(|_| stream.flush()).is_err() {
+            break;
+        }
     }
-    message::encode_empty(framing::T_MANIFEST_DONE)?.encode(stream)?;
-    stream.flush()?;
+    let manifest_done = message::encode_empty(framing::T_MANIFEST_DONE)?;
+    if manifest_done
+        .encode(stream)
+        .and_then(|_| stream.flush())
+        .is_err()
+    {
+        // Sender is gone; the plan loop will read NOT_MODIFIED or EOF.
+    }
+    let _ = stream.flush();
 
     // ---- Receive plan (§6) ----
     let mut plan: Vec<PlanEntry> = Vec::new();

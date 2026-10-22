@@ -24,3 +24,6 @@ path = "tests/integration.rs"
 name = "bench"
 path = "src/bin/bench.rs"
 
+[dev-dependencies]
+filetime = "0.2.29"
+
