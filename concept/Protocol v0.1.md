@@ -3,11 +3,12 @@
 Specification for the ffsync wire protocol. Written for v0.1 (protocol
 version 1: **one file pair, two peers, one TCP connection**); it tracks the
 protocol across versions — changes ship with a `VERSION` bump and are
-recorded in the relevant sections. Current version: **2** (v0.2: HELLO
-gained `file_mtime_nanos`, see §3/§4). This document is implementation-
-facing: it should contain everything needed to build the sync without
-re-deriving design arguments. The reasoning lives in `Positioning.md` and
-`Design Decisions.md` (referenced as D-numbers).
+recorded in the relevant sections. Current version: **3** (v0.2: HELLO
+gained `file_mtime_nanos`, see §3/§4; v0.3 adds the tree envelope, see
+§16). This document is implementation-facing: it should contain everything
+needed to build the sync without re-deriving design arguments. The
+reasoning lives in `Positioning.md` and `Design Decisions.md` (referenced
+as D-numbers).
 
 ## 1. Scope and non-goals
 
@@ -26,17 +27,16 @@ re-deriving design arguments. The reasoning lives in `Positioning.md` and
 - Progress/observability derived from protocol flow (§11).
 - v0.2: peer-local persistent chunk index (warm starts, D15) — §14.1; HELLO
   sub-second mtime (protocol v2).
+- v0.3: directory-tree sync (D17) — one connection, sequential per-file
+  conversations inside a TREE_BEGIN/TREE_END envelope (§16); mtime
+  preservation on commit.
 
 **Out of scope, per D9:**
 
-- Directory recursion, deletes, renames (tree sync is Phase 1 concept work).
 - Metadata beyond (path, size, mtime): no permissions, xattrs, symlinks,
-  hardlinks.
-- Authentication, encryption, key exchange.
-- Daemon/continuous mode.
-- Persistent cross-run chunk index — **extension point only** (§14.1). The
-  resume manifest (§10) deliberately uses the same format so the index can be
-  added without protocol changes.
+  hardlinks. (v0.3 follows symlinks to their target type; dangling ones are
+  skipped with a warning — recorded, not silent.)
+- Bidirectional merge / continuous sync (that is Syncthing's job; D9, D17).
 
 ## 2. Model
 
@@ -88,7 +88,7 @@ not by tolerating unknown frames).
 
 | Type  | Name           | Dir     | Payload |
 |-------|----------------|---------|---------|
-| 0x01  | HELLO          | both    | magic `FFSY` (4B), version u16 (=2), flags u16 (§4), role u8 (1=sender, 2=receiver), cdc_min u32, cdc_avg u32, cdc_max u32, file_size u64, file_mtime u64 (unix secs, 0 if absent), file_mtime_nanos u32 (sub-second part, 0 if absent; v0.2), path (u16 len + UTF-8) |
+| 0x01  | HELLO          | both    | magic `FFSY` (4B), version u16 (=3), flags u16 (§4), role u8 (1=sender, 2=receiver), cdc_min u32, cdc_avg u32, cdc_max u32, file_size u64, file_mtime u64 (unix secs, 0 if absent), file_mtime_nanos u32 (sub-second part, 0 if absent; v0.2), path (u16 len + UTF-8) |
 | 0x02  | MANIFEST_CHUNK | recv→send | hash 32B + offset u64 + length u32 (44 B) |
 | 0x03  | MANIFEST_DONE  | recv→send | empty |
 | 0x04  | PLAN_LOCAL     | send→recv | target_offset u64 + length u32 + source_offset u64 + hash 32B (52 B) |
@@ -99,6 +99,8 @@ not by tolerating unknown frames).
 | 0x09  | COMMIT_ACK     | recv→send | empty |
 | 0x0A  | NOT_MODIFIED   | both    | empty |
 | 0x0B  | ERROR          | both    | code u16 + message (u16 len + UTF-8) |
+| 0x0C  | TREE_BEGIN     | send→recv | entry_count u64, then entry_count × tree entry (§16.2); v0.3 |
+| 0x0D  | TREE_END       | both    | deleted_count u32 + deleted_bytes u64 (recv→send, after deletes; send→recv variant is empty); v0.3 |
 
 Error codes: 1=version, 2=role conflict, 3=bad frame, 4=hash mismatch,
 5=io, 6=aborted. Any ERROR frame is terminal: the sender of ERROR closes the
@@ -326,8 +328,9 @@ origin, D5):
 5. **Hash truncation:** BLAKE3 supports shorter outputs; truncating wire hashes
    saves bandwidth at a quantifiable collision cost. Only with explicit
    analysis; v0.1 always sends 32 bytes.
-6. **Tree sync:** Phase 1 metadata reconciliation from
-   `File Synchronisation Workflow.md` layered above per-file syncs.
+6. **Tree sync:** implemented in v0.3 — §16 (D17). Open remains: parallel
+   per-file streams for high-BDP paths (needs QUIC or a conversation
+   multiplexer; deferred with D13's QUIC answer).
 
 ## 15. Worked example (3-chunk toy file)
 
@@ -356,3 +359,126 @@ R→S: COMMIT_ACK
 Same flow with R = [A][B][C] but mtime differs: plan comes back empty, VERIFY
 carries root(S), receiver compares against its own root → match → COMMIT_ACK
 with no temp file ever created.
+
+## 16. Tree sync (v0.3, D17)
+
+One connection, many per-file conversations. The per-file protocol (§4–§8) is
+unchanged; the tree layer wraps and sequences it.
+
+### 16.1 Session shape
+
+```
+S→R: TREE_BEGIN   (tree manifest + tree flags)
+R→S: TREE_BEGIN   (receiver's tree manifest, same framing)
+      both sides triage (§16.3) — no wire traffic
+      for each file needing sync (deterministic order, §16.4):
+        S→R: per-file HELLO (path = relative path, §4)
+        ... per-file protocol §5–§8 unchanged ...
+      (deletions, §16.5)
+S→R: TREE_END     (empty payload)
+R→S: TREE_END     (deleted_count, deleted_bytes)
+```
+
+The sender's TREE_BEGIN is authoritative for direction: the sender's tree is
+the desired state, the receiver converges toward it (`rsync -r --delete`
+semantics made explicit; `--no-delete` via tree flags, §16.2). Both peers
+send their full tree manifest before any per-file conversation starts —
+triage is local, deterministic on both sides from the same two manifests.
+
+A v2 peer receiving TREE_BEGIN fails with an unknown-frame ERROR (v2 framing
+is strict, §3) — the version check in HELLO makes this a clean rejection
+before any tree state exists. Protocol version 3 is only advertised by
+peers implementing this section.
+
+### 16.2 Tree manifest and flags
+
+TREE_BEGIN payload: `entry_count u64`, then `entry_count` tree entries:
+
+```
+TreeEntry := rel_path (u16 len + UTF-8) | kind u8 (0=file, 1=dir)
+           | size u64 | mtime u64 (unix secs, 0 if absent)
+           | mtime_nanos u32 (0 if absent)
+```
+
+Entries are sorted by `rel_path` (byte order) — deterministic iteration on
+both sides without negotiation. `kind=1` (dir) entries carry size=0 and
+exist only to create empty directories on the receiver (a directory with
+files needs no entry; its files imply the path). Paths are relative to the
+synced root, `/`-separated regardless of platform, and must not contain
+`..` components (protocol error otherwise — path traversal is a protocol
+violation, not a filesystem concern).
+
+Tree flags (in TREE_BEGIN, u16): bit 0 `checksum` (D11 tree-wide: no
+metadata fast path on any file), bit 1 `no_delete` (§16.5).
+
+### 16.3 Triage (local, no wire traffic)
+
+Both peers, after exchanging TREE_BEGINs, compute locally:
+
+- **skip**: same rel_path on both sides, both files, same size, same
+  mtime secs + nanos (and neither side set `checksum`) — exactly the §4
+  fast-path rule, applied per file from metadata alone. Also: same path
+  and both dirs.
+- **sync**: same path, both files, size or mtime differs (or `checksum`
+  set) → per-file conversation (its VERIFY is the medium diff; the
+  workflow doc's Phase 2 is absorbed there).
+- **transfer**: file exists on sender only → per-file conversation with an
+  empty receiver file (the receiver creates it; empty-plan handling of a
+  zero-byte sender file truncates a non-empty receiver file to empty —
+  fixed in v3, previously an ERROR).
+- **delete**: file exists on receiver only → deferred to §16.5.
+- **conflict**: file on one side, dir on the other → the dir side is
+  removed and the file synced (the sender's tree is authoritative in both
+  directions of this asymmetry: sender-file/receiver-dir deletes the dir,
+  sender-dir/receiver-file deletes the file, then creates the dir if
+  needed). Files inside a conflicted dir are covered by the delete rule.
+
+### 16.4 Execution order
+
+Per-file conversations run in the sender's manifest order (sorted by
+rel_path). Skipping happens on both sides independently — the sender
+initiates a conversation only for files in its `sync`/`transfer` set; the
+receiver expects conversations exactly for the same set (computed from the
+same two manifests), so no per-file negotiation is needed. A receiver that
+disagrees (it must not, given deterministic triage) fails loudly on the
+first unexpected HELLO.
+
+Within one file's conversation, everything is unchanged from §5–§8 —
+including resume (a mid-tree failure leaves that file's temp file; the
+next session's triage sees the file still differing and the per-file
+resume logic takes over), warm indexes (D15), and the fast path.
+
+Deletions happen **after** all conversations succeeded. A failed
+conversation aborts the session (ERROR, terminal per §3) before any
+delete is applied — fail-closed: a failed transfer never destroys data.
+
+### 16.5 Deletions
+
+After the last per-file COMMIT_ACK, the sender sends TREE_END (empty).
+The receiver deletes every file in its `delete` set (skipped when
+`no_delete` is set), then removes now-empty directories bottom-up
+(within the synced subtree only), then replies TREE_END with
+`deleted_count u32 + deleted_bytes u64` for the summary line. The sender
+reads the reply and exits; the receiver exits after sending. The sender's
+TREE_END doubles as the "transfers done, please finalize" barrier — the
+receiver must not delete anything before it (a sender aborting
+mid-session leaves the receiver's tree intact apart from synced files).
+
+Delete safety is bounded by the same trust decision as every write in the
+session: the receiver already pinned the sender's fingerprint (D16).
+
+### 16.6 mtime preservation (v3, load-bearing for trees)
+
+On every commit (COMMIT_ACK path), the receiver sets the target file's
+mtime to the sender's HELLO `file_mtime`/`file_mtime_nanos` **before**
+sending COMMIT_ACK, using `File::set_modified` (std, all platforms). The
+sender's HELLO mtime is read before its scan starts (unchanged §4). Both
+peers then record the same mtime in their D15 indexes, so the next tree
+sync's triage (§16.3) skips the file — the tree fast path fires without
+reading a byte. Without this, every synced file's mtime would change at
+commit and no tree sync would ever skip.
+
+Single-file sync adopts the same behavior under protocol v3 (observable
+change: the receiver's file now carries the sender's mtime after a sync;
+this matches rsync's default `--times` behavior and is what users expect
+from a sync tool — recorded in D17).

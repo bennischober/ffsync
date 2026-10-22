@@ -527,3 +527,114 @@ defaults, regenerated on demand); TOFU's known weakest-link property
 (documented above); Windows state-dir conventions need care (`%APPDATA%`,
 not the temp dir).
 
+## D17 — Directory sync: one session, sequential per-file conversations, tree protocol v3
+
+**Decision (v0.3 scope):** ffsync learns to sync a **directory tree**
+between two peers, reusing the proven per-file engine. The design keeps
+single-file sync as the special case it already is, and adds a thin
+orchestration layer:
+
+- **One connection, many conversations.** A tree session is a single
+  transport (TCP or TLS, D16) over which the peers run the *existing*
+  per-file state machines sequentially, one file at a time, with a
+  directory-level envelope around them. No connection pool, no parallel
+  streams (D13's QUIC answer stays: revisit when measurement demands it),
+  no interleaving of per-file conversations. Sequential keeps the per-file
+  state machines verbatim (they are one-shot, and their NOT_MODIFIED /
+  drain semantics are stream-positional) and makes resume, progress, and
+  error attribution trivially per-file.
+- **Tree envelope (protocol v3):** a `TREE_BEGIN` / `TREE_END` pair of
+  frames wraps the session; between them, peers exchange a metadata
+  scan of the tree (relative path, size, mtime secs + nanos), reconcile
+  it into an action list (see triage below), and then execute per-file
+  conversations in a deterministic order. The per-file HELLO carries the
+  relative path (it already has a `path` field) and the tree flags in its
+  reserved flag bits.
+- **Triage happens on metadata, files are proven by roots (D5, D11):**
+  matching (path, size, mtime secs+nanos) on both sides → skipped, unless
+  `--checksum` disables the fast path tree-wide (D11 semantics, unchanged).
+  Everything else → per-file sync (which itself proves identity by root
+  hash; the "medium diff" of the workflow doc is absorbed by the per-file
+  machine's VERIFY, which is strictly stronger).
+- **Direction and deletions:** a tree sync is **one-directional**
+  (sender's tree is authoritative, like `rsync -r --delete` semantics made
+  explicit). The receiver deletes files present locally but absent from
+  the sender's manifest, **after** all transfers succeeded, and only files
+  inside the synced subtree. Deletes are deferred to the end so a failed
+  transfer never destroys data (fail-closed, same contract as single-file
+  sync). `--no-delete` opts out (rsync flag name, familiar semantics).
+- **mtime preservation on commit:** after reconstruction, the receiver
+  sets the target file's mtime to the sender's (std `File::set_modified`,
+  verified to work on this toolchain). Without this, every synced file
+  changes mtime and the next tree sync would re-transfer everything —
+  the fast path would never fire. This is a wire-visible change: the
+  receiver's COMMIT_ACK now happens *after* mtime was set, so both peers'
+  warm indexes (D15) record the same mtime. (Single-file sync does NOT
+  gain this silently: it changes observable behavior; it lands as part of
+  the v3 protocol bump, and the single-file path adopts it under the same
+  flag.)
+- **Empty directories:** created on the receiver (existence, not content,
+  is what a tree is); empty files are synced as zero-byte files (their
+  chunk list is empty, root is the domain-separated empty root — the
+  codec already handles both). The pre-existing gap that an empty sender
+  file cannot converge a non-empty receiver file is fixed in v3 (the
+  empty-plan branch truncates to zero and verifies the empty root instead
+  of erroring).
+- **Symlinks, permissions, xattrs, hardlinks:** still out of scope (D9).
+  A symlink inside the tree is synced as its target type resolved
+  (follow), or skipped with a warning if dangling — recorded, not silent.
+
+**Reasoning:** the workflow doc's Phase 1–3 (shallow/medium/deep diff) map
+onto this as: Phase 1 = tree metadata triage (new, cheap); Phase 2 is
+absorbed into per-file VERIFY (root hash comparison — strictly stronger
+than the doc's per-file root exchange, and it falls out of the existing
+machine); Phase 3–4 = the existing per-file plan/transfer/reconstruction,
+unchanged. The sequential model deliberately trades parallel-file
+throughput for correctness-first simplicity: one file's failure leaves a
+clean, resumable session (its temp file), exactly like single-file sync
+today.
+
+**Alternatives rejected:**
+- *Parallel per-file conversations* — the per-file machines are one-shot
+  and stream-positional (NOT_MODIFIED drain logic assumes conversation
+  end); parallelizing needs a conversation multiplexer, which is a new
+  protocol layer with real correctness risk, for a win that only matters
+  on very high-BDP links with many large files. Revisit with QUIC (D13).
+- *One mega-manifest of all chunks in the tree* — collapses per-file
+  identity (a chunk is only meaningful as part of a file's ordered chunk
+  list, and verification is per-file root); also recreates the memory
+  problem for large trees. Per-file conversations keep identity clean.
+- *Receiver-derived plans* (§13.5) — orthogonal to tree sync, unchanged.
+- *Bidirectional merge* — that is Syncthing's job (D9); ffsync is
+  explicitly one-directional with the sender authoritative. A reverse
+  sync is just another run with swapped roles.
+
+**Wire mapping (v3):** protocol version 2 → 3. New frame types
+`TREE_BEGIN` (0x0C) / `TREE_END` (0x0D): TREE_BEGIN carries the sender's
+tree manifest (entry count, then per entry: path, size, mtime secs+nanos,
+flags) plus the shared tree flags (`--checksum`, `--no-delete`).
+Per-file conversations then run unchanged inside the envelope; the
+per-file HELLO `path` field carries the relative path and `file_size`
+stays authoritative for that file. TREE_END carries the per-file outcome
+summary; the receiver sends the final TREE_END with the delete report
+after applying deletions. v2 peers receiving TREE_BEGIN reject it as an
+unknown frame (v2 framing is strict) — version negotiation in HELLO
+makes this a clean, loud rejection.
+
+**Validation plan:** unit tests for triage and the tree manifest codec;
+loopback tests (`tests/tree.rs`) over TCP + TLS: converge a tree of
+mixed-size files, empty files, empty dirs, nested dirs; deletions applied
+only after success and only with delete enabled; mtime preservation makes
+the second sync hit the per-file fast path for every file; a mid-tree
+failure leaves earlier files synced and the failed file resumable;
+`--checksum` disables the tree fast path; v2 peer rejects TREE_BEGIN
+loudly. Live two-process check over TLS, as with D15/D16.
+
+**Accepted costs:** sequential per-file conversations serialize scan and
+transfer (no overlap *across* files, only within one file — the pipeline's
+parallelism is per-file); the tree manifest is memory-resident on both
+sides (bounded by file count × ~100 bytes per entry; 100k files ≈ 10 MB —
+fine, and the per-directory database note in D15 stays the scale trigger);
+deletes are a trust decision deferred to session end (a receiver that
+trusts the sender's fingerprint already trusts it with writes).
+
