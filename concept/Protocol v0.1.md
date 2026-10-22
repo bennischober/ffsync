@@ -318,7 +318,9 @@ origin, D5):
    into near-zero-scan operations — the core product insight
    (`Positioning.md`).
 2. **Eager diff** (§9.2).
-3. **TLS** via rustls; the framing is TLS-agnostic.
+3. **TLS** via rustls (decided: D16 — self-signed certs, mutual TOFU
+   fingerprint pinning, wraps the stream before frame 1; framing unchanged).
+   See also the D13 amendment for the QUIC sequencing.
 4. **Parallel chunk streams** (multiple TCP connections or QUIC streams) to
    beat single-flow window limits on high-BDP paths.
 5. **Hash truncation:** BLAKE3 supports shorter outputs; truncating wire hashes

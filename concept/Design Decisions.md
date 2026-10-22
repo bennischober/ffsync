@@ -112,6 +112,21 @@ network layer lands (a hidden-file convention may be preferable).
 
 ## D13 — Transport plan: plain TCP in v0.1, QUIC as the v0.2 default
 
+> **Amendment (2026-10, v0.2 work):** QUIC is *deferred past* v0.2; the
+> v0.2 security layer is TLS-over-TCP per D16. Two developments changed the
+> calculus: (1) the persistent index (D15) landed first, making repeated
+> single-file syncs cheap over plain TCP, so the QUIC motivation shifted
+> entirely to multi-file sessions (parallel streams, migration) — which do
+> not exist yet; (2) the implementation survey (verified 2026-10): quinn is
+> pure Rust on rustls + tokio; quiche (Cloudflare) hard-wires BoringSSL (C,
+> cmake build) — rejected on D14 grounds; a moq-dev fork with a rustls
+> backend is not upstreamable. **Plan:** rustls-over-TCP now (same crypto
+> design D16 specifies; works for 1:1 file sync indefinitely), revisit
+> quinn when directory sync exists — at that point tokio enters only at the
+> transport edges (the mmap/thread data plane stays native, per the
+> measured 5x regression of async I/O in `evaluation/chunking.md`), and
+> parallel per-file QUIC streams become the optimization worth building.
+
 **Decision:** v0.1 runs over one plain TCP stream (plaintext, LAN or inside an
 SSH tunnel). QUIC — not raw TCP hardening — is the default v0.2 transport plan.
 
@@ -378,4 +393,117 @@ explicitly deferred; v0.2 keeps manifest streaming as-is.
 second run performs zero chunk-I/O on unchanged data (stat-only) and still
 hash-verifies; loopback test: warm receiver + changed file falls back to cold
 scan correctly; corrupt-index test: truncated index behaves as missing.
+
+## D16 — Transport security: rustls TLS 1.3 with self-signed certs, mutual auth by TOFU fingerprint pinning, no PSK, no SSH embedding
+
+**Decision (v0.2 security layer):** encryption and peer authentication ride
+on **rustls (TLS 1.3)** as a thin wrapper around the existing TCP stream —
+the sync state machines stay untouched (they are generic over
+`Read + Write`, and `rustls::StreamOwned` *is* `Read + Write`). Both peers
+generate a **self-signed certificate on first run** (`rcgen`, stored in the
+ffsync state directory) and authenticate each other by **pinning the
+certificate's SHA-256 fingerprint** — trust on first use (TOFU):
+
+1. First connection: each side shows its fingerprint; the user confirms the
+   peer's fingerprint matches out-of-band (in person, phone, signal —
+   whatever they'd use to exchange a key). `ffsync trust <peer-name>`
+   stores it. This is the "fingerprint compare" step SSH users already
+   know — same mental model, no new concepts.
+2. Every later connection: the presented fingerprint must match the pinned
+   one, **on both sides** (mutual auth via a rustls client-cert verifier on
+   the server and a custom server-cert verifier on the client). A mismatch
+   is a loud, terminal rejection — the same "fail loudly" contract as every
+   other ffsync error.
+
+Connection-level identity is all the auth there is: **no usernames, no
+passwords, no secrets file** (rsync's daemon model — `auth users` +
+`secrets file` — was studied and rejected: plaintext secrets on disk,
+challenge-response to reimplement, and it answers a question ffsync does
+not have: multi-user serving. ffsync peers are 1:1, person-to-person).
+
+**Why not the alternatives:**
+- *Plain TCP + handshake MAC (PSK over our own framing)* — rejected: rolling
+  our own channel crypto is exactly the class of mistake TLS exists to
+  prevent (nonce reuse, truncation, renegotiation bugs). The one legit
+  PSK-in-TLS path is unavailable: rustls does not support external PSKs
+  (open issue since 2018, verified 2026-10). A hand-rolled Noise construction
+  (snow) would buy smaller dependency weight at the cost of an unaudited
+  crypto hand-rolled layer — the opposite trade of rustls, which is the
+  Rust ecosystem's audited, mainstream default (D14 bias).
+- *Embedding SSH (libssh2)* — rejected: C dependency on the primary Windows
+  platform, subprocess-based piping is un-scriptable, and SSH key management
+  (agents, known_hosts formats) is a second config surface ffsync would
+  have to explain. Users who want SSH can still tunnel plain-TCP ffsync
+  through it; that path stays supported by design (transport-agnostic
+  state machines).
+- *Web PKI (Let's Encrypt, real CAs)* — rejected for peers: ffsync peers
+  usually have no domain name; ACME/DNS machinery is setup burden with zero
+  benefit when the trust anchor is "the friend's fingerprint", not "a CA
+  vouches". Self-signed + pinning is strictly simpler and honest about the
+  trust model.
+- *QUIC now* — rejected for v0.2 (see D13 amendment below): quinn brings
+  tokio back into the tree for one stream of payload; QUIC's wins
+  (migration, parallel streams) pay off at directory-sync scale, not for
+  single-file syncs. TLS-over-TCP ships the same crypto with a fraction of
+  the surface.
+
+**Threat model (what this does and does not stop):**
+- Stops: passive observers (encryption), active MITM (pinning — a MITM
+  presents a different cert and is rejected), unauthenticated writers (a
+  peer without the pinned fingerprint cannot complete a handshake, let
+  alone overwrite a file), replay of an old session (TLS 1.3 nonce +
+  transcript binding; ffsync's VERIFY oracle additionally pins the payload
+  to content).
+- Does not stop: a compromised *pinned* peer (it is authorized by
+  definition), a user who blindly confirms the first fingerprint (TOFU's
+  known weakest link — mitigated by making the fingerprint prominent and
+  by `ffsync trust` being an explicit command), and attacks on the host
+  itself. This is the same envelope rsync-over-ssh provides, minus the
+  multi-user machinery.
+
+**UI contract (rsync-easy, verified against rsync's actual model):** rsync
+daemon auth = config file + `auth users` + a plaintext secrets file
+(challenge-response); rsync-over-ssh = ssh keys + known_hosts. ffsync's
+answer keeps the one part users actually like — "check the fingerprint
+once, never again" — and drops everything else:
+
+```
+# receiver (first ever run): generates identity, prints fingerprint
+$ ffsync receive big-file.bin 7788
+  identity: 3f9a…c21e (created, stored in ffsync state dir)
+  waiting for peer …
+# sender (first ever run): same, then both users compare out-of-band
+$ ffsync send big-file.bin 192.168.1.20:7788
+  peer fingerprint: 3f9a…c21e — trust? [y/N] y      # interactive TOFU
+  (non-interactive: --trust <fingerprint> or ffsync trust <name> <fp>)
+# every later sync: no prompts, pinned fingerprints verified silently
+```
+
+`ffsync trust <name> <fingerprint>` / `ffsync fingerprints` manage pins in
+the state dir (`~/.ffsync/` / `%APPDATA%\ffsync\`, one TOML file, no
+secrets — fingerprints are public). No config file, no daemon config, no
+users: two commands and a one-time compare. Setup cost vs rsync-over-ssh:
+comparable; vs rsync-daemon: strictly less (no plaintext secrets file, no
+module config); security: strictly more (mutual, pinning beats
+password-over-TLS challenge-response).
+
+**Wire mapping:** none — TLS wraps the TCP stream before frame 1; HELLO
+and everything above are unchanged (protocol version stays 2; the framing
+was transport-agnostic by construction, §14.3). Port: TLS is the default
+on the same port scheme; `--plaintext` flag keeps LAN/SSH-tunnel use
+explicit. Fingerprint = SHA-256 over the DER-encoded self-signed cert,
+formatted like SSH's (`AA:BB:…`, 16 groups).
+
+**Validation plan:** loopback tests over an in-memory rustls pair
+(accept, pin-match → sync converges; pin-mismatch → loud rejection with
+distinct error; untrusted first-use without `--trust` → prompt/abort);
+integration test: receiver refuses an unauthenticated writer entirely
+(no file touched). Transport work is confined to `src/transport.rs` +
+CLI wiring; `protocol::sync` signatures unchanged.
+
+**Accepted costs:** a new dependency class (rustls + rcgen + a crypto
+provider — the D14 ledger grows by design, recorded when it lands);
+certs never expire practically (self-signed, 10-year, regenerated on
+demand); TOFU's known weakest-link property (documented above); Windows
+state-dir conventions need care (`%APPDATA%`, not the temp dir).
 
