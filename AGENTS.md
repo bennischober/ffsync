@@ -39,11 +39,17 @@ Design documents (read before making architectural changes):
 | `cargo build` | Build the binary |
 | `cargo check --tests` | Fast compile check including tests |
 | `cargo test` | Run unit and integration tests (`tests/integration.rs`) |
-| `cargo run` | Run `main.rs` (currently a manual benchmark harness with a hardcoded local file path) |
+| `cargo run` | Run the CLI (`ffsync send/receive`, see `--help`) |
 | `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--rsync`, `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
 | `cargo clippy` | Lint (no `clippy.toml`) |
 | `cargo audit` | Check `Cargo.lock` against RustSec advisories (see D14 in `concept/Design Decisions.md`) |
+
+CI (`.github/workflows/`) runs on push to `main` and on PRs, on
+Windows **and** Linux: `cargo fmt --check`, `cargo clippy --all-targets
+-- -D warnings`, `cargo test`, `cargo audit` — keep all four green
+locally before pushing. A weekly scheduled workflow re-runs `cargo audit`
+so advisories published between pushes are caught (D14).
 
 Toolchain: current stable Rust (1.99.x as of 2026-10), edition 2024. The crate
 is a lib + two bins (`ffsync`, `bench`); tests import via `ffsync::chunking` /
