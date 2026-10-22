@@ -1,0 +1,22 @@
+name: audit-weekly
+
+# D14 (supply-chain hygiene): advisories published after the last push are
+# caught by this schedule even when nothing in the repo changed. The per-push
+# audit job lives in ci.yml.
+on:
+  schedule:
+    - cron: "23 4 * * 1" # Mondays 04:23 UTC
+  workflow_dispatch: # manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit (scheduled)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo audit
