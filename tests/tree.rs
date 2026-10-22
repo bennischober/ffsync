@@ -61,10 +61,27 @@ fn run_tree_session(
     Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
     Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
 ) {
+    run_tree_session_ex(sender_root, receiver_root, checksum, no_delete, &[], &[])
+}
+
+/// Like [`run_tree_session`], but with exclude patterns: the sender's
+/// govern both scans (§16.7), the receiver's only guard its delete pass.
+fn run_tree_session_ex(
+    sender_root: &Path,
+    receiver_root: &Path,
+    checksum: bool,
+    no_delete: bool,
+    sender_excludes: &[&str],
+    receiver_excludes: &[&str],
+) -> (
+    Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
+    Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
+) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
     let recv_root = receiver_root.to_path_buf();
+    let recv_excludes: Vec<String> = receiver_excludes.iter().map(|s| s.to_string()).collect();
     let server = std::thread::spawn(move || {
         let (tcp, _peer) = listener.accept().unwrap();
         tcp.set_nodelay(true).ok();
@@ -76,6 +93,7 @@ fn run_tree_session(
                 root: recv_root,
                 force_checksum: checksum,
                 no_delete,
+                excludes: recv_excludes,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -86,12 +104,14 @@ fn run_tree_session(
     tcp.set_nodelay(true).ok();
     tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
+    let send_excludes: Vec<String> = sender_excludes.iter().map(|s| s.to_string()).collect();
     let send_res = tree_send(
         &mut &tcp,
         &TreeSendRequest {
             root: sender_root.to_path_buf(),
             force_checksum: checksum,
             no_delete,
+            excludes: send_excludes,
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -319,6 +339,7 @@ fn tree_v2_flow_rejects_tree_frames() {
             root: sender.path().to_path_buf(),
             force_checksum: false,
             no_delete: false,
+            excludes: Vec::new(),
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -340,6 +361,7 @@ fn tree_paths_reject_traversal() {
 
     let frame = TreeBegin {
         flags: 0,
+        excludes: Vec::new(),
         entries: vec![TreeEntryWire {
             rel_path: "../escape.bin".to_string(),
             kind: 0,
@@ -390,6 +412,7 @@ fn sender_vanished_file_fails_loudly() {
                 root: recv_root,
                 force_checksum: false,
                 no_delete: false,
+                excludes: Vec::new(),
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -415,6 +438,7 @@ fn sender_vanished_file_fails_loudly() {
             root: sender.path().to_path_buf(),
             force_checksum: false,
             no_delete: false,
+            excludes: Vec::new(),
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -442,4 +466,131 @@ fn sender_vanished_file_fails_loudly() {
         receiver.exists("stale.bin"),
         "fail-closed: no deletions on a failed session"
     );
+}
+
+// ---- Excludes (§16.7) ----
+
+#[test]
+fn tree_excludes_protect_receiver_files_from_delete() {
+    // The sender does not have secrets/ (excluded by pattern); the receiver
+    // does. Without excludes the delete pass would wipe it; with them it
+    // must survive, and the sync reports 0 deletions.
+    let sender = TempTree::new("excl_protect_s");
+    sender.write("code.rs", b"fn main() {}");
+    let receiver = TempTree::new("excl_protect_r");
+    receiver.write("code.rs", b"fn main() {}");
+    receiver.write("secrets/api.key", b"hunter2");
+    receiver.write("secrets/notes.txt", b"private");
+
+    let (s, r) = run_tree_session_ex(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &["secrets/"],
+        &[],
+    );
+    let s = s.expect("sender ok");
+    let r = r.expect("receiver ok");
+    assert_eq!(s.deleted, 0);
+    assert_eq!(r.deleted, 0);
+    assert!(
+        receiver.exists("secrets/api.key"),
+        "excluded receiver-only file must survive the delete pass"
+    );
+    assert!(receiver.exists("secrets/notes.txt"));
+    assert_eq!(receiver.read("code.rs").unwrap(), b"fn main() {}");
+    // Second session with NO excludes: the sender's tree is authoritative,
+    // so now the secrets are deleted (excludes are per-session, not state).
+    // Three deletions: the two files plus the emptied secrets dir itself.
+    let (s2, r2) = run_tree_session(sender.path(), receiver.path(), false, false);
+    let s2 = s2.expect("sender ok");
+    let r2 = r2.expect("receiver ok");
+    assert_eq!(s2.deleted, 3);
+    assert_eq!(r2.deleted, 3);
+    assert!(!receiver.exists("secrets/api.key"));
+}
+
+#[test]
+fn tree_sender_excludes_filter_its_own_tree() {
+    // Sender has junk it does not want to sync; with the pattern in place
+    // the receiver never sees those files (and does not keep local copies
+    // of them either — they are invisible to the whole session).
+    let sender = TempTree::new("excl_filter_s");
+    sender.write("app.bin", b"app");
+    sender.write("cache/tmp1.bin", b"junk1");
+    sender.write("cache/deep/tmp2.bin", b"junk2");
+    let receiver = TempTree::new("excl_filter_r");
+    receiver.write("cache/old.bin", b"old"); // receiver-only, but cache/ excluded
+
+    let (s, r) = run_tree_session_ex(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &["cache"],
+        &[],
+    );
+    let s = s.expect("sender ok");
+    let r = r.expect("receiver ok");
+    // Only app.bin was in the filtered conversation set.
+    assert_eq!(s.files, 1);
+    assert_eq!(r.files, 1);
+    assert!(receiver.exists("app.bin"));
+    // The excluded dir was pruned on the sender; the receiver's excluded
+    // content was never in any manifest, so nothing was deleted either.
+    assert!(receiver.exists("cache/old.bin"));
+    assert!(!receiver.exists("cache/tmp1.bin"));
+    assert_eq!(s.deleted, 0);
+    assert_eq!(r.deleted, 0);
+}
+
+#[test]
+fn tree_excludes_deterministic_across_both_peers() {
+    // Both peers must derive the SAME filtered manifests: triage on both
+    // sides then produces the identical conversation sequence (§16.4). A
+    // receiver that filtered differently would fail loudly on the first
+    // unexpected HELLO; this test pins the happy path with several files.
+    let sender = TempTree::new("excl_det_s");
+    sender.write("a.bin", b"a");
+    sender.write("b.bin", b"b");
+    sender.write("skip1.bin", b"s1");
+    sender.write("sub/skip2.bin", b"s2");
+    sender.write("sub/keep.bin", b"k");
+    let receiver = TempTree::new("excl_det_r");
+
+    let (s, r) = run_tree_session_ex(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &["skip*.bin"],
+        &[],
+    );
+    let s = s.expect("sender ok");
+    let r = r.expect("receiver ok");
+    // Conversations: a.bin, b.bin, sub/keep.bin (skip*.bin filtered at any
+    // depth; sub/ itself is not excluded).
+    assert_eq!(s.files, 3);
+    assert_eq!(r.files, 3);
+    assert!(receiver.exists("a.bin"));
+    assert!(receiver.exists("sub/keep.bin"));
+    assert!(!receiver.exists("skip1.bin"));
+    assert!(!receiver.exists("sub/skip2.bin"));
+    assert_eq!(r.transferred_bytes, 3); // 1 + 1 + 1 bytes
+}
+
+#[test]
+fn tree_excludes_v3_peer_without_flag_interops() {
+    // A peer that never sets the excludes flag parses the §16.2 layout —
+    // verified by a session whose sender sends no patterns: the receiver
+    // (same code) treats it as a plain session.
+    let sender = TempTree::new("excl_noflag_s");
+    sender.write("only.bin", b"x");
+    let receiver = TempTree::new("excl_noflag_r");
+
+    let (s, r) = run_tree_session(sender.path(), receiver.path(), false, false);
+    s.expect("sender ok");
+    r.expect("receiver ok");
+    assert!(receiver.exists("only.bin"));
 }

@@ -517,3 +517,66 @@ Single-file sync adopts the same behavior under protocol v3 (observable
 change: the receiver's file now carries the sender's mtime after a sync;
 this matches rsync's default `--times` behavior and is what users expect
 from a sync tool — recorded in D17).
+
+### 16.7 Excludes (v3, `--exclude` / `--exclude-from`)
+
+Excludes remove paths from a tree session entirely: an excluded path is
+invisible to triage on both peers — it is never transferred, never
+deleted, never reported. This is rsync's model: exclude patterns filter
+what the session sees, and (because receiver-only paths that are excluded
+never enter the receiver's manifest either) excluded files on the receiver
+are protected from deletion.
+
+**Ownership — the sender's patterns rule.** Exclude patterns travel in the
+sender's TREE_BEGIN; the receiver applies exactly those to its own scan.
+The receiver's own patterns (if any) never touch manifests — they only
+protect paths from the receiver's delete pass (§16.5), so both peers
+triage identically from the same two filtered manifests (§16.4's
+determinism contract is untouched).
+
+**Wire form.** TREE_BEGIN gains flag bit 2 `excludes`. When set, the
+payload after `flags u16` carries the pattern section *before*
+`entry_count u64`:
+
+```
+pattern_count u32
+pattern_count × pattern (u16 len + UTF-8)
+entry_count u64
+entry_count × TreeEntry (§16.2)
+```
+
+A peer that did not send `excludes` but receives the flag must fail
+(Malformed): the two peers would filter differently, desyncing the
+per-file conversation sequence — this is a loud protocol error by design.
+Peers that never set the flag parse exactly the §16.2 layout.
+
+**Pattern grammar** (matched against the wire rel path, always
+`/`-separated; case-sensitive; no backslash escapes — a `\` in a pattern
+is a parse error):
+
+- A pattern containing `/` anywhere except a trailing one is **anchored**:
+  it matches from the tree root (`/build` matches only the root entry
+  `build`; `doc/*.md` only files directly in `doc/`).
+- A pattern without `/` matches the **basename** of any entry at any depth
+  (`*.tmp`, `node_modules`).
+- `*` matches any run of characters except `/`; `?` matches exactly one
+  character except `/`; `[abc]`, `[a-z]`, `[!a-z]` are character classes
+  within a segment (an unterminated `[` is literal).
+- `**` as a *complete segment* matches any number of segments, including
+  zero (`logs/**/*.log` matches `logs/a.log` and `logs/a/b/a.log`;
+  `a/**/b` matches `a/b`). `**` inside a segment collapses to `*`.
+- A trailing `/` restricts the pattern to **directories** (`build/`).
+
+**Scanning rule (both peers):** an excluded directory is pruned — its
+whole subtree never enters the manifest (contents cannot re-include; there
+is no negation syntax). An excluded file is skipped. The scan-sidecar
+filter (`*.ffsync-index` / `*.ffsync-tmp`, §16.2) takes precedence and is
+not user-visible.
+
+**Delete-pass protection (receiver).** A path is skipped by the delete
+pass when the path itself matches one of the receiver's patterns, or when
+any of its ancestor directories matches one (an excluded directory
+protects its whole subtree from deletion). Conflict resolution (§16.3) is
+not gated on excludes — the sender's kind change is explicit and
+authoritative.
+

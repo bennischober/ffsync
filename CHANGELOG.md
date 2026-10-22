@@ -6,6 +6,23 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Tree-mode excludes (`--exclude <pat>`, `--exclude-from <file>`; §16.7):**
+  exclude patterns remove paths from a tree session entirely — never
+  transferred, never deleted, never reported (rsync's exclude model).
+  Grammar: `*`/`?` never cross `/`, `**` as a whole segment matches any
+  depth, `[a-z]`/`[!a-z]` classes, a pattern containing `/` is anchored to
+  the tree root, without it matches the basename at any depth, trailing
+  `/` restricts to directories. The **sender's patterns rule the session**
+  (they travel in TREE_BEGIN under a new flag bit, so both peers filter
+  identically and triage stays deterministic); the receiver's own patterns
+  only protect matching paths (and their subtrees) from deletion. An
+  excluded directory is pruned with its whole subtree; no negation syntax
+  (re-includes may come later). Excluded dirs are pruned during scan, so
+  the receiver creates excluded directories it lacks only when the dir
+  itself is not excluded.
+
 ### Changed
 
 - **Allocation hygiene in the transfer path:** the zstd

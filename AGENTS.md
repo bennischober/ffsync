@@ -14,9 +14,10 @@ resume after mid-transfer disconnects, the persistent chunk index for warm
 starts (D15), TLS transport with mutual TOFU fingerprint pinning (D16), and
 tree sync (D17: protocol v3 — TREE_BEGIN/TREE_END envelope, sequential
 per-file conversations, mtime preservation on commit, deletes deferred to
-session end, `--no-delete` opt-out). Not implemented yet: excludes/pattern
-matching, parallel per-file streams (QUIC, D13), permissions/xattrs/symlink
-policy (D9).
+session end, `--no-delete` opt-out) and tree-mode excludes (§16.7:
+`--exclude`/`--exclude-from`, sender's patterns rule the session,
+receiver's patterns guard the delete pass). Not implemented yet: parallel
+per-file streams (QUIC, D13), permissions/xattrs/symlink policy (D9).
 
 Design documents (read before making architectural changes):
 
@@ -126,10 +127,12 @@ pre-existing.
   deletions). State machines are generic over `S: Read + Write` —
   transport-agnostic by design.
 - `src/tree.rs` — the tree layer (D17): metadata-only directory scan
-  (sorted, ffsync sidecar files excluded), relative-path validation
-  (no traversal, wire paths always `/`-separated), the `triage` pure
-  function (skip/sync/transfer/create-dir/delete/kind-conflict), and
-  the tree manifest type. Pure computation — no protocol frames here.
+  (sorted, ffsync sidecar files excluded, optional exclude patterns with
+  subtree pruning — §16.7), relative-path validation (no traversal, wire
+  paths always `/`-separated), the hand-rolled glob matcher
+  (`ExcludeSet`/`ExcludePattern`), the `triage` pure function
+  (skip/sync/transfer/create-dir/delete/kind-conflict), and the tree
+  manifest type. Pure computation — no protocol frames here.
 - `src/transport.rs` — transport security (D16): rustls TLS 1.3 as a thin
   wrapper. `Identity` (self-signed cert + PKCS#8 key, raw-DER codec in
   `identity.bin`, created on first run), SHA-256 fingerprint codec
@@ -210,6 +213,11 @@ pre-existing.
   manifests, same flags — the receiver derives its flags from the sender's
   TREE_BEGIN). Any nondeterminism desyncs the per-file conversation
   sequence; the receiver fails loudly on the first unexpected HELLO.
+- Excludes (§16.7) follow the same contract, with a twist: the receiver
+  must read the sender's TREE_BEGIN *before* scanning its own tree (the
+  sender's patterns govern both scans). The receiver's own patterns never
+  touch manifests — they only guard its delete pass. Never "optimize" the
+  receiver into scanning first; that deadlocks nothing but desyncs triage.
 - Tree sessions make the fast-path branch explicit (FILE_SYNC frame);
   single-file mode still relies on the drain-after-NOT_MODIFIED dance.
   Do not "simplify" one to match the other — they differ because the
@@ -231,10 +239,10 @@ pre-existing.
 Implemented: single-file sync end-to-end (Phases 2–4 of the workflow doc:
 root-hash identity, chunk diffing and plan generation, transfer + zstd),
 resume, the persistent chunk index (D15), transport security (D16:
-rustls TLS 1.3, mutual TOFU fingerprint pinning), and directory-tree sync
+rustls TLS 1.3, mutual TOFU fingerprint pinning), directory-tree sync
 (D17, protocol v3: Phase 1 metadata triage + per-file conversations,
-mtime preservation, deferred deletes). Not yet implemented: excludes/
-pattern matching, parallel per-file streams — QUIC (D13 amendment:
+mtime preservation, deferred deletes), and tree-mode excludes (§16.7).
+Not yet implemented: parallel per-file streams — QUIC (D13 amendment:
 deferred until measurement shows parallel streams worthwhile), and
 permissions/xattrs/symlinks as first-class metadata (D9). See
 `concept/Design Decisions.md` D5 (checksum-based change detection) and

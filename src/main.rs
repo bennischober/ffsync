@@ -33,9 +33,11 @@ ffsync: fast chunk-level file sync for big files and fast links
 
 Usage:
   ffsync send <file|dir> <host:port> [--checksum] [--no-delete]
+              [--exclude <pat>]... [--exclude-from <file>]
               [--plaintext] [--trust <fp>]
   ffsync receive <file|dir> <port> [--checksum] [--from <old-file>]
-              [--no-delete] [--plaintext] [--trust <fp>]
+              [--no-delete] [--exclude <pat>]... [--exclude-from <file>]
+              [--plaintext] [--trust <fp>]
   ffsync trust <fingerprint>       pin a peer fingerprint (TOFU first contact)
   ffsync untrust <fingerprint>     remove a pinned fingerprint
   ffsync fingerprints              show this peer's identity + all pins
@@ -51,6 +53,17 @@ Options:
   --no-delete        tree mode: keep files that exist only on the receiver
                      (default IS to delete them — the sender's tree is
                      authoritative, like rsync --delete)
+  --exclude <pat>    tree mode: exclude matching paths from the sync
+                     (repeatable). Grammar: '*' and '?' never cross '/';
+                     '**' as a whole segment matches any depth;
+                     '[a-z]'/'[!a-z]' character classes; a pattern with '/'
+                     matches from the root, without it matches the basename
+                     at any depth; trailing '/' restricts to directories.
+                     The sender's patterns rule the session (they travel in
+                     the protocol); on the receiver they additionally protect
+                     matching paths from --no-delete-less deletion.
+  --exclude-from <f> tree mode: read one exclude pattern per line from <f>
+                     ('#' comments and blank lines are ignored)
   --plaintext        disable TLS (LAN use or inside an SSH tunnel); D16
   --trust <fp>       non-interactive first contact: pin <fp> instead of
                      prompting; also overrides which pinned peer to expect
@@ -81,6 +94,31 @@ fn die(msg: &str) -> ! {
     eprintln!("error: {}", msg);
     eprintln!("try 'ffsync --help'");
     std::process::exit(2);
+}
+
+/// Reads an exclude file (§16.7 `--exclude-from`): one pattern per line,
+/// `#` comments and blank lines ignored. Missing file is a loud error —
+/// silently syncing everything the user meant to exclude would be worse.
+fn read_exclude_file(path: &str, out: &mut Vec<String>) {
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        die(&format!("cannot read --exclude-from file {path}: {e}"));
+    });
+    for (n, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Reject inline comments early: a trailing " # note" is almost
+        // certainly not meant as part of the pattern.
+        if line.contains(" #") {
+            die(&format!(
+                "--exclude-from {} line {}: inline comments are not supported (use a whole-line '#' comment)",
+                path,
+                n + 1
+            ));
+        }
+        out.push(line.to_string());
+    }
 }
 
 struct ProgressDisplay {
@@ -254,22 +292,37 @@ fn set_stream_timeouts(stream: &TcpStream, secs: u64) {
     let _ = stream.set_write_timeout(d);
 }
 
-fn run_send(
-    file: PathBuf,
-    addr: String,
+/// Shared CLI flags for send/receive (tree and single-file runners pick
+/// what they need; single-file mode rejects excludes loudly).
+struct CliOptions {
     force_checksum: bool,
     plaintext: bool,
     trust_flag: Option<String>,
     no_delete: bool,
-) -> std::io::Result<()> {
+    excludes: Vec<String>,
+}
+
+fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()> {
     let tree = file.is_dir();
     if tree {
-        if no_delete {
+        if opts.no_delete {
             return Err(std::io::Error::other(
                 "--no-delete applies to receive only (the sender never deletes)",
             ));
         }
-        return run_tree_send(file, addr, force_checksum, plaintext, trust_flag);
+        return run_tree_send(
+            file,
+            addr,
+            opts.force_checksum,
+            opts.plaintext,
+            opts.trust_flag,
+            opts.excludes,
+        );
+    }
+    if !opts.excludes.is_empty() {
+        return Err(std::io::Error::other(
+            "--exclude/--exclude-from apply to tree mode only (pass a directory)",
+        ));
     }
     if !file.is_file() {
         return Err(std::io::Error::other(format!(
@@ -289,7 +342,7 @@ fn run_send(
 
     // Transport security (D16): TLS by default; --plaintext for LAN/SSH
     // tunnels. Handshake first, then the sync protocol over the TLS stream.
-    let mut stream: Box<dyn ReadWrite> = if plaintext {
+    let mut stream: Box<dyn ReadWrite> = if opts.plaintext {
         Box::new(tcp)
     } else {
         let (identity, created) = ffsync::transport::Identity::load_or_create()?;
@@ -297,7 +350,7 @@ fn run_send(
             println!("identity created: {}", identity.fingerprint());
             println!("(share this fingerprint out-of-band so peers can pin it)");
         }
-        let policy = resolve_pin_policy(trust_flag.as_deref(), &host)?;
+        let policy = resolve_pin_policy(opts.trust_flag.as_deref(), &host)?;
         let (tls, presented) = ffsync::transport::client_session(
             tcp,
             &identity,
@@ -316,7 +369,7 @@ fn run_send(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
         mtime: None,
-        force_checksum,
+        force_checksum: opts.force_checksum,
         tree: false,
     };
     let pipeline = PipelineConfig::default();
@@ -338,19 +391,36 @@ fn io_err(e: &SyncError) -> std::io::Error {
 fn run_receive(
     file: PathBuf,
     port: u16,
-    force_checksum: bool,
     from: Option<PathBuf>,
-    plaintext: bool,
-    trust_flag: Option<String>,
-    no_delete: bool,
+    opts: CliOptions,
 ) -> std::io::Result<()> {
+    let CliOptions {
+        force_checksum,
+        plaintext,
+        trust_flag,
+        no_delete,
+        excludes,
+    } = opts;
     if file.is_dir() {
         if from.is_some() {
             return Err(std::io::Error::other(
                 "--from is single-file only (tree sync has no old-file concept)",
             ));
         }
-        return run_tree_receive(file, port, force_checksum, plaintext, trust_flag, no_delete);
+        return run_tree_receive(
+            file,
+            port,
+            force_checksum,
+            plaintext,
+            trust_flag,
+            no_delete,
+            excludes,
+        );
+    }
+    if !excludes.is_empty() {
+        return Err(std::io::Error::other(
+            "--exclude/--exclude-from apply to tree mode only (pass a directory)",
+        ));
     }
     let local_source = from.unwrap_or_else(|| file.clone());
     if !local_source.is_file() {
@@ -420,6 +490,7 @@ fn run_tree_send(
     force_checksum: bool,
     plaintext: bool,
     trust_flag: Option<String>,
+    excludes: Vec<String>,
 ) -> std::io::Result<()> {
     let (host, port) = parse_host_port(&addr);
     println!("connecting to {host}:{port} ...");
@@ -437,6 +508,7 @@ fn run_tree_send(
         root,
         force_checksum,
         no_delete: false, // the sender never deletes; the flag is receiver-side
+        excludes,
     };
     let pipeline = PipelineConfig::default();
     let outcome = match tree_send(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -460,6 +532,7 @@ fn run_tree_receive(
     plaintext: bool,
     trust_flag: Option<String>,
     no_delete: bool,
+    excludes: Vec<String>,
 ) -> std::io::Result<()> {
     if !root.exists() {
         std::fs::create_dir_all(&root)?;
@@ -478,6 +551,7 @@ fn run_tree_receive(
         root,
         force_checksum,
         no_delete,
+        excludes,
     };
     let pipeline = PipelineConfig::default();
     let outcome = match tree_receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -728,6 +802,7 @@ fn main() {
             let mut plaintext = false;
             let mut trust_flag = None;
             let mut no_delete = false;
+            let mut excludes: Vec<String> = Vec::new();
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -740,6 +815,18 @@ fn main() {
                         trust_flag = Some(v.to_string());
                     }
                     "--no-delete" => no_delete = true,
+                    "--exclude" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--exclude requires a pattern"));
+                        excludes.push(v.to_string());
+                    }
+                    "--exclude-from" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--exclude-from requires a path"));
+                        read_exclude_file(v, &mut excludes);
+                    }
                     "--help" | "-h" => {
                         print!("{}", USAGE);
                         return;
@@ -756,12 +843,21 @@ fn main() {
             }
             let file = PathBuf::from(&positional[0]);
             let addr = positional[1].clone();
-            run_send(file, addr, force_checksum, plaintext, trust_flag, no_delete).unwrap_or_else(
-                |e| {
-                    eprintln!("error: {}", e);
-                    std::process::exit(1);
+            run_send(
+                file,
+                addr,
+                CliOptions {
+                    force_checksum,
+                    plaintext,
+                    trust_flag,
+                    no_delete,
+                    excludes,
                 },
-            );
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
         }
         "receive" => {
             let mut positional: Vec<String> = Vec::new();
@@ -770,6 +866,7 @@ fn main() {
             let mut trust_flag = None;
             let mut from = None;
             let mut no_delete = false;
+            let mut excludes: Vec<String> = Vec::new();
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -786,6 +883,18 @@ fn main() {
                         from = Some(PathBuf::from(v));
                     }
                     "--no-delete" => no_delete = true,
+                    "--exclude" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--exclude requires a pattern"));
+                        excludes.push(v.to_string());
+                    }
+                    "--exclude-from" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--exclude-from requires a path"));
+                        read_exclude_file(v, &mut excludes);
+                    }
                     "--help" | "-h" => {
                         print!("{}", USAGE);
                         return;
@@ -807,11 +916,14 @@ fn main() {
             run_receive(
                 file,
                 port,
-                force_checksum,
                 from,
-                plaintext,
-                trust_flag,
-                no_delete,
+                CliOptions {
+                    force_checksum,
+                    plaintext,
+                    trust_flag,
+                    no_delete,
+                    excludes,
+                },
             )
             .unwrap_or_else(|e| {
                 eprintln!("error: {}", e);

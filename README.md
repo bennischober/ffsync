@@ -22,9 +22,9 @@ commands.
 > disconnects. Trees sync by metadata triage (D17): only changed files get
 > conversations, synced files adopt the sender's mtime, and a run with
 > nothing changed reads metadata only. Deletions of receiver-only files
-> apply after every transfer succeeded, opt-out with `--no-delete`. Not
-> implemented yet: exclude patterns, parallel streams (QUIC). See
-> [roadmap](#roadmap) below.
+> apply after every transfer succeeded, opt-out with `--no-delete`.
+> Exclude patterns filter tree sessions (§16.7). Not implemented yet:
+> parallel streams (QUIC). See [roadmap](#roadmap) below.
 
 ## Why
 
@@ -184,6 +184,26 @@ never destroys data). Because synced files carry the sender's mtime, a
 second run with nothing changed reads metadata only — no hashing, no
 transfer, a handful of frames.
 
+**Exclude patterns** keep paths out of a tree session entirely — never
+transferred, never deleted, never reported:
+
+```bash
+# Sender: sync the tree but not build output or caches (repeatable)
+ffsync send ./project 127.0.0.1:7788 --exclude target/ --exclude "*.log" --exclude node_modules
+
+# Receiver: patterns from a file; they also protect matching paths from deletion
+ffsync receive ./project 7788 --exclude-from ./ffsync-excludes.txt
+```
+
+Grammar: `*` and `?` never cross `/`; `**` as a whole segment matches any
+depth; `[a-z]`/`[!a-z]` are character classes; a pattern containing `/`
+matches from the tree root, without it matches the basename at any depth;
+a trailing `/` restricts to directories. The sender's patterns rule the
+session (they travel in the protocol, so both peers filter identically);
+a receiver's own patterns additionally protect matching paths — and
+everything under an excluded directory — from deletion (e.g. keep local
+`secrets/` while syncing everything else).
+
 **Transport security is on by default** (D16): both peers generate a
 self-signed certificate on first run and authenticate each other by
 fingerprint. On first contact each side prints the peer's fingerprint and
@@ -325,14 +345,17 @@ The reasoning is the product; it is all recorded:
   tree, sequential per-file conversations over one connection, mtime
   preservation, deferred deletes with `--no-delete`, empty files/dirs
   first-class.
-- **Next - excludes/pattern matching** (`node_modules`, `.git`): the most
-  requested missing piece for real trees; deliberately not shipped in 0.3
-  (a wrong exclude silently syncs the wrong set — worth doing properly).
-- **Later - parallel per-file streams / QUIC transport** (D13): connection
+- **Done (unreleased) - excludes/pattern matching (§16.7):** `--exclude`
+  and `--exclude-from` filter tree sessions; the sender's patterns travel
+  in the protocol so both peers filter identically, and a receiver's own
+  patterns protect paths from deletion. No negation syntax yet
+  (re-includes may come later).
+- **Next - parallel per-file streams / QUIC transport** (D13): connection
   migration for the "friend over the internet" case; plain TCP and
   TLS-over-TCP stay available.
 - **Later - SeqCDC and other chunkers** as they mature; the `Chunker` trait
   makes swapping cheap (registered as F2).
+- **Later - permissions/xattrs/symlinks as first-class metadata** (D9).
 
 ## License
 

@@ -62,6 +62,10 @@ pub struct TreeSendRequest {
     pub force_checksum: bool,
     /// Do not delete receiver-only files (§16.5 opt-out).
     pub no_delete: bool,
+    /// Exclude patterns (§16.7). The sender's patterns govern BOTH sides'
+    /// scans (they travel in TREE_BEGIN); invalid patterns fail the session
+    /// before any wire traffic.
+    pub excludes: Vec<String>,
 }
 
 /// Everything the receiver needs for a tree session.
@@ -70,6 +74,10 @@ pub struct TreeReceiveRequest {
     pub root: PathBuf,
     pub force_checksum: bool,
     pub no_delete: bool,
+    /// The receiver's own exclude patterns (§16.7): they never touch
+    /// manifests (the sender's do that) — they only protect paths from the
+    /// delete pass (§16.5).
+    pub excludes: Vec<String>,
 }
 
 /// Outcome of a completed tree session.
@@ -135,10 +143,12 @@ fn read_tree_begin(stream: &mut impl Read) -> Result<(TreeBegin, TreeManifest), 
 fn send_tree_begin(
     stream: &mut impl Write,
     flags: u16,
+    excludes: &[String],
     manifest: &TreeManifest,
 ) -> Result<(), SyncError> {
     TreeBegin {
         flags,
+        excludes: excludes.to_vec(),
         entries: manifest_to_wire(manifest),
     }
     .into_frame()?
@@ -174,7 +184,9 @@ where
 {
     // ---- Scan our tree (§16.1) ----
     progress(TreeProgress::Scanning);
-    let manifest = TreeManifest::scan(&request.root).map_err(|e| {
+    let excludes = tree::ExcludeSet::from_patterns(&request.excludes)
+        .map_err(|e| SyncError::Protocol(format!("bad exclude pattern: {e}")))?;
+    let manifest = TreeManifest::scan_with_excludes(&request.root, &excludes).map_err(|e| {
         SyncError::Protocol(format!(
             "cannot scan tree {}: {}",
             request.root.display(),
@@ -190,10 +202,14 @@ where
         TREE_FLAG_NO_DELETE
     } else {
         0
+    } | if !request.excludes.is_empty() {
+        message::TREE_FLAG_EXCLUDES
+    } else {
+        0
     };
 
     // ---- TREE_BEGIN exchange ----
-    send_tree_begin(stream, flags, &manifest)?;
+    send_tree_begin(stream, flags, &request.excludes, &manifest)?;
     let (peer_begin, peer_manifest) = read_tree_begin(stream)?;
     let checksum = request.force_checksum || (peer_begin.flags & TREE_FLAG_CHECKSUM) != 0;
     // no_delete on the sender only suppresses the RECEIVER's deletes; the
@@ -315,15 +331,23 @@ pub fn tree_receive<S>(
 where
     S: Read + Write,
 {
-    // ---- Scan our tree (§16.1) ----
+    // ---- TREE_BEGIN exchange (receiver second) ----
+    // Read the sender's envelope FIRST: its exclude patterns govern BOTH
+    // sides' scans (§16.7) — our manifest must be filtered with them before
+    // it goes on the wire, or the two triages diverge (§16.4 contract).
+    // No deadlock: the sender writes its TREE_BEGIN before blocking on ours.
     progress(TreeProgress::Scanning);
-    let manifest = TreeManifest::scan(&request.root).map_err(|e| {
-        SyncError::Protocol(format!(
-            "cannot scan tree {}: {}",
-            request.root.display(),
-            e
-        ))
-    })?;
+    let (peer_begin, peer_manifest) = read_tree_begin(stream)?;
+    let sender_excludes = tree::ExcludeSet::from_patterns(&peer_begin.excludes)
+        .map_err(|e| SyncError::Protocol(format!("peer sent bad exclude pattern: {e}")))?;
+    let manifest =
+        TreeManifest::scan_with_excludes(&request.root, &sender_excludes).map_err(|e| {
+            SyncError::Protocol(format!(
+                "cannot scan tree {}: {}",
+                request.root.display(),
+                e
+            ))
+        })?;
 
     let flags = if request.force_checksum {
         TREE_FLAG_CHECKSUM
@@ -334,10 +358,12 @@ where
     } else {
         0
     };
+    // The receiver's own patterns never touch manifests (§16.7); they only
+    // guard the delete pass below. They are NOT advertised on the wire.
+    let own_excludes = tree::ExcludeSet::from_patterns(&request.excludes)
+        .map_err(|e| SyncError::Protocol(format!("bad exclude pattern: {e}")))?;
 
-    // ---- TREE_BEGIN exchange (receiver second) ----
-    let (peer_begin, peer_manifest) = read_tree_begin(stream)?;
-    send_tree_begin(stream, flags, &manifest)?;
+    send_tree_begin(stream, flags, &[], &manifest)?;
     let checksum = request.force_checksum || (peer_begin.flags & TREE_FLAG_CHECKSUM) != 0;
     let no_delete = request.no_delete || (peer_begin.flags & TREE_FLAG_NO_DELETE) != 0;
     let mut conversation_paths: Vec<String> = Vec::new();
@@ -505,12 +531,19 @@ where
     }
 
     // ---- Deletions (§16.5): only after every conversation succeeded ----
+    // Exclude protection (§16.7): paths matching the receiver's own patterns
+    // — directly or via an excluded ancestor — are never deleted, even
+    // though the (sender-filtered) manifests marked them receiver-only.
     let mut deleted_count: u32 = 0;
     let mut deleted_bytes: u64 = 0;
     if !no_delete && !deletions.is_empty() {
         // Deepest paths first so directories empty out before removal.
         deletions.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, (rel, size)) in deletions.iter().enumerate() {
+            let kind = manifest.get(rel).map(|e| e.kind).unwrap_or(EntryKind::File);
+            if own_excludes.matches_path_or_ancestor(rel, kind) {
+                continue;
+            }
             let p = abs_path(&request.root, rel);
             let res = if p.is_dir() {
                 std::fs::remove_dir(&p)

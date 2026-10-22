@@ -505,17 +505,39 @@ pub struct TreeEntryWire {
     pub mtime_nanos: u32,
 }
 
-/// TREE_BEGIN payload: flags u16, entry_count u64, then entries.
+/// TREE_BEGIN payload: flags u16, then — only when the `excludes` flag
+/// (bit 2, §16.7) is set — the pattern section, then `entry_count u64` and
+/// the entries (§16.2 layout).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeBegin {
     pub flags: u16,
+    /// Exclude patterns (present only when `TREE_FLAG_EXCLUDES` is set).
+    pub excludes: Vec<String>,
     pub entries: Vec<TreeEntryWire>,
 }
+
+/// TREE_BEGIN flag bit 2: the payload carries the exclude-pattern section
+/// (§16.7). Defined here next to the codec whose layout it gates.
+pub const TREE_FLAG_EXCLUDES: u16 = 1 << 2;
 
 impl TreeBegin {
     pub fn into_frame(self) -> io::Result<Frame> {
         let mut payload = Vec::with_capacity(10 + self.entries.len() * 24);
         payload.extend_from_slice(&self.flags.to_le_bytes());
+        if self.flags & TREE_FLAG_EXCLUDES != 0 {
+            payload.extend_from_slice(&(self.excludes.len() as u32).to_le_bytes());
+            for pat in &self.excludes {
+                let pat_bytes = pat.as_bytes();
+                if pat_bytes.len() > u16::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("exclude pattern longer than {} bytes", u16::MAX),
+                    ));
+                }
+                payload.extend_from_slice(&(pat_bytes.len() as u16).to_le_bytes());
+                payload.extend_from_slice(pat_bytes);
+            }
+        }
         payload.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
         for e in &self.entries {
             let path_bytes = e.rel_path.as_bytes();
@@ -542,6 +564,25 @@ impl TreeBegin {
         let p = &frame.payload[..];
         let mut pos = 0usize;
         let flags = read_u16_le(p, &mut pos)?;
+        let mut excludes = Vec::new();
+        if flags & TREE_FLAG_EXCLUDES != 0 {
+            let pat_count = read_u32_le(p, &mut pos)? as usize;
+            // Each pattern is at least 3 bytes on the wire (2 len + 1 char);
+            // reject absurd counts before allocating (§12 spirit).
+            if pat_count > (p.len().saturating_sub(pos)) / 3 + 1 {
+                return Err(MessageError::Malformed(
+                    "exclude pattern count exceeds payload",
+                ));
+            }
+            for _ in 0..pat_count {
+                let pat_len = read_u16_le(p, &mut pos)? as usize;
+                let pat = read_bytes(p, &mut pos, pat_len)?;
+                let raw = std::str::from_utf8(pat)
+                    .map_err(|_| MessageError::Malformed("exclude pattern is not UTF-8"))?
+                    .to_string();
+                excludes.push(raw);
+            }
+        }
         let count = read_u64_le(p, &mut pos)? as usize;
         // Resource limit (§12 spirit): a manifest claiming absurd counts must
         // not allocate for them upfront. Each entry is at least 24 bytes on
@@ -575,7 +616,11 @@ impl TreeBegin {
         if pos != p.len() {
             return Err(MessageError::Malformed("trailing bytes in TREE_BEGIN"));
         }
-        Ok(Self { flags, entries })
+        Ok(Self {
+            flags,
+            excludes,
+            entries,
+        })
     }
 }
 
