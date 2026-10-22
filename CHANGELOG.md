@@ -27,6 +27,17 @@ All notable changes to ffsync are documented here. The format follows
   version bumped to 2; HELLO gained `file_mtime_nanos`). Found by the
   warm-start tests.
 
+### Changed
+
+- CLI polish: `--help` and `--version` (also per-command, `-h`/`-V`), unknown
+  flags are now rejected on `send` (a typo'd `--checkum` used to be silently
+  ignored, changing sync semantics), pre-flight errors with actionable hints
+  (missing source, missing local source, connection refused), an outcome line
+  with effective throughput and wall time, `receive <port> 0` binds an
+  OS-assigned port and prints it (for scripted runs), and bracketed IPv6
+  `[host]:port` parsing on `send` (receive stays IPv4-only for now).
+  Sub-second durations render as milliseconds.
+
 ## [0.1.0] - 2026-10-22
 
 First working implementation: single-file sync between two peers over TCP.
