@@ -410,6 +410,22 @@ pub fn read_error(inp: &mut impl Read) -> Result<(ErrorCode, String), MessageErr
     Ok((code, msg))
 }
 
+/// Reads an ERROR frame payload from an already-received frame.
+pub fn read_error_payload(frame: &Frame) -> Result<(ErrorCode, String), MessageError> {
+    if frame.ftype != framing::T_ERROR {
+        return Err(MessageError::UnexpectedType(frame.ftype));
+    }
+    let p = &frame.payload;
+    let mut pos = 0usize;
+    let code = read_u16_le(p, &mut pos)?;
+    let code = ErrorCode::from_u16(code).ok_or(MessageError::Malformed("unknown error code"))?;
+    let msg_len = read_u16_le(p, &mut pos)? as usize;
+    let msg = read_bytes(p, &mut pos, msg_len)?;
+    let msg = String::from_utf8(msg.to_vec())
+        .map_err(|_| MessageError::Malformed("error message is not UTF-8"))?;
+    Ok((code, msg))
+}
+
 /// DATA frame: hash + zstd-compressed chunk bytes.
 pub fn encode_data(hash: Hash, compressed: &[u8]) -> io::Result<Frame> {
     let mut payload = Vec::with_capacity(32 + compressed.len());

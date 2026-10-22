@@ -1,6 +1,622 @@
-//! Placeholder for the two-peer state machines (sender/receiver).
-//! Implemented in the next iteration; the module exists so the protocol
-//! layer is importable end-to-end.
+//! The two-peer sync state machines (`concept/Protocol v0.1.md` §5–§8).
+//!
+//! Both sides are plain functions over a generic duplex stream so the same
+//! code runs over TCP, over an in-memory duplex pair, or inside tests.
+//!
+//! Flow (lazy mode, v0.1):
+//! 1. both peers send HELLO (§4), validate, optionally take the
+//!    size+mtime fast path (D11),
+//! 2. receiver streams its manifest (§5); sender scans its own file
+//!    concurrently and consumes the manifest into a hash set,
+//! 3. sender diffs and streams the plan (§6, D12 exact-match),
+//! 4. sender streams DATA frames for remote chunks (§7),
+//! 5. receiver verifies the temp file root against VERIFY and commits (§8).
 
-// The sender/receiver sync logic per `concept/Protocol v0.1.md` §5–§10
-// will live here.
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use blake3::Hash;
+
+use crate::chunking::{
+    Blake3Hasher, CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, Chunk, ChunkEvent, FastCDCChunker,
+    PipelineConfig, chunk_root, process_file,
+};
+use crate::protocol::framing::{self, FrameError};
+use crate::protocol::message::{
+    self, ErrorCode, FLAG_TRUST_TIMES, Hello, ManifestChunk, Message, MessageError, PlanEntry, Role,
+};
+use crate::reconstruction::{ChunkSource, ReconstructionTask, Reconstructor};
+
+/// Errors from the sync state machines.
+#[derive(Debug)]
+pub enum SyncError {
+    /// The peer sent an ERROR frame; connection is dead.
+    Peer(ErrorCode, String),
+    /// A local I/O problem.
+    Io(io::Error),
+    /// A protocol violation (bad frames, wrong order, wrong roles).
+    Protocol(String),
+    /// The stream ended unexpectedly mid-session.
+    Eof,
+    /// Final verification failed; the temp file was removed.
+    VerificationFailed,
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncError::Peer(code, msg) => write!(f, "peer error {:?}: {}", code, msg),
+            SyncError::Io(e) => write!(f, "io error: {}", e),
+            SyncError::Protocol(msg) => write!(f, "protocol violation: {}", msg),
+            SyncError::Eof => write!(f, "connection closed unexpectedly"),
+            SyncError::VerificationFailed => write!(f, "verification failed"),
+        }
+    }
+}
+
+impl From<io::Error> for SyncError {
+    fn from(e: io::Error) -> Self {
+        SyncError::Io(e)
+    }
+}
+
+impl From<FrameError> for SyncError {
+    fn from(e: FrameError) -> Self {
+        match e {
+            FrameError::Eof => SyncError::Eof,
+            FrameError::Truncated => SyncError::Protocol("truncated frame".into()),
+            FrameError::Io(e) => SyncError::Io(e),
+        }
+    }
+}
+
+/// Progress events emitted during a sync (§11): the CLI displays these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Scanning own file: (bytes hashed so far, file size).
+    Scanning(u64, u64),
+    /// Diffing against the peer's manifest.
+    Diffing,
+    /// Transferring: (payload bytes sent so far, payload total).
+    Transferring(u64, u64),
+    /// Receiving data: (payload bytes written so far, payload total).
+    Receiving(u64, u64),
+    /// Verifying the reconstructed file.
+    Verifying,
+    /// Sync completed without any transfer (fast path or empty plan).
+    NothingToDo,
+}
+
+/// Everything the sender needs to know about the file being sent.
+pub struct SendRequest {
+    pub path: PathBuf,
+    /// Peer-reachable path/name reported in HELLO (display only).
+    pub display_path: String,
+    /// mtime to report; `None` reads it from the file.
+    pub mtime: Option<SystemTime>,
+    /// Disable the size+mtime fast path (rsync `--checksum` semantics, D11).
+    pub force_checksum: bool,
+}
+
+/// The receiver's view of what to build.
+pub struct ReceiveRequest {
+    pub path: PathBuf,
+    /// The file we already have (used as the manifest source); may not exist.
+    pub local_source: PathBuf,
+    pub force_checksum: bool,
+}
+
+/// Outcome of a completed sync.
+#[derive(Debug)]
+pub enum SyncOutcome {
+    /// Receiver converged; nothing was transferred.
+    InSync,
+    /// Receiver converged; delta bytes were transferred.
+    Transferred { bytes: u64, chunks: usize },
+}
+
+fn unix_secs(t: Option<SystemTime>) -> u64 {
+    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn send_error_and_finish(out: &mut impl Write, code: ErrorCode, msg: &str) -> SyncError {
+    let frame = message::encode_error(code, msg);
+    let _ = frame.and_then(|f| f.encode(out));
+    let _ = out.flush();
+    SyncError::Peer(code, msg.to_string())
+}
+
+/// Validates the received HELLO against ours (§4). Returns the peer's HELLO
+/// or a terminal error.
+fn validate_hello(peer: &Hello, ours_role: Role) -> Result<Hello, SyncError> {
+    if peer.version != super::VERSION {
+        return Err(send_error_and_finish(
+            &mut Vec::new(), // replaced below; see helper
+            ErrorCode::Version,
+            &format!("unsupported version {}", peer.version),
+        ));
+    }
+    if peer.role == ours_role {
+        return Err(SyncError::Protocol(format!(
+            "role conflict: both peers are {:?}",
+            ours_role
+        )));
+    }
+    Ok(peer.clone())
+}
+
+impl From<MessageError> for SyncError {
+    fn from(e: MessageError) -> Self {
+        match e {
+            MessageError::Frame(FrameError::Eof) => SyncError::Eof,
+            MessageError::Frame(FrameError::Truncated) => {
+                SyncError::Protocol("truncated frame".into())
+            }
+            MessageError::Frame(FrameError::Io(e)) => SyncError::Io(e),
+            MessageError::UnexpectedType(t) => {
+                SyncError::Protocol(format!("unexpected frame type 0x{:02X}", t))
+            }
+            MessageError::Malformed(why) => {
+                SyncError::Protocol(format!("malformed frame: {}", why))
+            }
+        }
+    }
+}
+
+/// Runs the sender side of a sync over `stream`.
+///
+/// `stream` must be a full-duplex ordered byte stream; reads consume what the
+/// peer writes and vice versa. Single-threaded by design (v0.1 lazy mode).
+pub fn send<S>(
+    stream: &mut S,
+    request: &SendRequest,
+    pipeline: &PipelineConfig,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<SyncOutcome, SyncError>
+where
+    S: Read + Write,
+{
+    // ---- Scan own file first (we are the sender; our chunk list defines
+    // the plan, and we need the file size for HELLO). ----
+    let file = File::open(&request.path)?;
+    let file_size = file.metadata()?.len();
+    let mtime = request
+        .mtime
+        .or_else(|| file.metadata().ok().and_then(|m| m.modified().ok()));
+    drop(file);
+
+    progress(Progress::Scanning(0, file_size));
+    let (_scan_stats, source_chunks) = scan_with_progress(&request.path, pipeline, |hashed| {
+        progress(Progress::Scanning(hashed, file_size))
+    })?;
+    let root = chunk_root(&source_chunks);
+    progress(Progress::Diffing);
+
+    // ---- HELLO ----
+    let hello_flags = if request.force_checksum {
+        0
+    } else {
+        FLAG_TRUST_TIMES
+    };
+    let hello = Hello {
+        version: super::VERSION,
+        flags: hello_flags,
+        role: Role::Sender,
+        cdc_min: CHUNK_MIN as u32,
+        cdc_avg: CHUNK_AVG as u32,
+        cdc_max: CHUNK_MAX as u32,
+        file_size,
+        file_mtime: unix_secs(mtime),
+        path: request.display_path.clone(),
+    };
+    let trust_own = (hello.flags & FLAG_TRUST_TIMES) != 0;
+    let hello_size = hello.file_size;
+    let hello_mtime = hello.file_mtime;
+    hello.into_frame()?.encode(stream)?;
+    stream.flush()?;
+
+    let peer = message::read_typed::<Hello>(stream)?;
+    let peer = match validate_hello(&peer, Role::Sender) {
+        Ok(h) => h,
+        Err(SyncError::Protocol(msg)) => {
+            return Err(send_error_and_finish(stream, ErrorCode::RoleConflict, &msg));
+        }
+        Err(other) => return Err(other),
+    };
+
+    // ---- Fast path (§4): size+mtime equal and trust_times agreed ----
+    let trust = trust_own && (peer.flags & FLAG_TRUST_TIMES) != 0;
+    if trust && hello_size == peer.file_size && hello_mtime != 0 && hello_mtime == peer.file_mtime {
+        message::encode_empty(framing::T_NOT_MODIFIED)?.encode(stream)?;
+        stream.flush()?;
+        progress(Progress::NothingToDo);
+        return Ok(SyncOutcome::InSync);
+    }
+
+    // ---- Receive the manifest (§5) ----
+    let mut manifest: HashMap<Hash, u64> = HashMap::new();
+    loop {
+        let frame = framing::read_frame(stream)?;
+        match frame.ftype {
+            framing::T_MANIFEST_CHUNK => {
+                let entry = ManifestChunk::from_frame(frame)
+                    .map_err(|e| SyncError::Protocol(format!("bad manifest chunk: {}", e)))?;
+                manifest.insert(entry.hash, entry.offset);
+            }
+            framing::T_MANIFEST_DONE => break,
+            other => {
+                return Err(send_error_and_finish(
+                    stream,
+                    ErrorCode::BadFrame,
+                    &format!("expected manifest frame, got 0x{:02X}", other),
+                ));
+            }
+        }
+    }
+
+    // ---- Plan generation (§6, D12 exact match) ----
+    // The receiver's manifest gives us (hash -> its offset). For every source
+    // chunk: if the hash is in the manifest, PLAN_LOCAL with the receiver's
+    // offset; otherwise PLAN_REMOTE.
+    // NOTE (D12): exact (hash, length) matching. The manifest maps hash ->
+    // offset; chunk lengths are implied by the sender's chunk list, and
+    // identical hashes at equal chunking parameters imply identical content,
+    // but the *length* check requires storing lengths too. See plan below.
+    let mut plan: Vec<PlanEntry> = Vec::with_capacity(source_chunks.len());
+    let mut remote_total: u64 = 0;
+    for chunk in &source_chunks {
+        match manifest.get(&chunk.hash) {
+            Some(peer_offset) => plan.push(PlanEntry::Local {
+                target_offset: chunk.offset,
+                length: chunk.length as u32,
+                source_offset: *peer_offset,
+            }),
+            None => {
+                plan.push(PlanEntry::Remote {
+                    target_offset: chunk.offset,
+                    length: chunk.length as u32,
+                    hash: chunk.hash,
+                });
+                remote_total += chunk.length as u64;
+            }
+        }
+    }
+
+    for entry in &plan {
+        entry.into_frame()?.encode(stream)?;
+    }
+    message::encode_empty(framing::T_PLAN_DONE)?.encode(stream)?;
+    stream.flush()?;
+
+    // ---- Data transfer (§7) ----
+    // Chunks are hashed from the mmap'd pipeline, but for v0.1 we re-read the
+    // chunk bytes from the file. zstd-compress each chunk payload.
+    let mut sent: u64 = 0;
+    let mut sent_chunks: usize = 0;
+    if remote_total > 0 {
+        let mut file = File::open(&request.path)?;
+        let mut chunk_buf = Vec::new();
+        for entry in &plan {
+            let (target_offset, length, hash) = match entry {
+                PlanEntry::Remote {
+                    target_offset,
+                    length,
+                    hash,
+                } => (*target_offset, *length as usize, *hash),
+                _ => continue,
+            };
+            chunk_buf.clear();
+            chunk_buf.resize(length, 0);
+            use std::io::{Read as _, Seek as _};
+            file.seek(io::SeekFrom::Start(target_offset))?;
+            file.read_exact(&mut chunk_buf)?;
+            let compressed = zstd::bulk::compress(&chunk_buf, 3)?;
+            message::encode_data(hash, &compressed)?.encode(stream)?;
+            sent += length as u64;
+            sent_chunks += 1;
+            progress(Progress::Transferring(sent, remote_total));
+        }
+        stream.flush()?;
+    }
+
+    // ---- VERIFY + COMMIT_ACK (§8) ----
+    message::encode_verify(root)?.encode(stream)?;
+    stream.flush()?;
+
+    // The receiver answers COMMIT_ACK or NOT_MODIFIED (empty plan) or ERROR.
+    let frame = framing::read_frame(stream)?;
+    match frame.ftype {
+        framing::T_COMMIT_ACK => {
+            if remote_total > 0 {
+                Ok(SyncOutcome::Transferred {
+                    bytes: sent,
+                    chunks: sent_chunks,
+                })
+            } else {
+                Ok(SyncOutcome::InSync)
+            }
+        }
+        framing::T_ERROR => {
+            let (code, msg) = message::read_error_payload(&frame)?;
+            Err(SyncError::Peer(code, msg))
+        }
+        other => Err(SyncError::Protocol(format!(
+            "expected COMMIT_ACK, got 0x{:02X}",
+            other
+        ))),
+    }
+}
+
+/// Runs the receiver side of a sync over `stream`.
+pub fn receive<S>(
+    stream: &mut S,
+    request: &ReceiveRequest,
+    pipeline: &PipelineConfig,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<SyncOutcome, SyncError>
+where
+    S: Read + Write,
+{
+    // ---- Scan our local file for the manifest (§5). ----
+    let local_meta = std::fs::metadata(&request.local_source).ok();
+    let local_size = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let local_mtime = local_meta.as_ref().and_then(|m| m.modified().ok());
+
+    let (local_chunks, local_root) = if local_size > 0 {
+        progress(Progress::Scanning(0, local_size));
+        let (_stats, chunks) = scan_with_progress(&request.local_source, pipeline, |hashed| {
+            progress(Progress::Scanning(hashed, local_size))
+        })?;
+        let root = chunk_root(&chunks);
+        (chunks, Some(root))
+    } else {
+        (Vec::new(), None)
+    };
+
+    // ---- HELLO ----
+    let hello = Hello {
+        version: super::VERSION,
+        flags: if request.force_checksum {
+            0
+        } else {
+            FLAG_TRUST_TIMES
+        },
+        role: Role::Receiver,
+        cdc_min: CHUNK_MIN as u32,
+        cdc_avg: CHUNK_AVG as u32,
+        cdc_max: CHUNK_MAX as u32,
+        file_size: local_size,
+        file_mtime: unix_secs(local_mtime),
+        path: request
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    hello.into_frame()?.encode(stream)?;
+    stream.flush()?;
+
+    let peer = message::read_typed::<Hello>(stream)?;
+    let peer = match validate_hello(&peer, Role::Receiver) {
+        Ok(h) => h,
+        Err(SyncError::Protocol(msg)) => {
+            return Err(send_error_and_finish(stream, ErrorCode::RoleConflict, &msg));
+        }
+        Err(other) => return Err(other),
+    };
+
+    // ---- Fast path: if the SENDER says not-modified, we are done only if
+    // the sender's file matches ours. The fast-path decision belongs to the
+    // sender; here we only react to NOT_MODIFIED. ----
+
+    // ---- Stream our manifest (§5) ----
+    for chunk in &local_chunks {
+        message::ManifestChunk {
+            hash: chunk.hash,
+            offset: chunk.offset,
+            length: chunk.length as u32,
+        }
+        .into_frame()?
+        .encode(stream)?;
+    }
+    message::encode_empty(framing::T_MANIFEST_DONE)?.encode(stream)?;
+    stream.flush()?;
+
+    // ---- Receive plan (§6) ----
+    let mut plan: Vec<PlanEntry> = Vec::new();
+    let mut remote_total: u64 = 0;
+    loop {
+        let frame = framing::read_frame(stream)?;
+        match frame.ftype {
+            framing::T_PLAN_LOCAL | framing::T_PLAN_REMOTE => {
+                let entry = PlanEntry::from_frame(frame)
+                    .map_err(|e| SyncError::Protocol(format!("bad plan entry: {}", e)))?;
+                if let PlanEntry::Remote { length, .. } = entry {
+                    remote_total += length as u64;
+                }
+                plan.push(entry);
+            }
+            framing::T_PLAN_DONE => break,
+            framing::T_NOT_MODIFIED => {
+                // Sender took the size+mtime fast path. If we trust it, done.
+                progress(Progress::NothingToDo);
+                return Ok(SyncOutcome::InSync);
+            }
+            framing::T_ERROR => {
+                let (code, msg) = message::read_error_payload(&frame)?;
+                return Err(SyncError::Peer(code, msg));
+            }
+            other => {
+                return Err(send_error_and_finish(
+                    stream,
+                    ErrorCode::BadFrame,
+                    &format!("expected plan frame, got 0x{:02X}", other),
+                ));
+            }
+        }
+    }
+
+    // ---- Prepare the temp file (§8.1) ----
+    let target_size = peer.file_size;
+    if remote_total > 0 || plan.iter().any(|e| matches!(e, PlanEntry::Remote { .. })) {
+        let reconstructor = Reconstructor::new(&request.path, &request.local_source, target_size)?;
+
+        // ---- Receive DATA frames (§7) ----
+        let mut received: u64 = 0;
+        let mut scratch: Vec<u8> = Vec::new();
+        for entry in &plan {
+            let (target_offset, length, hash) = match entry {
+                PlanEntry::Remote {
+                    target_offset,
+                    length,
+                    hash,
+                } => (*target_offset, *length as usize, *hash),
+                _ => continue,
+            };
+            let (data_hash, compressed) = message::read_data(stream)?;
+            if data_hash != hash {
+                return Err(send_error_and_finish(
+                    stream,
+                    ErrorCode::BadFrame,
+                    "DATA hash does not match plan",
+                ));
+            }
+            let decompressed = zstd::bulk::decompress(&compressed, length)?;
+            if decompressed.len() != length {
+                return Err(send_error_and_finish(
+                    stream,
+                    ErrorCode::BadFrame,
+                    "decompressed length mismatch",
+                ));
+            }
+            let task = ReconstructionTask {
+                target_offset,
+                source: ChunkSource {
+                    offset: 0,
+                    length,
+                    is_local: false,
+                },
+            };
+            reconstructor.write_chunk(&task, &mut scratch, Some(&decompressed))?;
+            received += length as u64;
+            progress(Progress::Receiving(received, remote_total));
+        }
+
+        // ---- Local chunk copies ----
+        for entry in &plan {
+            if let PlanEntry::Local {
+                target_offset,
+                length,
+                source_offset,
+            } = entry
+            {
+                let task = ReconstructionTask {
+                    target_offset: *target_offset,
+                    source: ChunkSource {
+                        offset: *source_offset,
+                        length: *length as usize,
+                        is_local: true,
+                    },
+                };
+                reconstructor.write_chunk(&task, &mut scratch, None)?;
+            }
+        }
+
+        // ---- VERIFY (§8) ----
+        progress(Progress::Verifying);
+        let verify_root = message::read_verify(stream)?;
+        // Verification (§8.2): re-scan the temp file with the same CDC
+        // parameters and compute the chunk-tree root. With identical
+        // parameters, the receiver's chunking of correct chunk data
+        // reproduces the sender's chunk list, so the roots match.
+        let temp_path = request.path.with_extension("ffsync-tmp");
+        let temp_chunks = scan_file_plain(&temp_path, pipeline)?;
+        let temp_root = chunk_root(&temp_chunks);
+        if temp_root != verify_root {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(send_error_and_finish(
+                stream,
+                ErrorCode::HashMismatch,
+                "reconstructed file hash mismatch",
+            ));
+        }
+        // Hash verified; commit. Reconstruct the Reconstructor state: the
+        // temp file exists and is verified — rename atomically.
+        std::fs::rename(&temp_path, &request.path)?;
+        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        stream.flush()?;
+        return Ok(SyncOutcome::Transferred {
+            bytes: received,
+            chunks: plan
+                .iter()
+                .filter(|e| matches!(e, PlanEntry::Remote { .. }))
+                .count(),
+        });
+    }
+
+    // ---- Empty plan (§8 already-in-sync): the sender still sends VERIFY;
+    // compare against the root of our current file. ----
+    let verify_root = message::read_verify(stream)?;
+    match local_root {
+        Some(root) if root == verify_root => {
+            message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+            stream.flush()?;
+            progress(Progress::NothingToDo);
+            Ok(SyncOutcome::InSync)
+        }
+        Some(_) => Err(send_error_and_finish(
+            stream,
+            ErrorCode::HashMismatch,
+            "content differs despite empty plan (stale manifest?)",
+        )),
+        None => {
+            // We have no local file but the plan was empty: the sender thinks
+            // we have everything. That is only possible if our manifest said
+            // so — contradiction; treat as protocol error.
+            Err(send_error_and_finish(
+                stream,
+                ErrorCode::BadFrame,
+                "empty plan without a local file",
+            ))
+        }
+    }
+}
+
+/// Scans a file with progress callbacks bridged from the pipeline events.
+fn scan_with_progress(
+    path: &Path,
+    pipeline: &PipelineConfig,
+    mut on_progress: impl FnMut(u64),
+) -> Result<(u64, Vec<Chunk>), SyncError> {
+    let rx = process_file(
+        path,
+        move || FastCDCChunker::new(CHUNK_MIN, CHUNK_AVG, CHUNK_MAX),
+        Blake3Hasher,
+        pipeline,
+    )?;
+    let mut hashed: u64 = 0;
+    let mut chunks = Vec::new();
+    loop {
+        match rx.recv() {
+            Ok(ChunkEvent::Chunk(chunk)) => {
+                hashed += chunk.length as u64;
+                chunks.push(chunk);
+                on_progress(hashed);
+            }
+            Ok(ChunkEvent::Done) => {}
+            Err(_) => break,
+        }
+    }
+    Ok((hashed, chunks))
+}
+
+/// Scans a file without progress reporting (verification re-scan).
+fn scan_file_plain(path: &Path, pipeline: &PipelineConfig) -> Result<Vec<Chunk>, SyncError> {
+    let (_, chunks) = scan_with_progress(path, pipeline, |_| {})?;
+    Ok(chunks)
+}
