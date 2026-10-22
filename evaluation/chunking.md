@@ -97,6 +97,38 @@ for CDC boundary stability), warm page cache even at 1 GiB on this machine,
 development-machine noise. Real-content samples are still open (registered as
 F3-adjacent work for the real-world test).
 
+## Warm-start index: scan vs. reload (D15, 2026-10-22)
+
+Measured with `bench --warm --seed 42` (release build): one cold scan, one
+index write (what a successful sync pays at commit), one warm load (what
+every subsequent sync pays instead of the scan). The warm load is
+`load_index` = stat (size + nanosecond mtime) + decode + root re-derivation
+over the chunk list — no file contents read:
+
+| file | chunks | index size | cold scan | index write | warm load | speedup |
+|---|---|---|---|---|---|---|
+| 32 MiB | 105 | 4.58 KiB | 25.6 ms | 2.6 ms | 0.44 ms | 58x |
+| 1 GiB | 3 369 | 144.8 KiB | 350.3 ms | 3.1 ms | 0.62 ms | 563x |
+| 4 GiB | 13 460 | 578.4 KiB | 1039.6 ms | 6.2 ms | 1.13 ms | 918x |
+
+Findings:
+
+- **The warm load is essentially flat**: 0.4–1.1 ms from 32 MiB to 4 GiB —
+  it scales with the chunk count (~44 B/chunk to decode and re-hash), not
+  with file size. The cold scan scales with bytes. The crossover is
+  immediate: even a 32 MiB file warms 58x faster than it rescans.
+- **Index size is ~144 KiB per GiB** (3369 × 44 B + header) — the same
+  order as the wire manifest, as designed (identical 44-byte entry layout).
+- **Index write cost is negligible** (2.6–6.2 ms, one sequential
+  write + rename at commit).
+- Content verification: the reloaded index matches the cold scan exactly
+  (root + every chunk) in all runs — the D15 invariant "written only from
+  verified state, re-derived root catches corruption" holds end-to-end.
+
+Caveats: same development-machine, seeded-random-fixture caveats as above;
+the warm load was measured on a warm page cache (the index file is small —
+its cold-read cost is one disk seek, still far below any scan).
+
 > [!NOTE]
 > These results are no real benchmarks but rather observations during development. Actual benchmarks
 > may vary based on hardware, file types, and other factors. Benchmarks should also run in isolated

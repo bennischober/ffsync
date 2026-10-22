@@ -15,6 +15,7 @@ use blake3::Hash;
 use ffsync::chunking::{
     Blake3Hasher, Chunk, ChunkEvent, FastCDCChunker, Hasher, PipelineConfig, process_file,
 };
+use ffsync::index::FileIndex;
 use ffsync::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::{HashMap, HashSet};
@@ -96,6 +97,8 @@ struct BenchConfig {
     sweep: bool,
     /// Run the disconnect/resume simulation on the modified scenario.
     disconnect: bool,
+    /// Run the warm-start index simulation on the identical scenario (D15).
+    warm: bool,
 }
 
 impl BenchConfig {
@@ -192,6 +195,8 @@ Options:
   --cdc <m/a/M>    FastCDC sizes, e.g. 64k/256k/1m (default 256k/1m/4m)
   --sweep          run a chunk-size sweep (6 CDC configs) and compare deltas
   --disconnect     simulate a mid-transfer disconnect and compare resume costs
+  --warm           measure the warm-start index: cold scan + index write, then
+                   reload (stat-only) with content verification
   --out-dir <path> directory for fixtures and scratch output (default: {})
   --rsync          additionally compare against rsync (native, or via WSL)
   --json           print a machine-readable JSON summary as the last line
@@ -261,6 +266,7 @@ fn parse_args() -> BenchConfig {
         cdc: None,
         sweep: false,
         disconnect: false,
+        warm: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -306,6 +312,7 @@ fn parse_args() -> BenchConfig {
             }
             "--sweep" => cfg.sweep = true,
             "--disconnect" => cfg.disconnect = true,
+            "--warm" => cfg.warm = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -765,6 +772,77 @@ fn run_disconnect_simulation(
             "disconnect simulation failed verification",
         ));
     }
+    Ok(())
+}
+
+/// Reconstructs the target variant from the source file via `Reconstructor`.
+///
+/// Chunks whose hash exists in the source are copied locally (at the source
+/// chunk's offset); all other chunks are fed as simulated "network data" read
+/// from the real variant file at the right offset. The result is verified
+/// against the variant's root hash by `finalize`.
+fn run_warm_simulation(
+    file: &Path,
+    pipeline: &PipelineConfig,
+    cdc: (usize, usize, usize),
+) -> io::Result<()> {
+    println!();
+    println!("==== warm-start index simulation (D15) ====");
+    let size = fs::metadata(file)?.len();
+
+    // Cold pass: the real scan (what v0.1 pays on every run) + index write
+    // (what v0.2 pays once, at commit).
+    let (scan_stats, chunks) = scan_file(file, pipeline, cdc)?;
+    let index = FileIndex::from_scan(
+        chunks.clone(),
+        size,
+        ffsync::index::stat_mtime(file).unwrap_or((0, 0)),
+    );
+    let t_write = Instant::now();
+    ffsync::index::write_index(file, &index)?;
+    let write_us = t_write.elapsed().as_secs_f64() * 1e6;
+
+    // Warm pass: load + validate — must read no file content (stat-only).
+    let t_load = Instant::now();
+    let warm = ffsync::index::load_index(file);
+    let load_us = t_load.elapsed().as_secs_f64() * 1e6;
+    let Some(warm_idx) = warm else {
+        return Err(io::Error::other("warm index failed to load/validate"));
+    };
+
+    // The warm index must describe exactly the cold scan's content.
+    let content_ok = warm_idx == index;
+    let encoded_len = index.encode().len();
+
+    println!(
+        "file: {} ({} chunks, index {})",
+        fmt_bytes(size),
+        scan_stats.chunks,
+        fmt_bytes(encoded_len as u64)
+    );
+    println!(
+        "cold scan   {:>10.2} ms   ({} hashed, what every run pays without the index)",
+        scan_stats.total.as_secs_f64() * 1e3,
+        fmt_bytes(scan_stats.hashed_bytes)
+    );
+    println!(
+        "index write {:>10.2} µs   (once per successful sync, at commit)",
+        write_us
+    );
+    println!(
+        "warm load   {:>10.2} µs   (validate + decode, stat-only — no file contents read)",
+        load_us
+    );
+    println!(
+        "speedup     {:>10.1}x   (cold scan / warm load)",
+        scan_stats.total.as_secs_f64() * 1e6 / load_us.max(0.01)
+    );
+    if !content_ok {
+        return Err(io::Error::other(
+            "warm index does not match the cold scan (root or chunk mismatch)",
+        ));
+    }
+    println!("content verification: index matches cold scan exactly (root + all chunks)");
     Ok(())
 }
 
@@ -1529,6 +1607,10 @@ fn main() -> io::Result<()> {
         let (_, variant_chunks) = scan_file(modified, &pipeline, cdc)?;
         let (_, source_chunks) = scan_file(&source, &pipeline, cdc)?;
         run_disconnect_simulation(&source, modified, &source_chunks, &variant_chunks, cdc)?;
+    }
+
+    if cfg.warm {
+        run_warm_simulation(&source, &pipeline, cdc)?;
     }
 
     let rsync = if cfg.rsync {
