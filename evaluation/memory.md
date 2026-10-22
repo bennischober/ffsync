@@ -47,6 +47,12 @@ dropped with the pipeline. The repeated-sync check (private bytes stable
 across fresh processes at 1.7–7.4 MiB depending on role) shows no
 run-to-run growth mechanism.
 
+The structural guard is `tests/soak.rs` (ignored by default; run with
+`cargo test --test soak -- --ignored`): 100 sequential sessions inside one
+process under a counting global allocator, asserting net live heap stays
+flat. Measured delta after the hygiene pass: **−1.0 MiB over 100 sessions**
+(allocator returns freed arena pages).
+
 ## Caveats
 
 Development machine, warm page cache, Windows-only measurements; Linux

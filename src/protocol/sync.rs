@@ -32,6 +32,19 @@ use crate::protocol::message::{
 };
 use crate::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
 
+// Reusable per-thread zstd decompression context.
+//
+// `zstd::bulk::decompress` builds and drops a fresh context per call; the
+// receiver decompresses one chunk at a time on its own thread, so a
+// thread-local amortizes the context across the whole session.
+thread_local! {
+    static DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> =
+        std::cell::RefCell::new(
+            zstd::bulk::Decompressor::new()
+                .expect("zstd decompressor context allocation failed"),
+        );
+}
+
 /// Where a locally available chunk lives (D10 union manifest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalOrigin {
@@ -465,6 +478,10 @@ where
     if remote_total > 0 {
         let mut file = File::open(&request.path)?;
         let mut chunk_buf = Vec::new();
+        // One zstd context reused across all chunks: bulk::compress would
+        // create (and destroy) a fresh context per chunk, which shows up as
+        // allocation churn on many-small-chunk transfers.
+        let mut compressor = zstd::bulk::Compressor::new(3)?;
         for entry in &plan {
             let (target_offset, length, hash) = match entry {
                 PlanEntry::Remote {
@@ -479,7 +496,7 @@ where
             use std::io::{Read as _, Seek as _};
             file.seek(io::SeekFrom::Start(target_offset))?;
             file.read_exact(&mut chunk_buf)?;
-            let compressed = zstd::bulk::compress(&chunk_buf, 3)?;
+            let compressed = compressor.compress(&chunk_buf)?;
             message::encode_data(hash, &compressed)?.encode(stream)?;
             sent += length as u64;
             sent_chunks += 1;
@@ -929,11 +946,12 @@ where
                         source: ChunkSource {
                             offset: 0,
                             length: length as usize,
-                            is_local: false, // data is already in `scratch`
                         },
                     };
-                    let payload = scratch.clone();
-                    reconstructor.write_chunk(&task, &mut scratch, Some(&payload))?;
+                    // `scratch` holds the verified bytes; write them straight
+                    // from it (no clone — the old `&mut buf, Option<&data>`
+                    // signature forced a full-chunk copy per Local entry).
+                    reconstructor.write_chunk(&task, &scratch)?;
                 }
                 PlanEntry::Remote {
                     target_offset,
@@ -948,7 +966,12 @@ where
                             "DATA hash does not match plan",
                         ));
                     }
-                    let decompressed = zstd::bulk::decompress(&compressed, length as usize)?;
+                    // One zstd context reused across all chunks (see the
+                    // sender's data phase for the reasoning).
+                    let decompressed = DECOMPRESSOR.with(|d| {
+                        let mut decompressor = d.borrow_mut();
+                        decompressor.decompress(&compressed, length as usize)
+                    })?;
                     if decompressed.len() != length as usize {
                         return Err(send_error_and_finish(
                             stream,
@@ -970,10 +993,9 @@ where
                         source: ChunkSource {
                             offset: 0,
                             length: length as usize,
-                            is_local: false,
                         },
                     };
-                    reconstructor.write_chunk(&task, &mut scratch, Some(&decompressed))?;
+                    reconstructor.write_chunk(&task, &decompressed)?;
                     received += length as u64;
                     progress(Progress::Receiving(received, remote_total));
                 }

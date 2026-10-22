@@ -76,39 +76,35 @@ mod tests {
             // Hash of a 1MB block of 'A's
             let hash_a = blake3::hash(&vec![b'A'; chunk.length]);
 
-            let task = if chunk.hash == hash_a {
-                // We found it locally!
-                // (In this simple test, offset in V1 is same as V2 for 'A' parts)
-                ReconstructionTask {
-                    target_offset: chunk.offset,
-                    source: ChunkSource {
-                        offset: chunk.offset,
-                        length: chunk.length,
-                        is_local: true,
-                    },
-                }
+            if chunk.hash == hash_a {
+                // We found it locally! Copy it through the reconstructor's
+                // local-chunk path (offset in V1 is same as V2 for 'A' parts).
+                reconstructor
+                    .copy_local_chunk(
+                        &ReconstructionTask {
+                            target_offset: chunk.offset,
+                            source: ChunkSource {
+                                offset: chunk.offset,
+                                length: chunk.length,
+                            },
+                        },
+                        &mut scratch,
+                    )
+                    .unwrap();
             } else {
-                // Must be the 'B' block. Simulate network download.
-                ReconstructionTask {
+                // Must be the 'B' block. Simulate network download: the
+                // bytes are already in memory.
+                let task = ReconstructionTask {
                     target_offset: chunk.offset,
                     source: ChunkSource {
                         offset: 0,
                         length: chunk.length,
-                        is_local: false,
                     },
-                }
+                };
+                let network_data =
+                    &v2_data[chunk.offset as usize..(chunk.offset as usize + chunk.length)];
+                reconstructor.write_chunk(&task, network_data).unwrap();
             };
-
-            // Execute write
-            let network_data = if !task.source.is_local {
-                Some(&v2_data[chunk.offset as usize..(chunk.offset as usize + chunk.length)])
-            } else {
-                None
-            };
-
-            reconstructor
-                .write_chunk(&task, &mut scratch, network_data)
-                .unwrap();
         }
 
         // 6. Finalize and Verify

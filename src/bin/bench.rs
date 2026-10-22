@@ -583,10 +583,9 @@ fn simulate_disconnect(
                     source: ChunkSource {
                         offset: src_off,
                         length: chunk.length,
-                        is_local: true,
                     },
                 };
-                reconstructor.write_chunk(&task, &mut local_scratch, None)?;
+                reconstructor.copy_local_chunk(&task, &mut local_scratch)?;
             }
         }
     }
@@ -613,11 +612,9 @@ fn simulate_disconnect(
             source: ChunkSource {
                 offset: 0,
                 length: chunk.length,
-                is_local: false,
             },
         };
-        let payload = scratch.clone();
-        reconstructor.write_chunk(&task, &mut scratch, Some(&payload))?;
+        reconstructor.write_chunk(&task, &scratch)?;
         temp_written_bytes += chunk.length as u64;
     }
     drop(reconstructor); // close the handle without finalize; temp remains
@@ -1273,15 +1270,15 @@ fn reconstruct(
     let mut net_scratch: Vec<u8> = Vec::new();
 
     for chunk in target_chunks {
-        let task = if let Some(&source_offset) = source_index.get(&chunk.hash) {
-            ReconstructionTask {
+        if let Some(&source_offset) = source_index.get(&chunk.hash) {
+            let task = ReconstructionTask {
                 target_offset: chunk.offset,
                 source: ChunkSource {
                     offset: source_offset,
                     length: chunk.length,
-                    is_local: true,
                 },
-            }
+            };
+            reconstructor.copy_local_chunk(&task, &mut local_scratch)?;
         } else {
             // Simulated network payload: the bytes the wire would carry,
             // read from the real variant file at the chunk's offset.
@@ -1293,22 +1290,15 @@ fn reconstruct(
                     format!("short read from variant at offset {}", chunk.offset),
                 ));
             }
-            ReconstructionTask {
+            let task = ReconstructionTask {
                 target_offset: chunk.offset,
                 source: ChunkSource {
                     offset: chunk.offset,
                     length: chunk.length,
-                    is_local: false,
                 },
-            }
-        };
-
-        let network_data = if task.source.is_local {
-            None
-        } else {
-            Some(&net_scratch[..chunk.length])
-        };
-        reconstructor.write_chunk(&task, &mut local_scratch, network_data)?;
+            };
+            reconstructor.write_chunk(&task, &net_scratch[..chunk.length])?;
+        }
     }
 
     reconstructor.finalize(&Blake3Hasher, variant_hash, rec_path)?;

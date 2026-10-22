@@ -143,6 +143,9 @@ pre-existing.
 - `tests/loopback.rs` — two-peer integration tests over in-memory duplex
   streams: identical/modified/fresh/fast-path/disconnect-resume plus the
   warm-start, stale-index, and orphan-cleanup scenarios.
+- `tests/soak.rs` — leak guard (ignored by default): 100 sequential
+  sessions in one process under a counting global allocator, asserting net
+  live heap stays flat; run with `cargo test --test soak -- --ignored`.
 - `tests/tls.rs` — TLS transport tests over real TCP loopback: pin-match
   converges, third-party cert rejected by the client, unpinned client
   rejected by the pinned receiver (error names the attacker's

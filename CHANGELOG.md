@@ -6,7 +6,18 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet - see [0.3.1]._
+### Changed
+
+- **Allocation hygiene in the transfer path:** the zstd
+  compressor/decompressor context is now created once per session and
+  reused across chunks (`zstd::bulk::compress`/`decompress` built a fresh
+  context per chunk), and the receiver no longer clones the full chunk
+  buffer per Local plan entry (the reconstructor's `write_chunk` now takes
+  the data slice directly; `copy_local_chunk` is the explicit
+  read-from-source variant). No wire change.
+- New ignored soak tests (`cargo test --test soak -- --ignored`) run 100
+  sequential sessions in one process under a counting global allocator and
+  fail if net live heap grows — the leak guard for library embedders.
 
 ## [0.3.1] - 2026-10-22
 

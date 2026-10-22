@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 pub struct ChunkSource {
     pub offset: u64, // Where in the SOURCE to read from
     pub length: usize,
-    pub is_local: bool, // True = Local File, False = Payload provided
 }
 
 pub struct ReconstructionTask {
@@ -71,43 +70,39 @@ impl Reconstructor {
         target_path.with_extension("ffsync-tmp")
     }
 
-    /// Process a single chunk.
+    /// Process a single chunk whose bytes are already in memory.
     ///
-    /// `scratch_buffer`: A mutable buffer provided by the caller to avoid allocations.
-    /// `network_data`: If the source is remote, this contains the bytes.
-    pub fn write_chunk(
+    /// This is the path the sync state machines use: the receiver has
+    /// either decompressed network data or verified local bytes in a
+    /// buffer, and only needs them placed at `task.target_offset`.
+    pub fn write_chunk(&self, task: &ReconstructionTask, data: &[u8]) -> io::Result<()> {
+        self.temp_file.write_at(data, task.target_offset)?;
+        Ok(())
+    }
+
+    /// Process a single chunk by copying it from the local source file.
+    ///
+    /// The bytes are read through `scratch_buffer` (resized as needed) so
+    /// repeated calls do not reallocate. Bench and integration tests use
+    /// this to simulate the locals-first write order without a peer; the
+    /// protocol itself resolves local chunks itself because it must verify
+    /// each chunk's hash before writing (D12).
+    pub fn copy_local_chunk(
         &self,
         task: &ReconstructionTask,
         scratch_buffer: &mut Vec<u8>,
-        network_data: Option<&[u8]>,
     ) -> io::Result<()> {
-        let data_to_write = if task.source.is_local {
-            // CASE A: Local Copy (Source -> Scratch -> Dest)
-            // We open a fresh handle or use FileExt to read safely
-            // Note: Opening a file handle is relatively cheap, but for millions of chunks
-            // we might want to keep a thread-local handle open. For now, let's open it
-            // here to ensure 100% thread safety without `Send` issues on the struct.
-            let source_file = File::open(&self.local_source_path)?;
-
-            // Resize scratch buffer to fit data
-            if scratch_buffer.len() < task.source.length {
-                scratch_buffer.resize(task.source.length, 0);
-            }
-            let slice = &mut scratch_buffer[0..task.source.length];
-
-            // Atomic read from offset
-            source_file.read_at(slice, task.source.offset)?;
-            slice
-        } else {
-            // CASE B: Network Data (Network Buffer -> Dest)
-            network_data.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Network chunk missing data")
-            })?
-        };
-
-        // Atomic write to offset
-        self.temp_file.write_at(data_to_write, task.target_offset)?;
-
+        // Open a fresh handle per chunk. For millions of chunks we might
+        // want to keep a thread-local handle open; for now, open it here to
+        // keep the struct `Send`-agnostic (see D7 for the batching/parallel
+        // work this eventually needs).
+        let source_file = File::open(&self.local_source_path)?;
+        if scratch_buffer.len() < task.source.length {
+            scratch_buffer.resize(task.source.length, 0);
+        }
+        let slice = &mut scratch_buffer[0..task.source.length];
+        source_file.read_at(slice, task.source.offset)?;
+        self.temp_file.write_at(slice, task.target_offset)?;
         Ok(())
     }
 
