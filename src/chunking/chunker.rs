@@ -36,13 +36,20 @@ impl Chunker for FixedChunker {
 
 /// FastCDC-based chunking (content-defined)
 pub struct FastCDCChunker {
-    min_size: u32,
-    avg_size: u32,
-    max_size: u32,
+    min_size: usize,
+    avg_size: usize,
+    max_size: usize,
 }
 
 impl FastCDCChunker {
-    pub fn new(min_size: u32, avg_size: u32, max_size: u32) -> Self {
+    /// Creates a FastCDC chunker. All three sizes must be even (fastcdc 5.0
+    /// scans in two-byte steps and asserts this; odd values would silently
+    /// shift boundaries by one byte).
+    pub fn new(min_size: usize, avg_size: usize, max_size: usize) -> Self {
+        debug_assert!(
+            min_size % 2 == 0 && avg_size % 2 == 0 && max_size % 2 == 0,
+            "fastcdc requires even chunk sizes"
+        );
         Self {
             min_size,
             avg_size,

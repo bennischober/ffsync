@@ -36,12 +36,17 @@ Design documents (read before making architectural changes):
 | `cargo check --tests` | Fast compile check including tests |
 | `cargo test` | Run unit and integration tests (`tests/integration.rs`) |
 | `cargo run` | Run `main.rs` (currently a manual benchmark harness with a hardcoded local file path) |
-| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--rsync`, `--json`) |
+| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--rsync`, `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
 | `cargo clippy` | Lint (no `clippy.toml`) |
+| `cargo audit` | Check `Cargo.lock` against RustSec advisories (see D14 in `concept/Design Decisions.md`) |
 
-Toolchain: current stable Rust, edition 2024. The crate is a lib + two bins
-(`ffsync`, `bench`); tests import via `ffsync::chunking` / `ffsync::reconstruction`.
+Toolchain: current stable Rust (1.99.x as of 2026-10), edition 2024. The crate
+is a lib + two bins (`ffsync`, `bench`); tests import via `ffsync::chunking` /
+`ffsync::reconstruction`. Run `cargo audit` whenever dependencies change; on
+fastcdc upgrades additionally fingerprint chunk boundaries before/after with
+`cargo run --release --bin bench -- --quick --seed 42` (identical chunk counts
+and missing-byte counts required — boundaries are wire-protocol-relevant).
 
 The `--rsync` bench flag compares against rsync when available; on Windows it
 falls back to WSL (`wsl.exe` + `wslpath` translation). Paths are passed as

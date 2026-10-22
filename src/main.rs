@@ -14,7 +14,8 @@ fn create_large_file() -> std::io::Result<()> {
         .open("large_file.bin")?;
 
     let file_size = 10 * 1024 * 1024;
-    let data: Vec<u8> = (0..file_size).map(|_| rng.random()).collect();
+    let mut data = vec![0u8; file_size];
+    rng.fill_bytes(&mut data);
 
     file.write_all(&data)?;
 

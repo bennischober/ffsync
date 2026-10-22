@@ -228,3 +228,43 @@ over-send even though the bytes exist locally. The over-send is bounded
 (~2 × max_chunk_size near modification regions) and correctness is unaffected;
 identical CDC parameters on both peers maximize local reuse.
 
+## D14 — Supply-chain hygiene and dependency policy
+
+**Decision:** dependencies are updated promptly (same-week for security
+advisories), the toolchain tracks current stable, and `cargo audit` (or an
+equivalent OSV check) is part of any dependency work. FastCDC chunk-boundary
+behavior is fingerprinted (deterministic `--seed` bench run) before and after
+any fastcdc upgrade, because two peers must agree on chunk boundaries for
+their hashes to interoperate (D12).
+
+**Reasoning:** the August 2026 crates.io incident (compromised maintainer
+account poisoned `arrayref@0.3.10` + two sibling crates with a build-time
+dropper, DPRK-linked infrastructure) showed the realistic attack class:
+build scripts executing during an innocent `cargo update`. ffsync's exposure
+was checked during that response — our tree had `arrayref 0.3.9` (last safe
+version) and none of the dropper crates. The hygiene rules derived from that
+incident:
+
+- **Build scripts are the attack surface.** Audit them whenever the tree
+  changes shape: `cargo tree -e build` must stay small and explicable
+  (currently: effectively none — no `build.rs` anywhere in the graph).
+- **Lockfile is committed** (`Cargo.lock`); dependency bumps ship as their own
+  commits so an audit diff is one commit wide.
+- **Prefer fewer, well-audited deps.** `blake3` (dropped `arrayref` in 1.8.7),
+  `fastcdc`, `rand`, `tokio`, `memmap2`, `crossbeam`, `num_cpus` — all
+  mainstream; resist adding anything exotic (the gRPC/tonic/prost rejection
+  in D1's context was also a supply-chain decision, not just complexity).
+- **Known advisories in our history** (for the record): RUSTSEC-2026-0097
+  (rand unsound with custom logger; fixed by 0.9.3+, we moved to 0.10.3),
+  RUSTSEC-2026-0186 (memmap2 unchecked pointer offset; fixed 0.9.11+, we
+  moved to 0.9.12), RUSTSEC-2026-0007 (bytes, transitive via tokio; fixed
+  1.11.1), RUSTSEC-2026-0204 (crossbeam-epoch; fixed 0.9.20). All resolved
+  in the 2026-10 dependency pass; `cargo audit` exits clean.
+
+**Chunking-stability verification:** fastcdc 3.2.1 → 5.0.0 was fingerprinted
+before/after with seeded fixtures (30/30 chunks identical, byte-identical
+missing-byte counts on all scenarios, all reconstructions verified) —
+boundary behavior unchanged. This check is mandatory for every future
+fastcdc upgrade; a boundary change would be a wire-protocol compatibility
+break (D12) and must ship with a protocol version bump.
+

@@ -16,7 +16,7 @@ use ffsync::chunking::{
     Blake3Hasher, Chunk, ChunkEvent, FastCDCChunker, Hasher, PipelineConfig, process_file,
 };
 use ffsync::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
-use rand::RngCore;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Write};
@@ -25,11 +25,11 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 /// FastCDC lower bound used for every scan.
-const CHUNK_MIN: u32 = 256 * 1024;
+const CHUNK_MIN: usize = 256 * 1024;
 /// FastCDC average target used for every scan.
-const CHUNK_AVG: u32 = 1024 * 1024;
+const CHUNK_AVG: usize = 1024 * 1024;
 /// FastCDC upper bound used for every scan.
-const CHUNK_MAX: u32 = 4 * 1024 * 1024;
+const CHUNK_MAX: usize = 4 * 1024 * 1024;
 
 /// Fixture files are written in blocks of this size.
 const WRITE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -86,6 +86,10 @@ struct BenchConfig {
     rsync: bool,
     json: bool,
     size_explicit: bool,
+    /// Deterministic RNG seed for fixture generation; `None` = random seed.
+    /// Deterministic fixtures make bench runs comparable across code changes
+    /// (chunk hashes, deltas, and rsync's view of the files are all stable).
+    seed: Option<u64>,
 }
 
 impl BenchConfig {
@@ -178,6 +182,7 @@ Usage: cargo run --bin bench -- [options]
 Options:
   --size-mib <N>   fixture size in MiB (default: {})
   --quick          use a {} MiB fixture for a fast run
+  --seed <N>       deterministic fixture seed (comparable runs across code changes)
   --out-dir <path> directory for fixtures and scratch output (default: {})
   --rsync          additionally compare against rsync (native, or via WSL)
   --json           print a machine-readable JSON summary as the last line
@@ -200,6 +205,7 @@ fn parse_args() -> BenchConfig {
         rsync: false,
         json: false,
         size_explicit: false,
+        seed: None,
     };
 
     let mut args = std::env::args().skip(1);
@@ -227,6 +233,15 @@ fn parse_args() -> BenchConfig {
             }
             "--rsync" => cfg.rsync = true,
             "--json" => cfg.json = true,
+            "--seed" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| die("--seed requires a value"));
+                let parsed: u64 = value
+                    .parse()
+                    .unwrap_or_else(|_| die(&format!("invalid --seed value: {}", value)));
+                cfg.seed = Some(parsed);
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -242,9 +257,8 @@ fn parse_args() -> BenchConfig {
 }
 
 /// Writes `size` bytes of random data to `path`, streaming in ~4 MiB blocks.
-fn write_random_file(path: &Path, size: u64) -> io::Result<()> {
+fn write_random_file(path: &Path, size: u64, rng: &mut impl Rng) -> io::Result<()> {
     let mut file = File::create(path)?;
-    let mut rng = rand::rng();
     let mut buf = vec![0u8; WRITE_CHUNK_BYTES];
     let mut remaining = size;
     while remaining > 0 {
@@ -258,9 +272,8 @@ fn write_random_file(path: &Path, size: u64) -> io::Result<()> {
 
 /// Overwrites two ~1% regions around the middle of the file with fresh
 /// random bytes (simulating in-place edits of equal total size).
-fn flip_middle_regions(path: &Path, size: u64) -> io::Result<()> {
+fn flip_middle_regions(path: &Path, size: u64, rng: &mut impl Rng) -> io::Result<()> {
     let region_len = (size / 100).max(4096).min(size / 4);
-    let mut rng = rand::rng();
     let mut buf = vec![0u8; region_len as usize];
     let file = OpenOptions::new().write(true).open(path)?;
     for pos in [size * 45 / 100, size * 55 / 100] {
@@ -271,9 +284,8 @@ fn flip_middle_regions(path: &Path, size: u64) -> io::Result<()> {
 }
 
 /// Appends ~10% of new random bytes to the file.
-fn append_random_tail(path: &Path, size: u64) -> io::Result<()> {
+fn append_random_tail(path: &Path, size: u64, rng: &mut impl Rng) -> io::Result<()> {
     let tail_len = (size / 10).max(1);
-    let mut rng = rand::rng();
     let mut buf = vec![0u8; tail_len.min(WRITE_CHUNK_BYTES as u64) as usize];
     let mut file = OpenOptions::new().append(true).open(path)?;
     let mut remaining = tail_len;
@@ -292,8 +304,15 @@ fn generate_fixtures(cfg: &BenchConfig) -> io::Result<(PathBuf, Vec<(Scenario, P
     fs::create_dir_all(&cfg.out_dir)?;
     let size = cfg.size_bytes();
 
+    // One seeded RNG stream for all fixtures: deterministic per `--seed`, so
+    // hashes and deltas are reproducible across runs and code changes.
+    let mut rng = match cfg.seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_rng(&mut rand::rng()),
+    };
+
     let source = cfg.out_dir.join("source_A.bin");
-    write_random_file(&source, size)?;
+    write_random_file(&source, size, &mut rng)?;
     println!(
         "fixture: source A              {:>9}  {}",
         fmt_bytes(size),
@@ -309,14 +328,14 @@ fn generate_fixtures(cfg: &BenchConfig) -> io::Result<(PathBuf, Vec<(Scenario, P
             }
             Scenario::Modified => {
                 fs::copy(&source, &path)?;
-                flip_middle_regions(&path, size)?;
+                flip_middle_regions(&path, size, &mut rng)?;
             }
             Scenario::Appended => {
                 fs::copy(&source, &path)?;
-                append_random_tail(&path, size)?;
+                append_random_tail(&path, size, &mut rng)?;
             }
             Scenario::Fresh => {
-                write_random_file(&path, size)?;
+                write_random_file(&path, size, &mut rng)?;
             }
         }
         let variant_size = fs::metadata(&path)?.len();
