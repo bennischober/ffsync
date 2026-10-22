@@ -23,8 +23,8 @@ mod tests {
 
         // 2. Create Target File (V2) - 10MB, but middle 1MB is 'B's (Modification)
         let mut v2_data = vec![b'A'; 10 * 1024 * 1024];
-        for i in 4 * 1024 * 1024..5 * 1024 * 1024 {
-            v2_data[i] = b'B';
+        for b in &mut v2_data[4 * 1024 * 1024..5 * 1024 * 1024] {
+            *b = b'B';
         }
         {
             let mut f = File::create(v2_path).unwrap();

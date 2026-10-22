@@ -27,6 +27,7 @@ mod tests {
     }
 
     impl DuplexPair {
+        #[allow(clippy::new_ret_no_self)] // returns the (sender, receiver) end pair
         fn new(bound: usize) -> (DuplexEnd, DuplexEnd) {
             let (a_tx, b_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(bound);
             let (b_tx, a_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(bound);

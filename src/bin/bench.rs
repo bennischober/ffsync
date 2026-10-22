@@ -518,6 +518,7 @@ struct DisconnectStats {
 /// Finally the temp file is *completed* (remaining remote chunks + all
 /// local copies) and verified against the target's full-file BLAKE3 hash,
 /// proving the partial state is genuinely recoverable.
+#[allow(clippy::too_many_arguments)]
 fn simulate_disconnect(
     source: &Path,
     variant: &Path,
