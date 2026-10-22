@@ -2,6 +2,9 @@
 name = "ffsync"
 version = "0.1.0"
 edition = "2024"
+description = "Chunk-level file synchronization for big files and fast links"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bennischober/ffsync"
 
 [dependencies]
 blake3 = { version = "1.8.7" }
