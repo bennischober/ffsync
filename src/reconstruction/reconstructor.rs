@@ -45,6 +45,32 @@ impl Reconstructor {
         })
     }
 
+    /// Opens an existing temp file for resume (D10): no truncation, no
+    /// creation. The caller must have verified the temp file exists; its
+    /// content is the resume state. Size is ensured (extends with zeros if
+    /// a crash happened mid-pre-allocation; a no-op otherwise).
+    pub fn open_existing(
+        target_path: &Path,
+        local_source_path: &Path,
+        final_size: u64,
+    ) -> io::Result<Self> {
+        let temp_path = target_path.with_extension("ffsync-tmp");
+        let file = OpenOptions::new().read(true).write(true).open(&temp_path)?;
+        if file.metadata()?.len() < final_size {
+            file.set_len(final_size)?;
+        }
+        Ok(Self {
+            temp_file: file,
+            local_source_path: local_source_path.to_path_buf(),
+        })
+    }
+
+    /// The temp file path for a given target path (single source of truth
+    /// for the naming convention).
+    pub fn temp_path_for(target_path: &Path) -> PathBuf {
+        target_path.with_extension("ffsync-tmp")
+    }
+
     /// Process a single chunk.
     ///
     /// `scratch_buffer`: A mutable buffer provided by the caller to avoid allocations.

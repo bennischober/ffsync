@@ -254,6 +254,135 @@ mod tests {
         assert_eq!(read_file(&target), data);
     }
 
+    /// A duplex end that can be dropped mid-session to simulate a crash.
+    /// The peer then observes EOF/BrokenPipe. The kill is thread-scoped:
+    /// the sender thread panics once `kill_after_bytes` of payload have
+    /// been sent, which drops its duplex end — the in-memory equivalent of
+    /// a process/socket dying (a real `abort()` would take down the whole
+    /// test process, which the first version of this test did).
+    fn run_sync_resumable(
+        send_req: SendRequest,
+        recv_req: ReceiveRequest,
+        kill_after_bytes: u64,
+    ) -> (
+        Result<SyncOutcome, SyncError>,
+        Result<SyncOutcome, SyncError>,
+    ) {
+        let (mut sender_end, mut receiver_end) = DuplexPair::new(64);
+        let pipeline = PipelineConfig::default();
+        let pipeline_recv = PipelineConfig::default();
+
+        let s_handle = std::thread::spawn(move || {
+            let kill = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let kill_writer = std::sync::Arc::clone(&kill);
+            // Guard wrapping the duplex end: once the flag is set, the next
+            // write panics the thread (dropping the end -> receiver EOF).
+            struct KillGuard<'a> {
+                inner: &'a mut DuplexEnd,
+                kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            }
+            impl Write for KillGuard<'_> {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    if self.kill.load(std::sync::atomic::Ordering::SeqCst) {
+                        panic!("simulated sender crash");
+                    }
+                    self.inner.write(buf)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    self.inner.flush()
+                }
+            }
+            impl Read for KillGuard<'_> {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    self.inner.read(buf)
+                }
+            }
+            let mut progress = |p: ffsync::protocol::sync::Progress| {
+                if let ffsync::protocol::sync::Progress::Transferring(sent, _) = p {
+                    if sent >= kill_after_bytes {
+                        kill_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            };
+            let mut guard = KillGuard {
+                inner: &mut sender_end,
+                kill,
+            };
+            send(&mut guard, &send_req, &pipeline, &mut progress)
+        });
+        let r_handle = std::thread::spawn(move || {
+            let mut progress = |_p: ffsync::protocol::sync::Progress| {};
+            receive(&mut receiver_end, &recv_req, &pipeline_recv, &mut progress)
+        });
+
+        let s = s_handle
+            .join()
+            .unwrap_or_else(|_| Err(SyncError::Protocol("sender crashed (simulated)".into())));
+        let r = r_handle.join().unwrap_or_else(|_| Err(SyncError::Eof));
+        (s, r)
+    }
+
+    #[test]
+    fn resume_after_mid_transfer_disconnect() {
+        let fx = Fixture::new("resume");
+        let mut src_data = vec![0u8; 4 * 1024 * 1024];
+        for (i, b) in src_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add((i / 65536) as u8);
+        }
+        create_file(fx.source(), &src_data);
+
+        let mut old_data = src_data.clone();
+        let mid = 2 * 1024 * 1024;
+        for b in &mut old_data[mid..mid + 256 * 1024] {
+            *b = *b ^ 0xFF;
+        }
+        let target = fx.path("target.bin");
+        create_file(&target, &old_data);
+
+        // Attempt 1: crash the sender after ~64 KiB of DATA.
+        let (s1, r1) = run_sync_resumable(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: true,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: true,
+            },
+            64 * 1024,
+        );
+        // Both sides must have observed the crash (no false success).
+        assert!(s1.is_err(), "sender should have crashed");
+        assert!(r1.is_err(), "receiver should have seen the disconnect");
+        // The receiver must have left the temp file behind (resume state).
+        let temp = ffsync::reconstruction::Reconstructor::temp_path_for(&target);
+        assert!(temp.exists(), "temp file must survive the disconnect");
+
+        // Attempt 2: reconnect. The receiver now unions temp + old file.
+        let (s2, r2) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: true,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: true,
+            },
+        );
+        let _ = s2.expect("resumed sender ok");
+        let _ = r2.expect("resumed receiver ok");
+        // Convergence is the oracle.
+        assert_eq!(read_file(&target), src_data);
+        // The temp file must be gone (committed).
+        assert!(!temp.exists(), "temp file must be committed away");
+    }
+
     #[test]
     fn sync_trust_times_fast_path_skips_transfer() {
         let fx = Fixture::new("fastpath");

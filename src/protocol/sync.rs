@@ -12,7 +12,7 @@
 //! 4. sender streams DATA frames for remote chunks (§7),
 //! 5. receiver verifies the temp file root against VERIFY and commits (§8).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,9 +26,19 @@ use crate::chunking::{
 };
 use crate::protocol::framing::{self, FrameError};
 use crate::protocol::message::{
-    self, ErrorCode, FLAG_TRUST_TIMES, Hello, ManifestChunk, Message, MessageError, PlanEntry, Role,
+    self, ErrorCode, FLAG_RESUMING, FLAG_TRUST_TIMES, Hello, ManifestChunk, Message, MessageError,
+    PlanEntry, Role,
 };
-use crate::reconstruction::{ChunkSource, ReconstructionTask, Reconstructor};
+use crate::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
+
+/// Where a locally available chunk lives (D10 union manifest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalOrigin {
+    /// In the partially written temp file (newest state, temp-first claim).
+    Temp { offset: u64, length: usize },
+    /// In the receiver's old file.
+    OldFile { offset: u64, length: usize },
+}
 
 /// Errors from the sync state machines.
 #[derive(Debug)]
@@ -273,6 +283,9 @@ where
     }
 
     // ---- Receive the manifest (§5) ----
+    // On resume the manifest is the union of temp and old-file chunks
+    // (D10); the receiver resolves which file to read from per hash. The
+    // sender only needs the hash set for diffing.
     let mut manifest: HashMap<Hash, u64> = HashMap::new();
     loop {
         let frame = framing::read_frame(stream)?;
@@ -294,13 +307,10 @@ where
     }
 
     // ---- Plan generation (§6, D12 exact match) ----
-    // The receiver's manifest gives us (hash -> its offset). For every source
-    // chunk: if the hash is in the manifest, PLAN_LOCAL with the receiver's
-    // offset; otherwise PLAN_REMOTE.
-    // NOTE (D12): exact (hash, length) matching. The manifest maps hash ->
-    // offset; chunk lengths are implied by the sender's chunk list, and
-    // identical hashes at equal chunking parameters imply identical content,
-    // but the *length* check requires storing lengths too. See plan below.
+    // For every source chunk: if its hash is in the receiver's manifest,
+    // PLAN_LOCAL (the receiver reads the bytes from wherever its manifest
+    // says — temp or old file — and verifies them against `hash`);
+    // otherwise PLAN_REMOTE.
     let mut plan: Vec<PlanEntry> = Vec::with_capacity(source_chunks.len());
     let mut remote_total: u64 = 0;
     for chunk in &source_chunks {
@@ -309,6 +319,7 @@ where
                 target_offset: chunk.offset,
                 length: chunk.length as u32,
                 source_offset: *peer_offset,
+                hash: chunk.hash,
             }),
             None => {
                 plan.push(PlanEntry::Remote {
@@ -387,6 +398,13 @@ where
 }
 
 /// Runs the receiver side of a sync over `stream`.
+///
+/// Resume (D10): if a temp file from a previous crashed attempt exists, the
+/// receiver re-scans it and unions its chunks with the old file's chunks
+/// (temp-first: a hash found in the temp is claimed from the temp). The
+/// HELLO carries `FLAG_RESUMING` so the sender knows the manifest may
+/// describe two files; plan offsets are unambiguous because PLAN_LOCAL now
+/// carries the chunk hash and the receiver resolves the source per hash.
 pub fn receive<S>(
     stream: &mut S,
     request: &ReceiveRequest,
@@ -396,6 +414,9 @@ pub fn receive<S>(
 where
     S: Read + Write,
 {
+    let temp_path = Reconstructor::temp_path_for(&request.path);
+    let resuming = temp_path.exists();
+
     // ---- Scan our local file for the manifest (§5). ----
     let local_meta = std::fs::metadata(&request.local_source).ok();
     let local_size = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -412,14 +433,47 @@ where
         (Vec::new(), None)
     };
 
+    // ---- Resume manifest (D10): union of temp chunks and old-file chunks,
+    // temp-first. Offsets in the manifest are resolved per (hash -> file)
+    // below when the plan references them. ----
+    let temp_chunks: Vec<Chunk> = if resuming {
+        let tsize = std::fs::metadata(&temp_path)?.len();
+        progress(Progress::Scanning(0, tsize));
+        let (_stats, chunks) = scan_with_progress(&temp_path, pipeline, |hashed| {
+            progress(Progress::Scanning(hashed, tsize))
+        })?;
+        chunks
+    } else {
+        Vec::new()
+    };
+    // hash -> which file to read the chunk from (Temp beats OldFile: the
+    // temp content is the newest state; old-file entries only fill gaps).
+    let mut manifest_map: HashMap<Hash, LocalOrigin> = HashMap::new();
+    for c in &temp_chunks {
+        manifest_map.entry(c.hash).or_insert(LocalOrigin::Temp {
+            offset: c.offset,
+            length: c.length,
+        });
+    }
+    for c in &local_chunks {
+        manifest_map.entry(c.hash).or_insert(LocalOrigin::OldFile {
+            offset: c.offset,
+            length: c.length,
+        });
+    }
+
     // ---- HELLO ----
+    let mut flags = if request.force_checksum {
+        0
+    } else {
+        FLAG_TRUST_TIMES
+    };
+    if resuming {
+        flags |= FLAG_RESUMING;
+    }
     let hello = Hello {
         version: super::VERSION,
-        flags: if request.force_checksum {
-            0
-        } else {
-            FLAG_TRUST_TIMES
-        },
+        flags,
         role: Role::Receiver,
         cdc_min: CHUNK_MIN as u32,
         cdc_avg: CHUNK_AVG as u32,
@@ -476,12 +530,30 @@ where
     // in the plan loop (already implemented).
 
     // ---- Stream our manifest (§5) ----
-    // Tolerate write failures: a sender that took the size+mtime fast path
-    // exits right after reading our HELLO, so our manifest frames may hit a
-    // closed stream. Any such failure means the next readable frame is
-    // NOT_MODIFIED (handled in the plan loop) — or nothing, in which case
-    // the plan loop surfaces the real error.
+    // The union manifest (D10): temp chunks first, then old-file chunks
+    // whose hashes the temp does not already cover. With no temp file this
+    // is just the old file's manifest. Tolerate write failures: a sender
+    // that took the size+mtime fast path exits right after reading our
+    // HELLO, so our manifest frames may hit a closed stream. Any such
+    // failure means the next readable frame is NOT_MODIFIED (handled in the
+    // plan loop) — or nothing, in which case the plan loop surfaces the
+    // real error.
+    for chunk in &temp_chunks {
+        let frame = message::ManifestChunk {
+            hash: chunk.hash,
+            offset: chunk.offset,
+            length: chunk.length as u32,
+        }
+        .into_frame()?;
+        if frame.encode(stream).and_then(|_| stream.flush()).is_err() {
+            break;
+        }
+    }
+    let covered: HashSet<Hash> = temp_chunks.iter().map(|c| c.hash).collect();
     for chunk in &local_chunks {
+        if covered.contains(&chunk.hash) {
+            continue;
+        }
         let frame = message::ManifestChunk {
             hash: chunk.hash,
             offset: chunk.offset,
@@ -539,76 +611,105 @@ where
     // ---- Prepare the temp file (§8.1) ----
     let target_size = peer.file_size;
     if remote_total > 0 || plan.iter().any(|e| matches!(e, PlanEntry::Remote { .. })) {
-        let reconstructor = Reconstructor::new(&request.path, &request.local_source, target_size)?;
+        let reconstructor = if resuming {
+            // D10: never truncate — the temp content IS the resume state.
+            Reconstructor::open_existing(&request.path, &request.local_source, target_size)?
+        } else {
+            Reconstructor::new(&request.path, &request.local_source, target_size)?
+        };
 
-        // ---- Local chunk copies FIRST (D10) ----
-        // Local chunks are the bulk of the file and available offline;
-        // writing them before DATA means a mid-transfer crash leaves a temp
-        // that is mostly real data, so a resume's union manifest recovers
-        // nearly everything. (Simulation: remotes-first resume recovers
-        // ~nothing — every chunk straddles a zero-filled hole; locals-first
-        // recovers 30–32 of 32 MiB and halves the resume transfer.)
-        {
-            let mut scratch: Vec<u8> = Vec::new();
-            for entry in &plan {
-                if let PlanEntry::Local {
+        // ---- Execute plan entries in order ----
+        // Locals are resolved per-hash from the union manifest (temp first,
+        // then old file) and verified against the plan's expected hash (D12:
+        // a stale manifest entry can cost an ERROR, never silent corruption;
+        // the sender-side check also protects against offset drift between
+        // the two files' chunkings).
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut received: u64 = 0;
+        for entry in &plan {
+            match *entry {
+                PlanEntry::Local {
                     target_offset,
                     length,
-                    source_offset,
-                } = entry
-                {
+                    source_offset: _,
+                    hash,
+                } => {
+                    let origin = manifest_map.get(&hash).ok_or_else(|| {
+                        send_error_and_finish(
+                            stream,
+                            ErrorCode::BadFrame,
+                            "plan references a chunk not in our manifest",
+                        )
+                    })?;
+                    let (path, offset) = match origin {
+                        LocalOrigin::Temp { offset, .. } => (&temp_path, *offset),
+                        LocalOrigin::OldFile { offset, .. } => (&request.local_source, *offset),
+                    };
+                    let source_file = File::open(path)?;
+                    scratch.clear();
+                    scratch.resize(length as usize, 0);
+                    source_file.read_at(&mut scratch[..length as usize], offset)?;
+                    // Verify the read content (D12 exact-match guarantee).
+                    let actual = blake3::hash(&scratch[..length as usize]);
+                    if actual != hash {
+                        // Stale manifest entry: this chunk's content differs
+                        // from what we promised. Delete the stale temp and
+                        // fail — the connection is dead anyway, and the next
+                        // attempt starts clean.
+                        if matches!(origin, LocalOrigin::Temp { .. }) {
+                            let _ = std::fs::remove_file(&temp_path);
+                        }
+                        return Err(send_error_and_finish(
+                            stream,
+                            ErrorCode::HashMismatch,
+                            "local chunk content does not match its hash",
+                        ));
+                    }
                     let task = ReconstructionTask {
-                        target_offset: *target_offset,
+                        target_offset,
                         source: ChunkSource {
-                            offset: *source_offset,
-                            length: *length as usize,
-                            is_local: true,
+                            offset: 0,
+                            length: length as usize,
+                            is_local: false, // data is already in `scratch`
                         },
                     };
-                    reconstructor.write_chunk(&task, &mut scratch, None)?;
+                    let payload = scratch.clone();
+                    reconstructor.write_chunk(&task, &mut scratch, Some(&payload))?;
                 }
-            }
-        }
-
-        // ---- Receive DATA frames (§7) ----
-        let mut received: u64 = 0;
-        let mut scratch: Vec<u8> = Vec::new();
-        for entry in &plan {
-            let (target_offset, length, hash) = match entry {
                 PlanEntry::Remote {
                     target_offset,
                     length,
                     hash,
-                } => (*target_offset, *length as usize, *hash),
-                _ => continue,
-            };
-            let (data_hash, compressed) = message::read_data(stream)?;
-            if data_hash != hash {
-                return Err(send_error_and_finish(
-                    stream,
-                    ErrorCode::BadFrame,
-                    "DATA hash does not match plan",
-                ));
+                } => {
+                    let (data_hash, compressed) = message::read_data(stream)?;
+                    if data_hash != hash {
+                        return Err(send_error_and_finish(
+                            stream,
+                            ErrorCode::BadFrame,
+                            "DATA hash does not match plan",
+                        ));
+                    }
+                    let decompressed = zstd::bulk::decompress(&compressed, length as usize)?;
+                    if decompressed.len() != length as usize {
+                        return Err(send_error_and_finish(
+                            stream,
+                            ErrorCode::BadFrame,
+                            "decompressed length mismatch",
+                        ));
+                    }
+                    let task = ReconstructionTask {
+                        target_offset,
+                        source: ChunkSource {
+                            offset: 0,
+                            length: length as usize,
+                            is_local: false,
+                        },
+                    };
+                    reconstructor.write_chunk(&task, &mut scratch, Some(&decompressed))?;
+                    received += length as u64;
+                    progress(Progress::Receiving(received, remote_total));
+                }
             }
-            let decompressed = zstd::bulk::decompress(&compressed, length)?;
-            if decompressed.len() != length {
-                return Err(send_error_and_finish(
-                    stream,
-                    ErrorCode::BadFrame,
-                    "decompressed length mismatch",
-                ));
-            }
-            let task = ReconstructionTask {
-                target_offset,
-                source: ChunkSource {
-                    offset: 0,
-                    length,
-                    is_local: false,
-                },
-            };
-            reconstructor.write_chunk(&task, &mut scratch, Some(&decompressed))?;
-            received += length as u64;
-            progress(Progress::Receiving(received, remote_total));
         }
 
         // ---- VERIFY (§8) ----
@@ -644,10 +745,22 @@ where
     }
 
     // ---- Empty plan (§8 already-in-sync): the sender still sends VERIFY;
-    // compare against the root of our current file. ----
+    // compare against the root of our current state. On resume the temp file
+    // is the newest state (a previous attempt may have died after the last
+    // DATA byte), so prefer it when present. ----
     let verify_root = message::read_verify(stream)?;
-    match local_root {
+    let (state_root, state_desc): (Option<Hash>, &str) = if resuming {
+        let chunks = scan_file_plain(&temp_path, pipeline)?;
+        (Some(chunk_root(&chunks)), "temp")
+    } else {
+        (local_root, "old file")
+    };
+    match state_root {
         Some(root) if root == verify_root => {
+            if resuming {
+                // The previous attempt actually completed the data; commit it.
+                std::fs::rename(&temp_path, &request.path)?;
+            }
             message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
             stream.flush()?;
             progress(Progress::NothingToDo);
@@ -656,7 +769,10 @@ where
         Some(_) => Err(send_error_and_finish(
             stream,
             ErrorCode::HashMismatch,
-            "content differs despite empty plan (stale manifest?)",
+            &format!(
+                "content differs despite empty plan (stale {} manifest?)",
+                state_desc
+            ),
         )),
         None => {
             // We have no local file but the plan was empty: the sender thinks

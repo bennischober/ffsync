@@ -90,10 +90,14 @@ pub struct ManifestChunk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanEntry {
     /// Receiver already has these bytes at `source_offset` (its manifest).
+    /// `hash` identifies the content so the receiver can (a) disambiguate
+    /// which local file the offset refers to when resuming (temp vs. old
+    /// file) and (b) verify the local read against the expected content.
     Local {
         target_offset: u64,
         length: u32,
         source_offset: u64,
+        hash: Hash,
     },
     /// Sender will transmit the bytes for `hash`.
     Remote {
@@ -276,11 +280,13 @@ impl Message for PlanEntry {
                 target_offset,
                 length,
                 source_offset,
+                hash,
             } => {
-                let mut payload = Vec::with_capacity(20);
+                let mut payload = Vec::with_capacity(52);
                 payload.extend_from_slice(&target_offset.to_le_bytes());
                 payload.extend_from_slice(&length.to_le_bytes());
                 payload.extend_from_slice(&source_offset.to_le_bytes());
+                payload.extend_from_slice(hash.as_bytes());
                 Ok(Frame::new(framing::T_PLAN_LOCAL, payload))
             }
             PlanEntry::Remote {
@@ -300,8 +306,8 @@ impl Message for PlanEntry {
     fn from_frame(frame: Frame) -> Result<Self, MessageError> {
         match frame.ftype {
             framing::T_PLAN_LOCAL => {
-                if frame.payload.len() != 20 {
-                    return Err(MessageError::Malformed("plan local must be 20 bytes"));
+                if frame.payload.len() != 52 {
+                    return Err(MessageError::Malformed("plan local must be 52 bytes"));
                 }
                 let mut off = [0u8; 8];
                 off.copy_from_slice(&frame.payload[0..8]);
@@ -309,10 +315,13 @@ impl Message for PlanEntry {
                 len.copy_from_slice(&frame.payload[8..12]);
                 let mut src = [0u8; 8];
                 src.copy_from_slice(&frame.payload[12..20]);
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&frame.payload[20..52]);
                 Ok(PlanEntry::Local {
                     target_offset: u64::from_le_bytes(off),
                     length: u32::from_le_bytes(len),
                     source_offset: u64::from_le_bytes(src),
+                    hash: Hash::from_bytes(hash),
                 })
             }
             framing::T_PLAN_REMOTE => {
@@ -500,6 +509,7 @@ mod tests {
             target_offset: 4096,
             length: 65536,
             source_offset: 262_144,
+            hash: blake3::hash(b"local-chunk"),
         });
         round_trip(PlanEntry::Remote {
             target_offset: 4096,
