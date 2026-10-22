@@ -12,18 +12,17 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.1.0--index--dev-orange)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
 
-> **Status: v0.1.0 + v0.2 security & warm-start index (unreleased).**
-> Single-file sync between two peers over TLS works end-to-end, including
-> resume after mid-transfer disconnects. Fresh off the bench: a persistent
-> per-file chunk index turns repeated syncs into stat-only operations (D15),
-> and transport security landed (D16): TLS 1.3 by default, mutual
-> fingerprint pinning, no secrets on disk. Not implemented yet: directory
-> sync. See [roadmap](#roadmap) below.
+> **Status: v0.2.0.** Single-file sync between two peers over TLS works
+> end-to-end, including resume after mid-transfer disconnects. This release
+> adds a persistent per-file chunk index that turns repeated syncs into
+> stat-only operations (D15) and transport security (D16): TLS 1.3 by
+> default, mutual fingerprint pinning, no secrets on disk. Not implemented
+> yet: directory sync. See [roadmap](#roadmap) below.
 
 ## Why
 
@@ -228,12 +227,12 @@ The reasoning is the product; it is all recorded:
 
 ## Roadmap
 
-- **Done (unreleased) - transport security (D16):** TLS 1.3 by default,
+- **Done (0.2.0) - transport security (D16):** TLS 1.3 by default,
   mutual authentication by self-signed-cert fingerprint pinning (TOFU with
   an out-of-band compare on first contact); `--plaintext` keeps LAN/SSH
   tunnels. QUIC is deferred until directory sync makes parallel streams
   worthwhile (D13 amendment).
-- **Done (unreleased) - persistent chunk index (warm restarts, D15):** chunks
+- **Done (0.2.0) - persistent chunk index (warm restarts, D15):** chunks
   are content-addressed, so a persisted index turns repeated syncs into
   stat-only operations. This is the core product insight; rsync rescans
   everything from scratch every run.

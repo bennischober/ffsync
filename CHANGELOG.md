@@ -6,6 +6,10 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet — see [0.2.0]._
+
+## [0.2.0] - 2026-10-22
+
 ### Added
 
 - **Transport security (D16):** TLS 1.3 (rustls, ring provider) is on by
@@ -50,7 +54,7 @@ All notable changes to ffsync are documented here. The format follows
   `[host]:port` parsing on `send` (receive stays IPv4-only for now).
   Sub-second durations render as milliseconds.
 
-## [0.1.0] - 2026-10-22
+## [0.2.0] - 2026-10-22
 
 First working implementation: single-file sync between two peers over TCP.
 
@@ -97,4 +101,5 @@ First working implementation: single-file sync between two peers over TCP.
   fixed blocks); ffsync's advantage is the parallel scan (~3.8x cold start on
   the 72.7 GiB reference file) and resumability.
 
+[0.2.0]: https://github.com/bennischober/ffsync/releases/tag/v0.2.0
 [0.1.0]: https://github.com/bennischober/ffsync/releases/tag/v0.1.0

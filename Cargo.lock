@@ -226,7 +226,7 @@ checksum = "0431c3132902a1bed6fe77dcfa5d03844e083f263b81288246a2d43dd7d4b2ad"
 
 [[package]]
 name = "ffsync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "crossbeam",
