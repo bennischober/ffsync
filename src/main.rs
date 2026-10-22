@@ -1,10 +1,13 @@
-//! ffsync CLI: send and receive files over TCP with chunk-level delta sync.
+//! ffsync CLI: send and receive files or directory trees over TCP with
+//! chunk-level delta sync.
 //!
 //! Usage:
-//!   ffsync send <file> <host:port>   [--checksum]
-//!   ffsync receive <file> <port>     [--checksum] [--from <old-file>]
+//!   ffsync send <file|dir> <host:port>   [--checksum] [--no-delete]
+//!   ffsync receive <file|dir> <port>     [--checksum] [--from <old-file>]
 //!
-//! The sender connects to a receiver that is listening.
+//! The sender connects to a receiver that is listening. A directory path
+//! switches to tree sync (v0.3): the CONTENTS of the directory are synced
+//! (no trailing-slash semantics; `dir` and `dir/` are the same thing).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -14,6 +17,9 @@ use std::time::{Duration, Instant};
 use ffsync::chunking::PipelineConfig;
 use ffsync::protocol::sync::{
     Progress, ReceiveRequest, SendRequest, SyncError, SyncOutcome, receive, send,
+};
+use ffsync::protocol::tree_sync::{
+    TreeOutcome, TreeProgress, TreeReceiveRequest, TreeSendRequest, tree_receive, tree_send,
 };
 
 /// Default I/O timeout: a peer that sends nothing for this long kills the
@@ -26,9 +32,10 @@ const USAGE: &str = "\
 ffsync: fast chunk-level file sync for big files and fast links
 
 Usage:
-  ffsync send <file> <host:port> [--checksum] [--plaintext] [--trust <fp>]
-  ffsync receive <file> <port> [--checksum] [--from <old-file>]
-                [--plaintext] [--trust <fp>]
+  ffsync send <file|dir> <host:port> [--checksum] [--no-delete]
+              [--plaintext] [--trust <fp>]
+  ffsync receive <file|dir> <port> [--checksum] [--from <old-file>]
+              [--no-delete] [--plaintext] [--trust <fp>]
   ffsync trust <fingerprint>       pin a peer fingerprint (TOFU first contact)
   ffsync untrust <fingerprint>     remove a pinned fingerprint
   ffsync fingerprints              show this peer's identity + all pins
@@ -37,13 +44,25 @@ Usage:
 Options:
   --checksum         skip no metadata shortcuts; always compare chunk roots
                      (rsync -c semantics). Also disables the warm-start index.
-  --from <old-file>  receive: serve local chunks from <old-file> instead of
-                     <file> (useful when the target does not exist yet)
+                     In tree mode this applies to every file in the tree.
+  --from <old-file>  receive (single-file only): serve local chunks from
+                     <old-file> instead of <file> (useful when the target
+                     does not exist yet)
+  --no-delete        tree mode: keep files that exist only on the receiver
+                     (default IS to delete them — the sender's tree is
+                     authoritative, like rsync --delete)
   --plaintext        disable TLS (LAN use or inside an SSH tunnel); D16
   --trust <fp>       non-interactive first contact: pin <fp> instead of
                      prompting; also overrides which pinned peer to expect
   -h, --help         print this help
   -V, --version      print version
+
+Tree mode (v0.3): pass a directory instead of a file. The CONTENTS of the
+directory are synced into the destination directory ('dir' and 'dir/' mean
+the same thing — no rsync trailing-slash semantics). Files that match in
+size and modification time are skipped; changed files transfer deltas;
+files that exist only on the receiver are deleted unless --no-delete.
+Deletions happen only after every transfer succeeded.
 
 Security (D16): TLS 1.3 with self-signed certificates is on by default.
 Both peers authenticate mutually by cert fingerprint — compare the
@@ -241,7 +260,17 @@ fn run_send(
     force_checksum: bool,
     plaintext: bool,
     trust_flag: Option<String>,
+    no_delete: bool,
 ) -> std::io::Result<()> {
+    let tree = file.is_dir();
+    if tree {
+        if no_delete {
+            return Err(std::io::Error::other(
+                "--no-delete applies to receive only (the sender never deletes)",
+            ));
+        }
+        return run_tree_send(file, addr, force_checksum, plaintext, trust_flag);
+    }
     if !file.is_file() {
         return Err(std::io::Error::other(format!(
             "source file not found: {}",
@@ -288,6 +317,7 @@ fn run_send(
             .unwrap_or_default(),
         mtime: None,
         force_checksum,
+        tree: false,
     };
     let pipeline = PipelineConfig::default();
     let outcome = match send(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -312,7 +342,16 @@ fn run_receive(
     from: Option<PathBuf>,
     plaintext: bool,
     trust_flag: Option<String>,
+    no_delete: bool,
 ) -> std::io::Result<()> {
+    if file.is_dir() {
+        if from.is_some() {
+            return Err(std::io::Error::other(
+                "--from is single-file only (tree sync has no old-file concept)",
+            ));
+        }
+        return run_tree_receive(file, port, force_checksum, plaintext, trust_flag, no_delete);
+    }
     let local_source = from.unwrap_or_else(|| file.clone());
     if !local_source.is_file() {
         return Err(std::io::Error::other(format!(
@@ -358,6 +397,8 @@ fn run_receive(
         path: file.clone(),
         local_source,
         force_checksum,
+        tree: false,
+        apply_mtime: None,
     };
     let pipeline = PipelineConfig::default();
     let outcome = match receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -371,10 +412,230 @@ fn run_receive(
     Ok(())
 }
 
+/// Tree mode (v0.3): send a directory's contents. TLS setup is shared with
+/// the single-file path via [`connect_authenticated`].
+fn run_tree_send(
+    root: PathBuf,
+    addr: String,
+    force_checksum: bool,
+    plaintext: bool,
+    trust_flag: Option<String>,
+) -> std::io::Result<()> {
+    let (host, port) = parse_host_port(&addr);
+    println!("connecting to {host}:{port} ...");
+    let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
+        std::io::Error::other(format!(
+            "cannot connect to {host}:{port}: {e} (is the receiver running?)"
+        ))
+    })?;
+    tcp.set_nodelay(true).ok();
+    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+    let mut stream = connect_authenticated(tcp, &host, true, plaintext, trust_flag)?;
+
+    let display = &mut TreeDisplay::new();
+    let request = TreeSendRequest {
+        root,
+        force_checksum,
+        no_delete: false, // the sender never deletes; the flag is receiver-side
+    };
+    let pipeline = PipelineConfig::default();
+    let outcome = match tree_send(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
+        Ok(o) => o,
+        Err(e) => {
+            display.finish();
+            return Err(io_err(&e));
+        }
+    };
+    report_tree_outcome("send", &outcome, display);
+    Ok(())
+}
+
+/// Tree mode (v0.3): receive a directory's contents. The target directory is
+/// created when missing (a first sync into an empty destination is the
+/// normal case).
+fn run_tree_receive(
+    root: PathBuf,
+    port: u16,
+    force_checksum: bool,
+    plaintext: bool,
+    trust_flag: Option<String>,
+    no_delete: bool,
+) -> std::io::Result<()> {
+    if !root.exists() {
+        std::fs::create_dir_all(&root)?;
+    }
+    let listener = TcpListener::bind(("0.0.0.0", port))?;
+    let bound = listener.local_addr()?.port();
+    println!("listening on 0.0.0.0:{bound} (tree mode) ...");
+    let (tcp, peer) = listener.accept()?;
+    println!("peer connected: {peer}");
+    tcp.set_nodelay(true).ok();
+    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+    let mut stream = connect_authenticated(tcp, &peer.to_string(), false, plaintext, trust_flag)?;
+
+    let display = &mut TreeDisplay::new();
+    let request = TreeReceiveRequest {
+        root,
+        force_checksum,
+        no_delete,
+    };
+    let pipeline = PipelineConfig::default();
+    let outcome = match tree_receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
+        Ok(o) => o,
+        Err(e) => {
+            display.finish();
+            return Err(io_err(&e));
+        }
+    };
+    report_tree_outcome("receive", &outcome, display);
+    Ok(())
+}
+
+/// Shared transport setup (D16): TLS by default with mutual fingerprint
+/// pinning; `--plaintext` bypasses. Used by all four runners (file/tree ×
+/// send/receive).
+fn connect_authenticated(
+    tcp: TcpStream,
+    peer_label: &str,
+    client_role: bool,
+    plaintext: bool,
+    trust_flag: Option<String>,
+) -> std::io::Result<Box<dyn ReadWrite>> {
+    if plaintext {
+        return Ok(Box::new(tcp));
+    }
+    let (identity, created) = ffsync::transport::Identity::load_or_create()?;
+    if created {
+        println!("identity created: {}", identity.fingerprint());
+        println!("(share this fingerprint out-of-band so peers can pin it)");
+    }
+    let policy = resolve_pin_policy(trust_flag.as_deref(), peer_label)?;
+    let (tls, presented) = if client_role {
+        let (tls, presented) = ffsync::transport::client_session(
+            tcp,
+            &identity,
+            &policy,
+            rustls_pki_types_server_name(peer_label)?,
+        )?;
+        (Box::new(tls) as Box<dyn ReadWrite>, presented)
+    } else {
+        let (tls, presented) = ffsync::transport::server_session(tcp, &identity, &policy)?;
+        (Box::new(tls) as Box<dyn ReadWrite>, presented)
+    };
+    enforce_first_use(&policy, &presented, peer_label.to_string())?;
+    println!(
+        "peer identity: {}",
+        ffsync::transport::format_fingerprint(&presented)
+    );
+    Ok(tls)
+}
+
 /// The `Read + Write` object bound the sync state machines run over:
 /// a plain TCP stream (`--plaintext`) or a TLS stream (default).
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
+
+/// Tree-mode progress display: one line per file conversation plus
+/// tree-level phases, mirroring ProgressDisplay's single-line discipline.
+struct TreeDisplay {
+    current_file: Option<String>,
+    last_print: Instant,
+}
+
+impl TreeDisplay {
+    fn new() -> Self {
+        Self {
+            current_file: None,
+            last_print: Instant::now(),
+        }
+    }
+
+    fn update(&mut self, p: TreeProgress) {
+        match p {
+            TreeProgress::Scanning => {
+                self.set_line("scanning  walking the tree (metadata only)".to_string());
+            }
+            TreeProgress::FileStart(_idx, _total) => {
+                // The FileProgress line carries the visibility.
+            }
+            TreeProgress::FileProgress { rel_path, progress } => {
+                self.current_file = Some(rel_path);
+                self.render_file_progress(progress);
+            }
+            TreeProgress::FileDone(idx, total) => {
+                self.set_line(format!("done      {}/{} files synced", idx + 1, total));
+            }
+            TreeProgress::Deleting(n, bytes) => {
+                self.set_line(format!("deleting  {} removed ({})", n, fmt_bytes(bytes)));
+            }
+        }
+    }
+
+    fn render_file_progress(&mut self, p: Progress) {
+        let now = Instant::now();
+        if !matches!(p, Progress::NothingToDo) && now - self.last_print < Duration::from_millis(200)
+        {
+            return;
+        }
+        self.last_print = now;
+        let file = self.current_file.clone().unwrap_or_default();
+        let inner = match p {
+            Progress::Scanning(hashed, total) => {
+                let pct = hashed.checked_mul(100).map_or(1000, |v| v / total.max(1));
+                format!("hashing {:.1}% ({})", pct as f64 / 10.0, fmt_bytes(hashed))
+            }
+            Progress::WarmStart(chunks) => format!("warm ({} chunks from index)", chunks),
+            Progress::Diffing => "diffing".to_string(),
+            Progress::Transferring(sent, total) => {
+                let pct = sent.checked_mul(100).map_or(1000, |v| v / total.max(1));
+                format!("sending {:.1}% ({})", pct as f64 / 10.0, fmt_bytes(sent))
+            }
+            Progress::Receiving(received, total) => {
+                let pct = received.checked_mul(100).map_or(1000, |v| v / total.max(1));
+                format!(
+                    "receiving {:.1}% ({})",
+                    pct as f64 / 10.0,
+                    fmt_bytes(received)
+                )
+            }
+            Progress::Verifying => "verifying".to_string(),
+            Progress::NothingToDo => "up to date".to_string(),
+        };
+        self.set_line(format!("sync      {}  {}", file, inner));
+    }
+
+    fn set_line(&mut self, line: String) {
+        eprint!("\r{}", line);
+    }
+
+    fn finish(&mut self) {
+        eprintln!();
+    }
+}
+
+/// Prints the tree session summary (both roles).
+fn report_tree_outcome(role: &str, outcome: &TreeOutcome, display: &mut TreeDisplay) {
+    display.finish();
+    let mut parts = Vec::new();
+    parts.push(format!("{} files", outcome.files));
+    if outcome.transferred_bytes > 0 {
+        parts.push(format!(
+            "{} transferred",
+            fmt_bytes(outcome.transferred_bytes)
+        ));
+    }
+    if outcome.in_sync > 0 {
+        parts.push(format!("{} up to date", outcome.in_sync));
+    }
+    if outcome.deleted > 0 {
+        parts.push(format!(
+            "{} deleted ({})",
+            outcome.deleted,
+            fmt_bytes(outcome.deleted_bytes)
+        ));
+    }
+    println!("{}: {}", role, parts.join(", "));
+}
 
 /// Builds the pin policy from `--trust` (if given) or the pins file, for
 /// both roles (send = peer host label, receive = connected peer address).
@@ -466,6 +727,7 @@ fn main() {
             let mut force_checksum = false;
             let mut plaintext = false;
             let mut trust_flag = None;
+            let mut no_delete = false;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -477,6 +739,7 @@ fn main() {
                             .unwrap_or_else(|| die("--trust requires a fingerprint"));
                         trust_flag = Some(v.to_string());
                     }
+                    "--no-delete" => no_delete = true,
                     "--help" | "-h" => {
                         print!("{}", USAGE);
                         return;
@@ -489,14 +752,16 @@ fn main() {
                 }
             }
             if positional.len() != 2 {
-                die("send requires <file> <host:port>");
+                die("send requires <file|dir> <host:port>");
             }
             let file = PathBuf::from(&positional[0]);
             let addr = positional[1].clone();
-            run_send(file, addr, force_checksum, plaintext, trust_flag).unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            });
+            run_send(file, addr, force_checksum, plaintext, trust_flag, no_delete).unwrap_or_else(
+                |e| {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                },
+            );
         }
         "receive" => {
             let mut positional: Vec<String> = Vec::new();
@@ -504,6 +769,7 @@ fn main() {
             let mut plaintext = false;
             let mut trust_flag = None;
             let mut from = None;
+            let mut no_delete = false;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -519,6 +785,7 @@ fn main() {
                         let v = it.next().unwrap_or_else(|| die("--from requires a path"));
                         from = Some(PathBuf::from(v));
                     }
+                    "--no-delete" => no_delete = true,
                     "--help" | "-h" => {
                         print!("{}", USAGE);
                         return;
@@ -531,18 +798,25 @@ fn main() {
                 }
             }
             if positional.len() != 2 {
-                die("receive requires <file> <port>");
+                die("receive requires <file|dir> <port>");
             }
             let file = PathBuf::from(&positional[0]);
             let port: u16 = positional[1]
                 .parse()
                 .unwrap_or_else(|_| die(&format!("invalid port: {}", positional[1])));
-            run_receive(file, port, force_checksum, from, plaintext, trust_flag).unwrap_or_else(
-                |e| {
-                    eprintln!("error: {}", e);
-                    std::process::exit(1);
-                },
-            );
+            run_receive(
+                file,
+                port,
+                force_checksum,
+                from,
+                plaintext,
+                trust_flag,
+                no_delete,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
         }
         "trust" => {
             // ffsync trust <fingerprint>  (or with a name label as comment)

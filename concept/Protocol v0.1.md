@@ -101,6 +101,7 @@ not by tolerating unknown frames).
 | 0x0B  | ERROR          | both    | code u16 + message (u16 len + UTF-8) |
 | 0x0C  | TREE_BEGIN     | send→recv | entry_count u64, then entry_count × tree entry (§16.2); v0.3 |
 | 0x0D  | TREE_END       | both    | deleted_count u32 + deleted_bytes u64 (recv→send, after deletes; send→recv variant is empty); v0.3 |
+| 0x0E  | FILE_SYNC      | send→recv | empty; tree sessions only: "this file needs a conversation" (§16.4) — its absence is NOT_MODIFIED |
 
 Error codes: 1=version, 2=role conflict, 3=bad frame, 4=hash mismatch,
 5=io, 6=aborted. Any ERROR frame is terminal: the sender of ERROR closes the
@@ -442,6 +443,16 @@ receiver expects conversations exactly for the same set (computed from the
 same two manifests), so no per-file negotiation is needed. A receiver that
 disagrees (it must not, given deterministic triage) fails loudly on the
 first unexpected HELLO.
+
+Because the sender's fast-path decision (size+mtime equal, both trust
+times) is known *before* it would demand the receiver's manifest, tree
+sessions make the branch explicit: after the per-file HELLO exchange, the
+sender sends either NOT_MODIFIED (skip; conversation over, no manifest
+streamed) or FILE_SYNC (empty; conversation proceeds — the receiver then
+streams its manifest as usual). The receiver reads exactly one frame at
+that point; no write races, no broken-pipe tolerance needed inside a
+session. Single-file sync keeps its original drain-based flow (§4) —
+there, connection end *is* the session end.
 
 Within one file's conversation, everything is unchanged from §5–§8 —
 including resume (a mid-tree failure leaves that file's temp file; the

@@ -204,11 +204,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: None,
                 force_checksum: true, // keep the test deterministic
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(),
                 force_checksum: true,
+                tree: false,
+                apply_mtime: None,
             },
         );
 
@@ -241,11 +244,14 @@ mod tests {
             display_path: "source.bin".into(),
             mtime: None,
             force_checksum: false, // warm start needs the default mode
+            tree: false,
         };
         let mk_recv = || ReceiveRequest {
             path: target.clone(),
             local_source: target.clone(),
             force_checksum: false,
+            tree: false,
+            apply_mtime: None,
         };
 
         // Sync 1 (cold): full scan both sides, index files written at commit.
@@ -351,11 +357,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: None,
                 force_checksum: false,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(),
                 force_checksum: false,
+                tree: false,
+                apply_mtime: None,
             },
         );
         assert!(
@@ -375,11 +384,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: None,
                 force_checksum: false,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(),
                 force_checksum: false,
+                tree: false,
+                apply_mtime: None,
             },
         );
         s2.expect("attempt 2 sender converges");
@@ -409,11 +421,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: None,
                 force_checksum: true,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(),
                 force_checksum: true,
+                tree: false,
+                apply_mtime: None,
             },
         );
         s.expect("sender ok");
@@ -439,11 +454,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: None,
                 force_checksum: true,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(),
                 force_checksum: true,
+                tree: false,
+                apply_mtime: None,
             },
         );
 
@@ -465,11 +483,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: None,
                 force_checksum: true,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(), // does not exist yet
                 force_checksum: true,
+                tree: false,
+                apply_mtime: None,
             },
         );
 
@@ -576,11 +597,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: None,
                 force_checksum: true,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(),
                 force_checksum: true,
+                tree: false,
+                apply_mtime: None,
             },
             64 * 1024,
         );
@@ -598,11 +622,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: None,
                 force_checksum: true,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(),
                 force_checksum: true,
+                tree: false,
+                apply_mtime: None,
             },
         );
         let _ = s2.expect("resumed sender ok");
@@ -631,11 +658,14 @@ mod tests {
                 display_path: "source.bin".into(),
                 mtime: Some(t),
                 force_checksum: false,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: target.clone(),
                 force_checksum: false,
+                tree: false,
+                apply_mtime: None,
             },
         );
 
@@ -714,6 +744,8 @@ mod tests {
             path: target.clone(),
             local_source: target.clone(),
             force_checksum: false,
+            tree: false,
+            apply_mtime: None,
         };
         let pipeline = PipelineConfig::default();
         let mut progress = |_p: Progress| {};
@@ -754,11 +786,14 @@ mod tests {
                 display_path: "from.bin".into(),
                 mtime: None,
                 force_checksum: true,
+                tree: false,
             },
             ReceiveRequest {
                 path: target.clone(),
                 local_source: from_file.clone(),
                 force_checksum: true,
+                tree: false,
+                apply_mtime: None,
             },
         );
         let _s = s.expect("sender ok");

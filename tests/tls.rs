@@ -109,11 +109,14 @@ mod tests {
                     display_path: "data.bin".into(),
                     mtime: None,
                     force_checksum: true,
+                    tree: false,
                 };
                 let recv_req = ffsync::protocol::sync::ReceiveRequest {
                     path: path.clone(),
                     local_source: path.clone(),
                     force_checksum: true,
+                    tree: false,
+                    apply_mtime: None,
                 };
                 let pipeline = ffsync::chunking::PipelineConfig::default();
                 let pipeline_recv = ffsync::chunking::PipelineConfig::default();
