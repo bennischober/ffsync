@@ -12,12 +12,12 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
 
-> **Status: v0.4.0.** Single-file **and directory-tree** sync between two
+> **Status: v0.5.0.** Single-file **and directory-tree** sync between two
 > peers over TLS work end-to-end, including resume after mid-transfer
 > disconnects. Trees sync by metadata triage (D17): only changed files get
 > conversations, synced files adopt the sender's mtime, and a run with
@@ -331,7 +331,7 @@ src/
   main.rs         the CLI
   bin/bench.rs    the benchmark harness
 concept/          design docs (positioning, decisions, protocol spec, research)
-evaluation/       measured results (chunking, rsync comparison)
+evaluation/       measured results (chunking, rsync, parallel sessions)
 ```
 
 ## Design docs
@@ -346,9 +346,10 @@ The reasoning is the product; it is all recorded:
   (tracks all versions; currently v3), frame by frame
 - [`concept/Deep Research Digest.md`](concept/Deep%20Research%20Digest.md) —
   what the two deep-research runs got right, and what was rejected
-- [`evaluation/chunking.md`](evaluation/chunking.md) and
-  [`evaluation/rsync.md`](evaluation/rsync.md) — the measurements behind the
-  defaults
+- [`evaluation/chunking.md`](evaluation/chunking.md),
+  [`evaluation/rsync.md`](evaluation/rsync.md) and
+  [`evaluation/parallel.md`](evaluation/parallel.md) — the measurements
+  behind the defaults
 
 ## Roadmap
 
@@ -365,15 +366,16 @@ The reasoning is the product; it is all recorded:
   tree, sequential per-file conversations over one connection, mtime
   preservation, deferred deletes with `--no-delete`, empty files/dirs
   first-class.
-- **Done (unreleased) - excludes/pattern matching (§16.7):** `--exclude`
+- **Done (0.4.0) - excludes/pattern matching (§16.7):** `--exclude`
   and `--exclude-from` filter tree sessions; the sender's patterns travel
   in the protocol so both peers filter identically, and a receiver's own
   patterns protect paths from deletion. No negation syntax yet
   (re-includes may come later).
-- **Done (unreleased) - parallel per-file conversations (§16.8, D13 step
+- **Done (0.5.0) - parallel per-file conversations (§16.8, D13 step
   1):** `--parallel K` spreads a tree session's conversations over K
   connections (native threads, no async); measured 3.4×–6.1× on a
-  100-file full transfer at 30 ms simulated RTT. QUIC (one connection,
+  100-file full transfer at 30 ms simulated RTT
+  (`evaluation/parallel.md`). QUIC (one connection,
   K streams + connection migration) can now slot in as a transport swap.
 - **Next - QUIC transport (D13 step 2)**: connection migration for the
   "friend over the internet" case; the parallel-session layer is
