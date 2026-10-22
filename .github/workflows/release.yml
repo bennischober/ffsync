@@ -77,7 +77,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
   artifacts:
-    name: executables / ${{ matrix.target }}
+    name: executables / ${{ matrix.name }}
     needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
@@ -86,13 +86,31 @@ jobs:
         include:
           # Windows is the primary development platform; the plain .exe zip
           # is the main download for end users (no toolchain required).
-          - target: x86_64-pc-windows-msvc
+          # Asset names use friendly platform labels (node/go style), not
+          # Rust target triples — the triple stays a build detail here.
+          - name: windows-x64
+            target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
-          # Static, dependency-free Linux binary (no glibc drift).
-          - target: x86_64-unknown-linux-musl
+          - name: linux-x64
+            target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar
+          # ARM64 Linux (Raspberry Pi 5, Graviton, ARM servers). Native arm64
+          # runner — no cross-compilation, ring's C code builds in place.
+          - name: linux-arm64
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            archive: tar
+          # ARM64 Windows (Surface Pro X class, ARM laptops). The runner
+          # image ships Visual Studio with the native ARM64 toolset, so
+          # aarch64-pc-windows-msvc needs no extra tooling (rustup's own CI
+          # builds it on this image). Opportunistic entry: if the toolchain
+          # or ring misbehaves, drop it — linux-arm64 is the valuable one.
+          - name: windows-arm64
+            target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            archive: zip
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -101,11 +119,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # ring (via rustls/rcgen) compiles C code; the musl target needs the
+      # ring (via rustls/rcgen) compiles C code; the musl targets need the
       # musl-gcc wrapper, which the runner image does not preinstall.
       - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # On the arm64 runner, make ring's C compilation use the musl wrapper
+      # explicitly (glibc-compiled C objects do not link against musl
+      # libc.a). The x64 musl build resolves this without the hint.
+      - name: Point C toolchain at musl (arm64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
         env:
@@ -113,13 +139,14 @@ jobs:
           # exe depend on VCRUNTIME140.dll (absent on machines without the
           # VC++ redistributable — hardly "portable"). crt-static embeds the
           # runtime; verified locally: no VCRUNTIME imports in the PE.
-          RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static' || '' }}
+          # Applies to both windows targets (x64 and arm64).
+          RUSTFLAGS: ${{ contains(matrix.target, 'windows-msvc') && '-C target-feature=+crt-static' || '' }}
       - name: Package (zip)
         id: package
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $stage = "ffsync-${{ github.ref_name }}-${{ matrix.target }}"
+          $stage = "ffsync-${{ github.ref_name }}-${{ matrix.name }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/ffsync.exe" "$stage/"
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $stage/
@@ -129,7 +156,7 @@ jobs:
         id: package-tar
         if: matrix.archive == 'tar'
         run: |
-          stage="ffsync-${{ github.ref_name }}-${{ matrix.target }}"
+          stage="ffsync-${{ github.ref_name }}-${{ matrix.name }}"
           mkdir "$stage"
           cp "target/${{ matrix.target }}/release/ffsync" "$stage/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"

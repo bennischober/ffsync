@@ -20,7 +20,18 @@ All notable changes to ffsync are documented here. The format follows
   conversation fails the session and the receiver deletes nothing
   (fail-closed, as before). Measured with the new `bench --latency`
   harness (simulated 30 ms RTT, 100-file full transfer): sequential
-  21.0 s → 6.25 s at K=4 (3.36×) → 3.46 s at K=8 (6.07×).
+  21.0 s → 6.25 s at K=4 (3.36×) → 3.46 s at K=8 (6.07×). Documented in
+  `evaluation/parallel.md` with the model caveats (a latency model, not a
+  network measurement — trust the K-ratio, not the absolute seconds).
+
+### Changed
+
+- **Friendly release asset names:** release executables are now named
+  `ffsync-vX.Y.Z-windows-x64.zip` / `ffsync-vX.Y.Z-linux-x64.tar.gz`
+  instead of the Rust target triples (`…-x86_64-pc-windows-msvc.zip`,
+  `…-x86_64-unknown-linux-musl.tar.gz`); `.sha256` sidecars follow the
+  archive name. Added `linux-arm64` (aarch64 musl) and opportunistic
+  `windows-arm64` (aarch64 MSVC) builds on GitHub's native arm64 runners.
 
 ## [0.4.0] - 2026-10-22
 

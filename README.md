@@ -306,9 +306,14 @@ cargo run --release --bin bench -- --quick --rsync  # also time rsync (native or
 cargo audit                                          # dependency advisory check
 ```
 
-Release executables are built by the tag-driven release workflow: Windows
-(MSVC, static CRT — runs without the VC++ redistributable) and Linux (musl,
-fully static), each with a SHA-256 sidecar attached to the GitHub release.
+Release executables are built by the tag-driven release workflow and
+attached to the GitHub release with a SHA-256 sidecar each:
+`ffsync-vX.Y.Z-windows-x64.zip`, `ffsync-vX.Y.Z-linux-x64.tar.gz`,
+`ffsync-vX.Y.Z-linux-arm64.tar.gz`, `ffsync-vX.Y.Z-windows-arm64.zip`.
+Windows builds use MSVC with a static CRT (no VC++ redistributable
+needed); Linux builds are musl and fully static — one binary per
+architecture runs on any distro. (Asset names are friendly platform
+labels; the Rust target triples are a build detail of the workflow.)
 
 Requires a stable Rust toolchain (developed on 1.99, edition 2024). Windows is
 the primary development platform; the I/O layer is `#[cfg]`-split for Unix.
