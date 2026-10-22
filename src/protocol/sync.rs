@@ -24,6 +24,7 @@ use crate::chunking::{
     Blake3Hasher, CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, Chunk, ChunkEvent, FastCDCChunker,
     PipelineConfig, chunk_root, process_file,
 };
+use crate::index::{FileIndex, load_index};
 use crate::protocol::framing::{self, FrameError};
 use crate::protocol::message::{
     self, ErrorCode, FLAG_RESUMING, FLAG_TRUST_TIMES, Hello, ManifestChunk, Message, MessageError,
@@ -88,6 +89,10 @@ impl From<FrameError> for SyncError {
 pub enum Progress {
     /// Scanning own file: (bytes hashed so far, file size).
     Scanning(u64, u64),
+    /// Warm start (D15): chunk list loaded from a validated persistent
+    /// index; payload is the number of chunks reused. No file contents
+    /// were read.
+    WarmStart(usize),
     /// Diffing against the peer's manifest.
     Diffing,
     /// Transferring: (payload bytes sent so far, payload total).
@@ -221,18 +226,44 @@ where
 {
     // ---- Scan own file first (we are the sender; our chunk list defines
     // the plan, and we need the file size for HELLO). ----
+    // Warm start (D15): if a valid index exists for our file (size + mtime
+    // match), the chunk list and root come from the index without reading
+    // file contents. Otherwise: full cold scan, as always.
     let file = File::open(&request.path)?;
     let file_size = file.metadata()?.len();
     let mtime = request
         .mtime
         .or_else(|| file.metadata().ok().and_then(|m| m.modified().ok()));
     drop(file);
+    // Sub-second mtime for HELLO (v0.2): whole-second comparisons let a
+    // same-second same-size rewrite fast-path as "in sync".
+    let (mtime_secs, mtime_nanos) = mtime
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
 
     progress(Progress::Scanning(0, file_size));
-    let (_scan_stats, source_chunks) = scan_with_progress(&request.path, pipeline, |hashed| {
-        progress(Progress::Scanning(hashed, file_size))
-    })?;
-    let root = chunk_root(&source_chunks);
+    let warm = if request.force_checksum {
+        // Checksum mode must derive the root from a real scan (D15: the
+        // index is never evidence that scanning can be skipped).
+        None
+    } else {
+        load_index(&request.path)
+    };
+    let warmed = warm.is_some();
+    let (source_chunks, root) = match warm {
+        Some(idx) => {
+            progress(Progress::WarmStart(idx.chunks.len()));
+            (idx.chunks, idx.root)
+        }
+        None => {
+            let (_scan_stats, chunks) = scan_with_progress(&request.path, pipeline, |hashed| {
+                progress(Progress::Scanning(hashed, file_size))
+            })?;
+            let root = chunk_root(&chunks);
+            (chunks, root)
+        }
+    };
     progress(Progress::Diffing);
 
     // ---- HELLO ----
@@ -249,12 +280,14 @@ where
         cdc_avg: CHUNK_AVG as u32,
         cdc_max: CHUNK_MAX as u32,
         file_size,
-        file_mtime: unix_secs(mtime),
+        file_mtime: mtime_secs,
+        file_mtime_nanos: mtime_nanos,
         path: request.display_path.clone(),
     };
     let trust_own = (hello.flags & FLAG_TRUST_TIMES) != 0;
     let hello_size = hello.file_size;
     let hello_mtime = hello.file_mtime;
+    let hello_mtime_nanos = hello.file_mtime_nanos;
     hello.into_frame()?.encode(stream)?;
     stream.flush()?;
 
@@ -268,8 +301,17 @@ where
     };
 
     // ---- Fast path (§4): size+mtime equal and trust_times agreed ----
+    // Sub-second mtime matters (v0.2, D11/D15): whole-second comparison let a
+    // same-second rewrite with unchanged size fast-path as "in sync" — a
+    // silent wrong-content success (found by the warm-start tests). rsync
+    // compares sub-second mtimes for the same reason.
     let trust = trust_own && (peer.flags & FLAG_TRUST_TIMES) != 0;
-    if trust && hello_size == peer.file_size && hello_mtime != 0 && hello_mtime == peer.file_mtime {
+    if trust
+        && hello_size == peer.file_size
+        && hello_mtime != 0
+        && hello_mtime == peer.file_mtime
+        && hello_mtime_nanos == peer.file_mtime_nanos
+    {
         message::encode_empty(framing::T_NOT_MODIFIED)?.encode(stream)?;
         stream.flush()?;
         // TCP note: exiting now would close the socket while the receiver
@@ -377,6 +419,16 @@ where
     let frame = framing::read_frame(stream)?;
     match frame.ftype {
         framing::T_COMMIT_ACK => {
+            // Commit succeeded: persist our chunk list for the next warm
+            // start (D15). The source is verified content at this point —
+            // the receiver hash-verified the reconstruction against this
+            // exact chunk list.
+            let index = FileIndex::from_scan(
+                source_chunks,
+                file_size,
+                crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+            );
+            let _ = crate::index::write_index(&request.path, &index);
             if remote_total > 0 {
                 Ok(SyncOutcome::Transferred {
                     bytes: sent,
@@ -388,6 +440,14 @@ where
         }
         framing::T_ERROR => {
             let (code, msg) = message::read_error_payload(&frame)?;
+            // Poison-loop guard (D15): VERIFY failed on the receiver. If we
+            // warm-started, our index may have lied about the file's content
+            // (mtime-preserving edits defeat stat validation). Drop it so the
+            // next attempt cold-scans; a wrong index must never fail a sync
+            // twice. Any other error (or a cold scan) leaves the index alone.
+            if warmed && code == ErrorCode::HashMismatch {
+                crate::index::remove_index(&request.path);
+            }
             Err(SyncError::Peer(code, msg))
         }
         other => Err(SyncError::Protocol(format!(
@@ -417,20 +477,63 @@ where
     let temp_path = Reconstructor::temp_path_for(&request.path);
     let resuming = temp_path.exists();
 
+    // Orphan-index cleanup (D15): an index whose target file no longer
+    // exists is a leftover from a deleted file. Best-effort, only our own
+    // naming convention (`<target>.ffsync-index`, where <target> may itself
+    // contain dots — strip the literal suffix, not the last extension).
+    if let Some(parent) = request.path.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(base) = name.strip_suffix(".ffsync-index") else {
+                continue;
+            };
+            if base.is_empty() {
+                continue;
+            }
+            let target = parent.join(base);
+            if !target.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
     // ---- Scan our local file for the manifest (§5). ----
+    // Warm start (D15): a valid index (size + mtime match) supplies the
+    // chunk list and root without reading file contents. In --checksum
+    // mode the index is never used to skip the scan (its root would claim
+    // content identity without reading), per D15.
     let local_meta = std::fs::metadata(&request.local_source).ok();
     let local_size = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let local_mtime = local_meta.as_ref().and_then(|m| m.modified().ok());
 
-    let (local_chunks, local_root) = if local_size > 0 {
-        progress(Progress::Scanning(0, local_size));
-        let (_stats, chunks) = scan_with_progress(&request.local_source, pipeline, |hashed| {
-            progress(Progress::Scanning(hashed, local_size))
-        })?;
-        let root = chunk_root(&chunks);
-        (chunks, Some(root))
+    let warm_idx = if local_size > 0 && !request.force_checksum {
+        load_index(&request.local_source)
     } else {
-        (Vec::new(), None)
+        None
+    };
+    let (local_chunks, local_root) = match warm_idx {
+        Some(idx) => {
+            progress(Progress::WarmStart(idx.chunks.len()));
+            (idx.chunks, Some(idx.root))
+        }
+        None => {
+            if local_size > 0 {
+                progress(Progress::Scanning(0, local_size));
+                let (_stats, chunks) =
+                    scan_with_progress(&request.local_source, pipeline, |hashed| {
+                        progress(Progress::Scanning(hashed, local_size))
+                    })?;
+                let root = chunk_root(&chunks);
+                (chunks, Some(root))
+            } else {
+                (Vec::new(), None)
+            }
+        }
     };
 
     // ---- Resume manifest (D10): union of temp chunks and old-file chunks,
@@ -480,6 +583,10 @@ where
         cdc_max: CHUNK_MAX as u32,
         file_size: local_size,
         file_mtime: unix_secs(local_mtime),
+        file_mtime_nanos: local_mtime
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0),
         path: request
             .path
             .file_name()
@@ -664,10 +771,14 @@ where
                         // Stale manifest entry: this chunk's content differs
                         // from what we promised. Delete the stale temp and
                         // fail — the connection is dead anyway, and the next
-                        // attempt starts clean.
+                        // attempt starts clean. If we warm-started (D15),
+                        // also drop the index: it lied about content and
+                        // must not poison the retry (same guard as the
+                        // sender's HashMismatch handling).
                         if matches!(origin, LocalOrigin::Temp { .. }) {
                             let _ = std::fs::remove_file(&temp_path);
                         }
+                        crate::index::remove_index(&request.local_source);
                         return Err(send_error_and_finish(
                             stream,
                             ErrorCode::HashMismatch,
@@ -750,6 +861,16 @@ where
         // Hash verified; commit. Reconstruct the Reconstructor state: the
         // temp file exists and is verified — rename atomically.
         std::fs::rename(&temp_path, &request.path)?;
+        // Persist the verified state for the next warm start (D15): the
+        // verified temp scan is exactly the index content.
+        let _ = crate::index::write_index(
+            &request.path,
+            &FileIndex::from_scan(
+                temp_chunks,
+                target_size,
+                crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+            ),
+        );
         message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
         stream.flush()?;
         return Ok(SyncOutcome::Transferred {
@@ -777,6 +898,29 @@ where
             if resuming {
                 // The previous attempt actually completed the data; commit it.
                 std::fs::rename(&temp_path, &request.path)?;
+                // Persist the committed state (D15). The temp scan above is
+                // the verified chunk list; reuse it instead of re-scanning.
+                let chunks = scan_file_plain(&temp_path, pipeline).unwrap_or_default();
+                let _ = crate::index::write_index(
+                    &request.path,
+                    &FileIndex::from_scan(
+                        chunks,
+                        target_size,
+                        crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                    ),
+                );
+            } else {
+                // Old file already matched (no transfer needed): persist its
+                // index so the NEXT sync warms (D15). The scan already ran;
+                // writing costs one file of bytes.
+                let _ = crate::index::write_index(
+                    &request.path,
+                    &FileIndex::from_scan(
+                        local_chunks.clone(),
+                        local_size,
+                        crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
+                    ),
+                );
             }
             message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
             stream.flush()?;

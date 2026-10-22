@@ -12,4 +12,9 @@ pub mod sync;
 /// Protocol magic sent in the HELLO payload.
 pub const MAGIC: [u8; 4] = *b"FFSY";
 /// Protocol version implemented by this crate.
-pub const VERSION: u16 = 1;
+///
+/// v2 (v0.2): HELLO gains `file_mtime_nanos` (u32) — the §4 fast path must
+/// compare sub-second mtimes; whole-second comparison let a same-second
+/// same-size rewrite pass as "in sync" (D15 follow-up). v1 peers are
+/// rejected by the version check.
+pub const VERSION: u16 = 2;

@@ -4,6 +4,29 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Persistent chunk index (warm starts, D15):** each synced file gets a
+  sidecar `<file>.ffsync-index` (size, mtime, chunk-tree root, ordered chunk
+  list) written only from verified state at commit time. On the next sync, a
+  peer whose index validates (size + mtime at nanosecond granularity) skips
+  its file scan entirely — repeated syncs of unchanged data become stat-only
+  operations. Corrupt indexes are refused at load (the decoder re-derives the
+  chunk-tree root from the chunk list and rejects mismatches); a
+  stale-but-validating index fails the sync loudly and is invalidated, so a
+  retry cold-scans and recovers — never a poison loop, never silent
+  corruption.
+
+### Fixed
+
+- The mtime/size fast path now compares sub-second mtimes. Whole-second
+  comparison let a same-second rewrite of a same-size file pass as "already
+  in sync" without transferring — a silent wrong-content no-op (protocol
+  version bumped to 2; HELLO gained `file_mtime_nanos`). Found by the
+  warm-start tests.
+
 ## [0.1.0] - 2026-10-22
 
 First working implementation: single-file sync between two peers over TCP.

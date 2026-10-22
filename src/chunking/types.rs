@@ -1,7 +1,7 @@
 use blake3::Hash;
 
 /// Represents a chunk with its metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub offset: u64,
     pub length: usize,

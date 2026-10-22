@@ -10,8 +10,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use ffsync::chunking::PipelineConfig;
+    use ffsync::protocol::message::ErrorCode;
     use ffsync::protocol::sync::SyncError;
-    use ffsync::protocol::sync::{ReceiveRequest, SendRequest, SyncOutcome, receive, send};
+    use ffsync::protocol::sync::{
+        Progress, ReceiveRequest, SendRequest, SyncOutcome, receive, send,
+    };
 
     /// A bidirectional in-memory pipe: what one side writes, the other reads.
     /// Each direction is a bounded byte channel; `new` returns both ends.
@@ -146,6 +149,36 @@ mod tests {
         (s, r)
     }
 
+    /// Like `run_sync`, but records each side's progress events so tests can
+    /// assert on phases (e.g. that a warm start happened).
+    fn run_sync_recording(
+        send_req: SendRequest,
+        recv_req: ReceiveRequest,
+    ) -> (Vec<Progress>, Vec<Progress>) {
+        let (mut sender_end, mut receiver_end) = DuplexPair::new(64);
+        let pipeline = PipelineConfig::default();
+        let pipeline_recv = PipelineConfig::default();
+
+        let s_handle = std::thread::spawn(move || {
+            let mut events = Vec::new();
+            let mut progress = |p: ffsync::protocol::sync::Progress| events.push(p);
+            let r = send(&mut sender_end, &send_req, &pipeline, &mut progress);
+            assert!(r.is_ok(), "sender failed: {:?}", r);
+            events
+        });
+        let r_handle = std::thread::spawn(move || {
+            let mut events = Vec::new();
+            let mut progress = |p: ffsync::protocol::sync::Progress| events.push(p);
+            let r = receive(&mut receiver_end, &recv_req, &pipeline_recv, &mut progress);
+            assert!(r.is_ok(), "receiver failed: {:?}", r);
+            events
+        });
+
+        let s = s_handle.join().unwrap();
+        let r = r_handle.join().unwrap();
+        (s, r)
+    }
+
     #[test]
     fn sync_modified_file_transfers_delta_and_verifies() {
         let fx = Fixture::new("modified");
@@ -190,6 +223,206 @@ mod tests {
             (other_s, other_r) => panic!("unexpected outcomes: s={:?} r={:?}", other_s, other_r),
         }
         assert_eq!(read_file(&target), src_data);
+    }
+
+    #[test]
+    fn warm_start_uses_index_on_second_sync() {
+        let fx = Fixture::new("warmstart");
+        let mut src_data = vec![0u8; 2 * 1024 * 1024];
+        for (i, b) in src_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(17).wrapping_add((i / 65536) as u8);
+        }
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data[..1024 * 1024]);
+
+        let mk_send = || SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "source.bin".into(),
+            mtime: None,
+            force_checksum: false, // warm start needs the default mode
+        };
+        let mk_recv = || ReceiveRequest {
+            path: target.clone(),
+            local_source: target.clone(),
+            force_checksum: false,
+        };
+
+        // Sync 1 (cold): full scan both sides, index files written at commit.
+        let (s1, r1) = run_sync(mk_send(), mk_recv());
+        s1.expect("sync 1 sender ok");
+        r1.expect("sync 1 receiver ok");
+        let src_index = ffsync::index::index_path_for(fx.source());
+        let tgt_index = ffsync::index::index_path_for(&target);
+        assert!(src_index.exists(), "sender index written at commit");
+        assert!(tgt_index.exists(), "receiver index written at commit");
+
+        // Sync 2 (warm, unchanged data): both sides must load their chunk
+        // lists from the index — the sender emits WarmStart before Diffing,
+        // and the receiver's WarmStart precedes the manifest.
+        let (s2_events, r2_events) = run_sync_recording(mk_send(), mk_recv());
+        assert!(
+            s2_events
+                .iter()
+                .any(|p| matches!(p, Progress::WarmStart(_))),
+            "sender must warm-start: {:?}",
+            s2_events
+        );
+        assert!(
+            r2_events
+                .iter()
+                .any(|p| matches!(p, Progress::WarmStart(_))),
+            "receiver must warm-start: {:?}",
+            r2_events
+        );
+        // The receiver must still be InSync (nothing to transfer).
+        let (_s2, r2) = run_sync(mk_send(), mk_recv());
+        assert!(matches!(r2.expect("sync 3 ok"), SyncOutcome::InSync));
+
+        // Now change the source: warm start must NOT be used (mtime changes
+        // invalidate the sender's index; the receiver's index still validates
+        // but the plan will differ).
+        let mut changed = src_data.clone();
+        changed[0] = changed[0].wrapping_add(1);
+        create_file(fx.source(), &changed);
+        let (s3, r3) = run_sync(mk_send(), mk_recv());
+        s3.expect("sync after change ok");
+        r3.expect("sync after change ok");
+        assert_eq!(read_file(&target), changed, "convergence after change");
+        // Sender's index must have been invalidated (mtime mismatch) and
+        // refreshed at commit: loading it now must succeed for new content.
+        assert!(
+            ffsync::index::load_index(fx.source()).is_some(),
+            "sender index refreshed at commit"
+        );
+    }
+
+    #[test]
+    fn corrupt_or_stale_index_falls_back_to_cold_scan() {
+        let fx = Fixture::new("staleindex");
+        let mut src_data = vec![0u8; 1024 * 1024];
+        for (i, b) in src_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(11).wrapping_add((i / 16384) as u8);
+        }
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data);
+
+        // Write a valid *stale* index for the source: claims different
+        // chunks than the file really has. This is the poison case: only
+        // plan-read hash verification + VERIFY can recover; stat validation
+        // alone cannot refuse it (D15's accepted caveat).
+
+        // Corrupt the target's index on disk (truncated): receiver must
+        // treat it as missing and cold-scan.
+        let tgt_index = ffsync::index::index_path_for(&target);
+        std::fs::write(&tgt_index, b"FFSYIX01corrupt").unwrap();
+
+        // Backdate both files' mtimes to DISTINCT values so the wire fast
+        // path (size+mtime, D11) cannot mask the scenario — with natural
+        // same-second mtimes the sender exits at NOT_MODIFIED before any
+        // index is consulted (bit us once already).
+        let t_src = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let t_tgt = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(fx.source(), filetime::FileTime::from_system_time(t_src)).unwrap();
+        filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(t_tgt)).unwrap();
+        // Re-stamp the bogus index with the backdated source mtime so its
+        // validation still passes — the poison scenario must survive.
+        let stale = ffsync::index::FileIndex::from_scan(
+            vec![ffsync::chunking::Chunk {
+                offset: 0,
+                length: 512,
+                hash: blake3::hash(b"bogus"),
+            }],
+            src_data.len() as u64,
+            ffsync::index::stat_mtime(fx.source()).unwrap(),
+        );
+        ffsync::index::write_index(fx.source(), &stale).unwrap();
+
+        // The bogus sender index passes size+mtime validation (we crafted
+        // it) — its wrong chunk list makes the sender promise content it
+        // cannot back up. Safety property (D15): the sync must FAIL CLEANLY
+        // at VERIFY (HashMismatch) — never converge to wrong content — and
+        // the sender's lying index must be invalidated so the retry
+        // cold-scans and succeeds (no poison loop).
+        let (s1, r1) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: false,
+            },
+        );
+        assert!(
+            matches!(&s1, Err(SyncError::Peer(code, _)) if *code == ErrorCode::HashMismatch),
+            "attempt 1 must fail loudly at VERIFY: {s1:?}"
+        );
+        assert!(r1.is_err(), "attempt 1 receiver must also fail");
+        assert!(
+            ffsync::index::load_index(fx.source()).is_none(),
+            "sender index must be invalidated after the warm-start lie"
+        );
+
+        // Attempt 2: cold scan on both sides; must converge.
+        let (s2, r2) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: false,
+            },
+        );
+        s2.expect("attempt 2 sender converges");
+        r2.expect("attempt 2 receiver converges");
+        assert_eq!(read_file(&target), src_data);
+        // Post-commit indexes must now be valid for the real content.
+        assert!(ffsync::index::load_index(fx.source()).is_some());
+        assert!(ffsync::index::load_index(&target).is_some());
+    }
+
+    #[test]
+    fn orphan_index_is_cleaned_up_on_receive() {
+        let fx = Fixture::new("orphan");
+        let data = vec![9u8; 256 * 1024];
+        create_file(fx.source(), &data);
+        let target = fx.path("target.bin");
+        create_file(&target, &data);
+
+        // Orphan: index without a target file.
+        let orphan_target = fx.path("gone.bin");
+        let orphan_index = ffsync::index::index_path_for(&orphan_target);
+        std::fs::write(&orphan_index, vec![0u8; 64]).unwrap();
+
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: true,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: true,
+            },
+        );
+        s.expect("sender ok");
+        r.expect("receiver ok");
+        // Orphan cleanup: the index whose target no longer exists is gone.
+        assert!(
+            !orphan_index.exists(),
+            "orphan index must be removed by receive"
+        );
     }
 
     #[test]

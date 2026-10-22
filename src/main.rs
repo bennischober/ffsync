@@ -76,6 +76,12 @@ impl ProgressDisplay {
                     fmt_secs(elapsed)
                 )
             }
+            Progress::WarmStart(chunks) => {
+                format!(
+                    "warm      loaded {} chunks from index, scan skipped",
+                    chunks
+                )
+            }
             Progress::Diffing => "diffing   comparing chunk manifests".to_string(),
             Progress::Transferring(sent, total) => {
                 let pct = sent.checked_mul(100).map_or(1000, |v| v / total.max(1));

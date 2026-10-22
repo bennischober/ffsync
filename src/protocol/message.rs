@@ -74,7 +74,8 @@ pub struct Hello {
     pub cdc_avg: u32,
     pub cdc_max: u32,
     pub file_size: u64,
-    pub file_mtime: u64, // unix seconds, 0 if absent
+    pub file_mtime: u64,       // unix seconds, 0 if absent
+    pub file_mtime_nanos: u32, // sub-second part of file_mtime, 0 if absent
     pub path: String,
 }
 
@@ -190,6 +191,7 @@ impl Message for Hello {
         payload.extend_from_slice(&self.cdc_max.to_le_bytes());
         payload.extend_from_slice(&self.file_size.to_le_bytes());
         payload.extend_from_slice(&self.file_mtime.to_le_bytes());
+        payload.extend_from_slice(&self.file_mtime_nanos.to_le_bytes());
         let path = self.path.as_bytes();
         if path.len() > u16::MAX as usize {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "path too long"));
@@ -218,6 +220,7 @@ impl Message for Hello {
         let cdc_max = read_u32_le(p, &mut pos)?;
         let file_size = read_u64_le(p, &mut pos)?;
         let file_mtime = read_u64_le(p, &mut pos)?;
+        let file_mtime_nanos = read_u32_le(p, &mut pos)?;
         let path_len = read_u16_le(p, &mut pos)? as usize;
         let path_bytes = read_bytes(p, &mut pos, path_len)?;
         if pos != p.len() {
@@ -234,6 +237,7 @@ impl Message for Hello {
             cdc_max,
             file_size,
             file_mtime,
+            file_mtime_nanos,
             path,
         })
     }
@@ -490,6 +494,7 @@ mod tests {
             cdc_max: 1024 * 1024,
             file_size: 12_345_678,
             file_mtime: 1_760_000_000,
+            file_mtime_nanos: 123_456_700,
             path: "videos/movie file.mkv".to_string(),
         });
     }

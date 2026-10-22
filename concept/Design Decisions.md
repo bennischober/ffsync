@@ -305,10 +305,16 @@ a stale index costs re-sends, never corruption. The end-to-end VERIFY (§8)
 remains the final oracle in all cases.
 
 **Index format:** plain binary, little-endian, no serde: 8-byte magic
-(`FFSYIX01`), file size u64, mtime u64 (unix secs), chunk-tree root 32 B,
-chunk count u64, then `count ×` (hash 32 B, offset u64, length u32). Same
-hand-rolled style as the wire framing (D1). Corrupt/truncated index ⇒ treat
-as missing.
+(`FFSYIX01`), file size u64, mtime u64 (unix secs) **+ u32 sub-second nanos**
+(the nanoseconds are load-bearing: whole-second mtimes let a same-second
+rewrite validate a stale index and silently sync old content — found by the
+warm-start loopback test; the same finding forced sub-second mtimes onto the
+§4 wire fast path, see below), chunk-tree root 32 B, chunk count u64, then
+`count ×` (hash 32 B, offset u64, length u32). Same hand-rolled style as the
+wire framing (D1). `decode` self-verifies: it recomputes `chunk_root` from
+the decoded chunk list and refuses on mismatch, so corruption in the root or
+any entry is caught at load time (O(chunk count) in-memory hashing, no I/O).
+Corrupt/truncated index ⇒ treat as missing.
 
 **Reasoning:** the positioning doc calls the persistent index the core product
 insight — cold starts repeat, and rsync is amnesiac. The measured scan cost
@@ -340,7 +346,11 @@ reading file contents.
 
 **Accepted costs:** index files double the inode count per synced file
 (and appear in directory listings — D6's hidden-file question is now resolved
-for the index: `<target>.ffsync-index` sibling, same non-hidden style as the
+for the index: `<target>.ffsync-index` sibling — **appended**, not
+`with_extension` (which replaces the last extension and would make the
+target name unrecoverable from the index name; the orphan cleanup must
+strip the literal suffix to find the target — the `with_extension` variant
+deleted valid indexes at startup, found by tests), same non-hidden style as the
 temp); a deleted target leaves an orphan index (cleanup rule: on receive,
 best-effort delete of `*.ffsync-index` files whose target is missing in the
 same directory); and mtime-only validation means an mtime-preserving
@@ -350,11 +360,19 @@ a scan can be skipped (the root must come from the scan); warm-start chunk
 reads themselves are always hash-verified against the plan, so both modes
 are safe.
 
-**Wire mapping:** none — the index is purely peer-local state. The protocol
-is unchanged; a warm-started receiver streams its manifest from the index
-instead of from a scan, and the sender is unaware. A future manifest-delta
-optimization (send only changed entries) is explicitly deferred; v0.2 keeps
-manifest streaming as-is.
+**Wire mapping:** the index itself is peer-local, but the tests forced a
+protocol change: HELLO v2 adds `file_mtime_nanos` (u32), and the §4 fast
+path compares sub-second mtimes. v0.1's whole-second comparison let a
+same-second same-size rewrite fast-path as "in sync" — a silent
+wrong-content no-op that the index work only surfaced because the index
+tests rewrite files within the test second. Bumped `VERSION` to 2 (v0.1
+peers are rejected by version check; single-binary deployments upgrade
+atomically). Self-healing rule: an index that lies (stale-but-validating)
+must fail the sync loudly (VERIFY / plan-read hash verification) and be
+invalidated on that failure — sender on `ERROR(HashMismatch)`, receiver on
+local-read mismatch — so a retry cold-scans and recovers; no poison loop.
+A future manifest-delta optimization (send only changed entries) is
+explicitly deferred; v0.2 keeps manifest streaming as-is.
 
 **Validation plan:** bench gains a `--warm` scenario: sync twice, assert the
 second run performs zero chunk-I/O on unchanged data (stat-only) and still

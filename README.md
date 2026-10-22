@@ -12,15 +12,16 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.1.0-green)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--index--dev-orange)](CHANGELOG.md)
+[![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
 
-> **Status: v0.1.0 — first working implementation.** Single-file sync between
+> **Status: v0.1.0 + warm-start index (unreleased).** Single-file sync between
 > two peers over TCP works end-to-end, including resume after mid-transfer
-> disconnects. Not implemented yet: directory sync, the persistent chunk index
-> (warm restarts), and transport security. See
-> [roadmap](#roadmap) below.
+> disconnects. Fresh off the bench: a persistent per-file chunk index turns
+> repeated syncs into stat-only operations (D15). Not implemented yet:
+> directory sync and transport security. See [roadmap](#roadmap) below.
 
 ## Why
 
@@ -79,6 +80,17 @@ flowchart LR
    chunk-tree root (a domain-separated BLAKE3 over the ordered chunk hashes)
    must equal the sender's, and only then does a temp file atomically replace
    the target. A wrong byte anywhere fails loudly, never silently.
+5. **Warm start (after the first sync)** — each side persists a per-file
+   chunk index (`<file>.ffsync-index`) at commit time, holding the chunk list
+   and root it just verified. On the next sync, a peer whose file still
+   matches the index (size + mtime, compared at nanosecond granularity)
+   skips the scan entirely and serves its manifest/plan from the index —
+   repeated syncs of unchanged data become stat-only operations. rsync
+   rescans everything from scratch on every run; this is the memory rsync
+   does not have. Corrupt indexes are rejected at load (the decoder
+   re-derives the chunk root); a stale-but-validating index fails loudly and
+   is dropped, so a retry cold-scans — wrong content can cost an error,
+   never a silent mismatch.
 
 The wire protocol is specified in
 [`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md): 11 frame types,
@@ -96,7 +108,7 @@ length-prefixed, no protobuf, three direct dependencies in the data plane.
 | rsync (comparison only) | Baseline | The tool this project is measured against, and its delta algorithm is respected, not wrapped |
 
 Design decisions and their alternatives are recorded in
-[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1–D14).
+[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1–D15).
 
 ## Using it
 
@@ -111,12 +123,17 @@ ffsync receive ./big-file.bin 7788
 ffsync send ./big-file.bin 127.0.0.1:7788
 ```
 
-Flags: `--checksum` disables the mtime/size fast path (rsync `-c` semantics —
-always compare chunk roots); receiver-side `--from <old-file>` reads the local
-chunks from a different file than the target. If the connection drops
-mid-transfer, the receiver keeps its partial state; rerunning the same two
-commands **resumes** — the receiver re-scans its temp file, unions it with the
-old file, and only the genuinely missing chunks cross the wire.
+Flags: `--checksum` disables the mtime/size fast path *and* the warm-start
+index (rsync `-c` semantics — always compare chunk roots); receiver-side
+`--from <old-file>` reads the local chunks from a different file than the
+target. If the connection drops mid-transfer, the receiver keeps its partial
+state; rerunning the same two commands **resumes** — the receiver re-scans
+its temp file, unions it with the old file, and only the genuinely missing
+chunks cross the wire. After a successful sync, both peers keep
+`<file>.ffsync-index` sidecars; the next run of an unchanged file shows
+`warm loaded N chunks from index, scan skipped` instead of a hashing phase.
+Deleting the index file (or the file itself, whose orphaned index is cleaned
+up automatically) always falls back to a full cold scan.
 
 Progress is single-line: `hashing → diffing → sending/receiving → verifying`,
 with bytes, throughput, and elapsed time per phase. A scan-bound sync says so
@@ -170,6 +187,7 @@ src/
   chunking/       the pipeline: mmap -> FastCDC chunkers -> BLAKE3 hash workers
   reconstruction/ out-of-place rebuild: temp file, positional writes, verify, rename
   protocol/       wire protocol: framing, messages, sender/receiver state machines
+  index.rs        persistent chunk index (warm starts): codec, validate, atomic write
   main.rs         the CLI
   bin/bench.rs    the benchmark harness
 concept/          design docs (positioning, decisions, protocol spec, research)
@@ -182,7 +200,7 @@ The reasoning is the product; it is all recorded:
 
 - [`concept/Positioning.md`](concept/Positioning.md) — why this exists, the
   niche, why "build around rsync" does not work
-- [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D14 with
+- [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D15 with
   alternatives and rejected options
 - [`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md) — the wire protocol
   v0.1 implements, frame by frame
@@ -194,15 +212,17 @@ The reasoning is the product; it is all recorded:
 
 ## Roadmap
 
-- **v0.2 — persistent chunk index (warm restarts):** chunks are
-  content-addressed, so a persisted index turns repeated syncs into
-  near-zero-scan operations. This is the core product insight; rsync rescans
+- **Done (unreleased) — persistent chunk index (warm restarts, D15):** chunks
+  are content-addressed, so a persisted index turns repeated syncs into
+  stat-only operations. This is the core product insight; rsync rescans
   everything from scratch every run.
 - **v0.2 — QUIC transport** (via connection migration for the
   "friend over the internet" case) and TLS; plain TCP stays available. The
   decision is recorded as D13.
 - **Later — directory and multi-file sync** with a Merkle tree over per-file
-  chunk roots, generalizing the fast path from file to tree.
+  chunk roots, generalizing the fast path from file to tree. At tree scale
+  the per-file sidecar index gives way to a per-directory database (the
+  trigger recorded in D15).
 - **Later — SeqCDC and other chunkers** as they mature; the `Chunker` trait
   makes swapping cheap (registered as F2).
 

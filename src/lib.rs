@@ -5,5 +5,6 @@
 //! harness on top of them.
 
 pub mod chunking;
+pub mod index;
 pub mod protocol;
 pub mod reconstruction;

@@ -89,6 +89,13 @@ pre-existing.
     (baseline) and `FastCDCChunker` (content-defined, via `fastcdc::v2020`).
   - `hasher.rs` — `Hasher` trait; `Blake3Hasher` (in-memory and streaming).
   - `types.rs` — `Chunk` (offset, length, BLAKE3 hash) and `ChunkEvent`.
+- `src/index.rs` — the persistent per-file chunk index (D15, warm starts):
+  hand-rolled binary codec (magic `FFSYIX01`, 68-byte header, 44-byte chunk
+  entries), load-time self-verification (root re-derived from the chunk
+  list), size + nanosecond-mtime validation, atomic temp+rename writes, and
+  the `index_path_for` naming convention (suffix **appended**, never
+  `with_extension` — the orphan cleanup recovers target names by stripping
+  the literal suffix).
 - `src/reconstruction/` — writes a new file out-of-place from chunk sources.
   - `reconstructor.rs` — `Reconstructor`: pre-allocates a temp file, writes
     each chunk at its target offset (local copy from the old file, or remote
@@ -126,6 +133,14 @@ pre-existing.
   `Path::with_extension("ffsync-tmp")`, which *replaces* the last extension
   (`a.mkv` → `a.ffsync-tmp`). This differs from the `<.file.ext.ffsync-tmp>`
   naming in the concept doc (recorded as D6 in `concept/Design Decisions.md`).
+  The index path does the OPPOSITE (appends `.ffsync-index`) because the
+  orphan cleanup must recover the target name by stripping the suffix; never
+  "fix" one to match the other.
+- Sub-second mtime is load-bearing in two places: the index validation and
+  the §4 wire fast path (HELLO `file_mtime_nanos`, protocol v2). Whole-second
+  comparisons let a same-second same-size rewrite pass as unchanged — a
+  silent wrong-content sync. Any new metadata-based fast path must compare
+  at the finest available granularity.
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
 - Never commit generated artifacts. `.gitignore` covers `*.bin` and

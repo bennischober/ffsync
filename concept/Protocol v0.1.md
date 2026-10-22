@@ -82,7 +82,7 @@ not by tolerating unknown frames).
 
 | Type  | Name           | Dir     | Payload |
 |-------|----------------|---------|---------|
-| 0x01  | HELLO          | both    | magic `FFSY` (4B), version u16 (=1), flags u16 (§4), role u8 (1=sender, 2=receiver), cdc_min u32, cdc_avg u32, cdc_max u32, file_size u64, file_mtime u64 (unix secs, 0 if absent), path (u16 len + UTF-8) |
+| 0x01  | HELLO          | both    | magic `FFSY` (4B), version u16 (=2), flags u16 (§4), role u8 (1=sender, 2=receiver), cdc_min u32, cdc_avg u32, cdc_max u32, file_size u64, file_mtime u64 (unix secs, 0 if absent), file_mtime_nanos u32 (sub-second part, 0 if absent; v0.2), path (u16 len + UTF-8) |
 | 0x02  | MANIFEST_CHUNK | recv→send | hash 32B + offset u64 + length u32 (44 B) |
 | 0x03  | MANIFEST_DONE  | recv→send | empty |
 | 0x04  | PLAN_LOCAL     | send→recv | target_offset u64 + length u32 + source_offset u64 + hash 32B (52 B) |
@@ -107,12 +107,16 @@ connection after flushing; the peer must treat the transfer as failed.
    receiver SHOULD use the same values when chunking its own file. This is a
    bandwidth optimization, not a correctness requirement — see §8.2.
 4. Fast path: if `flags.trust_times` is set (default on, D14) **and**
-   `file_size` and `file_mtime` are equal on both sides, the sender sends
-   NOT_MODIFIED and closes. Both peers are done without reading a single file
-   byte. This is rsync's default semantics; it trusts mtime+size and can be
-   wrong in the same ways rsync can (2-second FAT mtime granularity, network
-   filesystem clocks). `--checksum` mode clears this flag and forces full
-   verification.
+   `file_size`, `file_mtime` **and `file_mtime_nanos`** are equal on both
+   sides, the sender sends NOT_MODIFIED and closes. Both peers are done
+   without reading a single file byte. This is rsync's default semantics; it
+   trusts mtime+size and can be wrong in the same ways rsync can (2-second
+   FAT mtime granularity, network filesystem clocks, mtime-preserving edits).
+   The nanosecond field exists because v0.1's whole-second comparison let a
+   same-second same-size rewrite pass as "in sync" — a silent wrong-content
+   no-op (v0.2, found by the D15 index tests; modern rsync compares
+   sub-second mtimes for the same reason). `--checksum` mode clears this
+   flag and forces full verification.
 
 Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2, reserved, must be 0
 in v0.1), bit 2 `resuming` (informational, §10).
