@@ -5,10 +5,12 @@ Guidance for AI coding agents (and humans) working in this repository.
 ## What this project is
 
 `ffsync` is a file synchronization tool written in Rust that syncs data at the
-chunk level to minimize transfer and I/O, similar in spirit to rsync. It is in
-an early prototype stage: the chunking/hashing pipeline, file reconstruction,
-and a benchmark harness exist; metadata exchange, sync-plan generation, and the
-network protocol are not implemented yet.
+chunk level to minimize transfer and I/O, similar in spirit to rsync. As of
+v0.1.0, single-file sync between two peers over TCP works end-to-end: parallel
+chunking/hashing pipeline, file reconstruction, manifest/plan exchange,
+zstd-compressed transfer, chunk-root verification, mtime/size fast path, and
+resume after mid-transfer disconnects. Not implemented yet: directory/multi-file
+sync, the persistent chunk index (warm restarts), and encryption/TLS.
 
 Design documents (read before making architectural changes):
 
@@ -17,10 +19,12 @@ Design documents (read before making architectural changes):
   "build around rsync" alternatives
 - `concept/Design Decisions.md` — recorded decisions with reasoning and
   alternatives; add new decisions there, do not silently change old ones
-- `concept/Protocol v0.1.md` — draft wire protocol for the first working
-  sync: framing, handshake, manifest/plan/data flow, verification, resume.
-  Implementation should follow it; deviations are protocol bugs unless the
-  spec is updated first
+- `concept/Protocol v0.1.md` — the v0.1 wire protocol: framing, handshake,
+  manifest/plan/data flow, verification, resume. The implementation follows
+  it; deviations are protocol bugs unless the spec is amended first
+- `concept/Deep Research Digest.md` — what the two deep-research runs
+  (architecture + P2P connectivity, saved alongside as markdown) got right,
+  and what we rejected
 - `concept/File Synchronisation Workflow.md` — the four-phase sync pipeline
   (shallow → medium → deep diff, then pipelined transfer and reconstruction)
 - `concept/File Reconstruction.md` — out-of-place reconstruction with a

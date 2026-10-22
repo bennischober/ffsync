@@ -629,7 +629,6 @@ fn simulate_disconnect(
     // The sender diffs ITS chunk list (variant_chunks, since the sender owns
     // the desired state) against the receiver's manifest. A chunk is covered
     // iff its hash is in the manifest set.
-    let source_hashes = source_hashes; // already computed
     let mut cold_restart_bytes = 0u64;
     let mut temp_only_resume_bytes = 0u64;
     let mut union_resume_bytes = 0u64;
@@ -651,7 +650,7 @@ fn simulate_disconnect(
     // file and would erase phase 1's state. The killed remotes are skipped
     // as "already written", which is only true if we did not truncate.
     let completion_verified = {
-        let mut temp = OpenOptions::new().read(true).write(true).open(&temp_path)?;
+        let temp = OpenOptions::new().read(true).write(true).open(&temp_path)?;
         let mut local_scratch: Vec<u8> = Vec::new();
         // Remaining remote chunks (skip the ones already written).
         let mut remote_seen = 0usize;
@@ -704,7 +703,7 @@ fn simulate_disconnect(
 }
 
 /// Looks up a chunk's offset in the source chunk list.
-fn source_index_lookup<'a>(source_chunks: &'a [Chunk], hash: Hash) -> Option<&'a u64> {
+fn source_index_lookup(source_chunks: &[Chunk], hash: Hash) -> Option<&u64> {
     source_chunks
         .iter()
         .find(|c| c.hash == hash)

@@ -1,16 +1,17 @@
 # Deep Research Digest
 
 Provenance: two Gemini deep-research runs from the project's inception phase
-(November 2025), saved as HTML in this folder:
+(November 2025), saved as markdown in this folder:
 
-- `DesigningaHighPerformanceResilientFileSynchro.html` — overall architecture
+- `Designing a High-Performance, Resilient File Synchronization Protocol in
+  Rust_ A QUIC, BLAKE3, and CDC Approach.md` — overall architecture
   ("RustSync"): transport, hashing, chunking, index structures, workflow.
-- `P2PConnectionChallengeResolution.html` — P2P connectivity: NAT traversal,
+- `P2P Connection Challenge Resolution.md` — P2P connectivity: NAT traversal,
   signaling, relay fallback.
 
 This document digests them into the current decision framework: what they
-validate, what they challenge, and what we adopt / defer / reject. The HTML
-files remain the primary sources; this digest is the working copy.
+validate, what they challenge, and what we adopt / defer / reject. The two
+source documents remain the primary sources; this digest is the working copy.
 
 ## Document 1: Architecture ("RustSync")
 
