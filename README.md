@@ -12,12 +12,12 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.3.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
 
-> **Status: v0.3.1.** Single-file **and directory-tree** sync between two
+> **Status: v0.4.0.** Single-file **and directory-tree** sync between two
 > peers over TLS work end-to-end, including resume after mid-transfer
 > disconnects. Trees sync by metadata triage (D17): only changed files get
 > conversations, synced files adopt the sender's mtime, and a run with
