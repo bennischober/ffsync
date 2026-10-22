@@ -1,3 +1,5 @@
+<div align="center">
+
 # ffsync
 
 **Fast chunk-level file sync for big files and fast links.**
@@ -5,9 +7,14 @@
 ffsync transfers the difference between two files, not the files. It is rsync's
 behavior — minimal bytes on the wire, resumable, verified — built on a modern
 engine: parallel content-defined chunking, BLAKE3 hashing, zstd compression,
-and a hand-rolled, dependency-light wire protocol (the release build has 31
-crate dependencies, none of them an async runtime). No daemon, no config, two
+and a hand-rolled, dependency-light wire protocol. No daemon, no config, two
 commands.
+
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
+[![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/badge/version-0.1.0-green)](CHANGELOG.md)
+
+</div>
 
 > **Status: v0.1.0 — first working implementation.** Single-file sync between
 > two peers over TCP works end-to-end, including resume after mid-transfer
