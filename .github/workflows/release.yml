@@ -1,0 +1,147 @@
+name: Release
+
+# Cut a release by pushing a version tag; the workflow publishes the crate
+# to crates.io and attaches versioned executables (with SHA-256 checksums)
+# to the GitHub release. The tag is the single source of truth — exactly
+# how v0.3.0 was cut by hand first (bump → tag → release notes).
+#
+#   git tag -a vX.Y.Z -m "..."
+#   git push origin main vX.Y.Z
+#
+# Safety rails:
+# - the verify job refuses to run when the tag name and Cargo.toml version
+#   disagree (publishing v0.3.1 with version = "0.3.0" would ship the
+#   wrong thing to an immutable registry),
+# - publish runs only after the full test suite passed on the tagged commit,
+# - the token is a fine-grained secret (publish-update scope), not the
+#   legacy crate-owner token.
+#
+# Manual runs (workflow_dispatch) act as dry runs: verify + artifact builds
+# execute, publish and release attachment are skipped.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write # attach artifacts to the release
+
+jobs:
+  verify:
+    name: verify (tag ↔ version, gates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag name matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ffsync") | .version')"
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::tag v$TAG does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "tag v$TAG == Cargo.toml $CARGO_VERSION"
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (all targets, deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+      - name: Package dry run
+        run: cargo package --locked
+
+  publish:
+    name: publish to crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    # Only real tag pushes publish; workflow_dispatch dry runs stop here.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  artifacts:
+    name: executables / ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows is the primary development platform; the plain .exe zip
+          # is the main download for end users (no toolchain required).
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          # Static, dependency-free Linux binary (no glibc drift).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # ring (via rustls/rcgen) compiles C code; the musl target needs the
+      # musl-gcc wrapper, which the runner image does not preinstall.
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package (zip)
+        id: package
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $stage = "ffsync-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ffsync.exe" "$stage/"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $stage/
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          "artifact=$stage.zip" | Out-File $env:GITHUB_OUTPUT -Append
+      - name: Package (tar.gz)
+        id: package-tar
+        if: matrix.archive == 'tar'
+        run: |
+          stage="ffsync-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir "$stage"
+          cp "target/${{ matrix.target }}/release/ffsync" "$stage/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          tar czf "$stage.tar.gz" "$stage"
+          echo "artifact=$stage.tar.gz" >> "$GITHUB_OUTPUT"
+      # Per-artifact .sha256 sidecar (kernel.org style) — matrix jobs run on
+      # different runners, so a single merged checksums.txt would need an
+      # extra join job; sidecars attach independently and verify the same way.
+      - name: SHA-256 checksum
+        shell: pwsh
+        run: |
+          $artifact = if ("${{ matrix.archive }}" -eq "zip") { "${{ steps.package.outputs.artifact }}" } else { "${{ steps.package-tar.outputs.artifact }}" }
+          if (-not $artifact) { throw "no artifact produced" }
+          $hash = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLower()
+          "$hash  $artifact" | Out-File "$artifact.sha256" -Encoding ascii
+          Get-Content "$artifact.sha256"
+      - name: Attach to release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ffsync-*.zip
+            ffsync-*.tar.gz
+            ffsync-*.sha256

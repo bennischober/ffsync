@@ -122,9 +122,27 @@ length-prefixed, no protobuf.
 | rsync (comparison only) | Baseline | The tool this project is measured against, and its delta algorithm is respected, not wrapped |
 
 Design decisions and their alternatives are recorded in
-[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1-D16).
+[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1-D17).
 
 ## Using it
+
+Install (three routes, fastest first for most users):
+
+```bash
+# 1. Download a prebuilt executable from the releases page (Windows zip,
+#    Linux tar.gz; SHA-256 sidecars included) - no toolchain needed:
+#    https://github.com/bennischober/ffsync/releases/latest
+
+# 2. From crates.io (needs a Rust toolchain):
+cargo install ffsync
+
+# 3. From the repository (tracks main):
+cargo install --git https://github.com/bennischober/ffsync
+```
+
+Binaries do not auto-update; new releases are announced on the releases
+page. Verify a download against the attached `.sha256` sidecar
+(`sha256sum -c ffsync-*.sha256` / `Get-FileHash` on Windows).
 
 Two terminals on the same machine (or LAN - replace `127.0.0.1` with the
 receiver's address):
