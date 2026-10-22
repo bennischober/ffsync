@@ -6,7 +6,6 @@
 //!
 //! The sender connects to a receiver that is listening.
 
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -15,6 +14,19 @@ use ffsync::chunking::PipelineConfig;
 use ffsync::protocol::sync::{
     Progress, ReceiveRequest, SendRequest, SyncError, SyncOutcome, receive, send,
 };
+
+/// Default I/O timeout: a peer that sends nothing for this long kills the
+/// sync. Generous enough for slow disks between frames on huge files
+/// (scans stream manifests continuously; the longest quiet period is a
+/// peer re-scanning its temp file on resume, which is disk-bound).
+const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// Applies the I/O timeout to a TCP stream.
+fn set_stream_timeouts(stream: &TcpStream, secs: u64) {
+    let d = Some(Duration::from_secs(secs));
+    let _ = stream.set_read_timeout(d);
+    let _ = stream.set_write_timeout(d);
+}
 
 fn die(msg: &str) -> ! {
     eprintln!("error: {}", msg);
@@ -55,7 +67,7 @@ impl ProgressDisplay {
         let elapsed = now - self.start;
         let line = match p {
             Progress::Scanning(hashed, total) => {
-                let pct = if total > 0 { hashed * 100 / total } else { 100 };
+                let pct = hashed.checked_mul(100).map_or(1000, |v| v / total.max(1));
                 format!(
                     "hashing   {:>6.1}%  ({}/{} bytes, {} elapsed)",
                     pct as f64 / 10.0,
@@ -66,7 +78,7 @@ impl ProgressDisplay {
             }
             Progress::Diffing => "diffing   comparing chunk manifests".to_string(),
             Progress::Transferring(sent, total) => {
-                let pct = if total > 0 { sent * 100 / total } else { 100 };
+                let pct = sent.checked_mul(100).map_or(1000, |v| v / total.max(1));
                 format!(
                     "sending   {:>6.1}%  ({}/{} bytes, {} elapsed)",
                     pct as f64 / 10.0,
@@ -76,11 +88,7 @@ impl ProgressDisplay {
                 )
             }
             Progress::Receiving(received, total) => {
-                let pct = if total > 0 {
-                    received * 100 / total
-                } else {
-                    100
-                };
+                let pct = received.checked_mul(100).map_or(1000, |v| v / total.max(1));
                 format!(
                     "receiving {:>6.1}%  ({}/{} bytes, {} elapsed)",
                     pct as f64 / 10.0,
@@ -155,6 +163,7 @@ fn run_send(file: PathBuf, addr: String, force_checksum: bool) -> std::io::Resul
     println!("connecting to {}:{} ...", host, port);
     let mut stream = TcpStream::connect((host.as_str(), port))?;
     stream.set_nodelay(true).ok();
+    set_stream_timeouts(&stream, DEFAULT_TIMEOUT_SECS);
     let display = &mut ProgressDisplay::new();
     let request = SendRequest {
         path: file.clone(),
@@ -193,6 +202,7 @@ fn run_receive(
     println!("peer connected: {}", peer);
     let mut stream: TcpStream = stream;
     stream.set_nodelay(true).ok();
+    set_stream_timeouts(&stream, DEFAULT_TIMEOUT_SECS);
     let display = &mut ProgressDisplay::new();
     let local_source = from.unwrap_or_else(|| file.clone());
     let request = ReceiveRequest {

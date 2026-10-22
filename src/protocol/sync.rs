@@ -645,6 +645,15 @@ where
                         LocalOrigin::Temp { offset, .. } => (&temp_path, *offset),
                         LocalOrigin::OldFile { offset, .. } => (&request.local_source, *offset),
                     };
+                    // Spec §12 resource limits: writes stay inside the
+                    // declared file size.
+                    if target_offset + length as u64 > target_size {
+                        return Err(send_error_and_finish(
+                            stream,
+                            ErrorCode::BadFrame,
+                            "plan chunk extends beyond the declared file size",
+                        ));
+                    }
                     let source_file = File::open(path)?;
                     scratch.clear();
                     scratch.resize(length as usize, 0);
@@ -697,6 +706,15 @@ where
                             "decompressed length mismatch",
                         ));
                     }
+                    // Spec §12 resource limits: chunk data must never
+                    // overflow the sender's declared file size.
+                    if target_offset + length as u64 > target_size {
+                        return Err(send_error_and_finish(
+                            stream,
+                            ErrorCode::BadFrame,
+                            "plan chunk extends beyond the declared file size",
+                        ));
+                    }
                     let task = ReconstructionTask {
                         target_offset,
                         source: ChunkSource {
@@ -719,7 +737,6 @@ where
         // parameters and compute the chunk-tree root. With identical
         // parameters, the receiver's chunking of correct chunk data
         // reproduces the sender's chunk list, so the roots match.
-        let temp_path = request.path.with_extension("ffsync-tmp");
         let temp_chunks = scan_file_plain(&temp_path, pipeline)?;
         let temp_root = chunk_root(&temp_chunks);
         if temp_root != verify_root {

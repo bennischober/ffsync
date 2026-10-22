@@ -14,12 +14,8 @@ mod tests {
     use ffsync::protocol::sync::{ReceiveRequest, SendRequest, SyncOutcome, receive, send};
 
     /// A bidirectional in-memory pipe: what one side writes, the other reads.
-    /// Each direction is a shared ring of bytes with blocking semantics via
-    /// condvars (a bounded channel of bytes).
-    struct DuplexPair {
-        a_to_b: std::sync::mpsc::SyncSender<Vec<u8>>,
-        b_to_a: std::sync::mpsc::SyncSender<Vec<u8>>,
-    }
+    /// Each direction is a bounded byte channel; `new` returns both ends.
+    struct DuplexPair;
 
     /// One end of the duplex pair. Reads block until data is available (or
     /// the peer dropped its sender); writes enqueue to the peer.
@@ -163,7 +159,7 @@ mod tests {
         let mut old_data = src_data.clone();
         let mid = 2 * 1024 * 1024;
         for b in &mut old_data[mid..mid + 256 * 1024] {
-            *b = *b ^ 0xFF;
+            *b ^= 0xFF;
         }
         let target = fx.path("target.bin");
         create_file(&target, &old_data);
@@ -298,10 +294,10 @@ mod tests {
                 }
             }
             let mut progress = |p: ffsync::protocol::sync::Progress| {
-                if let ffsync::protocol::sync::Progress::Transferring(sent, _) = p {
-                    if sent >= kill_after_bytes {
-                        kill_writer.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
+                if let ffsync::protocol::sync::Progress::Transferring(sent, _) = p
+                    && sent >= kill_after_bytes
+                {
+                    kill_writer.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             };
             let mut guard = KillGuard {
@@ -318,7 +314,7 @@ mod tests {
         let s = s_handle
             .join()
             .unwrap_or_else(|_| Err(SyncError::Protocol("sender crashed (simulated)".into())));
-        let r = r_handle.join().unwrap_or_else(|_| Err(SyncError::Eof));
+        let r = r_handle.join().unwrap_or(Err(SyncError::Eof));
         (s, r)
     }
 
@@ -334,7 +330,7 @@ mod tests {
         let mut old_data = src_data.clone();
         let mid = 2 * 1024 * 1024;
         for b in &mut old_data[mid..mid + 256 * 1024] {
-            *b = *b ^ 0xFF;
+            *b ^= 0xFF;
         }
         let target = fx.path("target.bin");
         create_file(&target, &old_data);
@@ -392,7 +388,7 @@ mod tests {
         create_file(&target, &data);
         // Make mtimes explicitly equal so the fast path triggers.
         let t = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        filetime::set_file_mtime(&fx.source(), filetime::FileTime::from_system_time(t)).unwrap();
+        filetime::set_file_mtime(fx.source(), filetime::FileTime::from_system_time(t)).unwrap();
         filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(t)).unwrap();
 
         let (s, r) = run_sync(
