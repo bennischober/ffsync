@@ -463,6 +463,17 @@ Deletions happen **after** all conversations succeeded. A failed
 conversation aborts the session (ERROR, terminal per §3) before any
 delete is applied — fail-closed: a failed transfer never destroys data.
 
+**ERROR at any read point (v3):** a peer that aborts mid-session sends
+ERROR (code `Aborted`) before dropping the stream, at whatever point it
+dies — instead of letting the peer time out. Receivers that expect a
+HELLO (or any typed frame) must classify an incoming ERROR as the peer's
+abort reason, not as a framing violation. A peer MAY still die without
+announcing (process kill, network cut); the socket timeout remains the
+last line of defense, which is why it exists and stays generous. Delete
+targets destroyed as a side effect of conflict resolution (§16.3) are
+tolerated as already-gone (`NotFound`/`NotADirectory`) during the delete
+pass.
+
 ### 16.5 Deletions
 
 After the last per-file COMMIT_ACK, the sender sends TREE_END (empty).
