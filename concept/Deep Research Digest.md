@@ -42,7 +42,7 @@ we have. Convergent points:
 | **Mid-chunk resume** (`StreamChunkRequest` with start byte offset) | **Reject for v0.1.** Requires the sender to keep per-chunk stream state. Our chunk-granularity resume (§10) wastes at most one partially sent chunk (~avg chunk size) per interruption — negligible at our chunk sizes. |
 | **0-RTT session resumption** | **Adopt with a caveat for v0.2.** 0-RTT data is replayable; fine for read-only/idempotent sync steps, must not carry mutating commands without anti-replay handling. |
 
-## Document 2: P2P connectivity ("P2PConnectionChallengeResolution")
+## Document 2: P2P connectivity ("P2P Connection Challenge Resolution")
 
 ### The numbers that matter
 
