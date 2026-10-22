@@ -43,6 +43,14 @@ Measured during development on a 72.7 GiB file (SATA SSD, ~550 MB/s):
 That is a **~3.8x faster cold start**, and the gap widens on faster hardware:
 BLAKE3 is SIMD-parallel while rsync's checksum work is not.
 
+Memory stays flat while files grow: chunk data is never copied — the file is
+memory-mapped and hashed in place, channels carry `(offset, length)` with
+backpressure, and the receiver writes positionally from a reused buffer. A
+1 GiB sync peaks at ~3–7 MiB of heap (measured,
+[`evaluation/memory.md`](evaluation/memory.md)); all sync state is O(chunks),
+~130 B per chunk — a 70 GiB movie syncs on roughly 35 MiB of RAM. Trees add
+~90 B per path; 10× the files does not move the needle.
+
 The honest niche: sync time ≈ max(scan on both peers, transfer). On slow links
 transfer dominates and rsync is fine. On **fast links (LAN, 1–10 GbE) with big
 files and repeated syncs**, the scan dominates — that is the cost ffsync

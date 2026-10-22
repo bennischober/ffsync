@@ -39,6 +39,8 @@ Design documents (read before making architectural changes):
   pre-allocated temp file and atomic rename
 - `evaluation/chunking.md` — measured performance of chunking approaches and
   the reasoning behind the current pipeline design
+- `evaluation/memory.md` — measured memory footprint of the sync paths
+  (heap is O(chunks) ≈ 0.05% of file size; trees stay flat with file count)
 
 ## Commands
 
