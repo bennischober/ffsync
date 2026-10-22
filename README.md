@@ -4,9 +4,11 @@
 minimal bytes on the wire, resumable, verified — with a modern engine: parallel
 content-defined chunking, BLAKE3, warm restarts, no daemon.
 
-> **Status: prototype.** The chunking/hashing pipeline, reconstruction, and
-> benchmark harness work. The network protocol is specified but not
-> implemented yet. Not ready for real use.
+> **Status: v0.1.0 — first working implementation.** Single-file sync between
+> two peers over TCP works end-to-end: parallel scan, manifest/plan exchange,
+> zstd-compressed delta transfer, chunk-root verification, atomic commit,
+> mtime/size fast path, and **resume after mid-transfer disconnects**.
+> Directory sync, encryption, and the persistent index are next.
 
 ## Why
 
@@ -34,6 +36,31 @@ sync time ≈ max(scan on both peers, transfer). On slow links, transfer
 dominates and rsync is fine. On **fast links (LAN, 1–10 GbE) with big files
 and repeated syncs**, the scan dominates and ffsync's engine is the win. The
 full reasoning lives in [`concept/Positioning.md`](concept/Positioning.md).
+
+## Using it
+
+Two terminals on the same machine (or LAN — replace `127.0.0.1` with the
+receiver's address):
+
+```bash
+# Receiver: listen and converge ./big-file.bin from its current state
+ffsync receive ./big-file.bin 7788
+
+# Sender: push the (newer) file to the receiver
+ffsync send ./big-file.bin 127.0.0.1:7788
+```
+
+Flags: `--checksum` disables the mtime/size fast path (rsync `-c` semantics —
+always compare chunk roots); receiver-side `--from <old-file>` reads the local
+chunks from a different file than the target. If the connection drops
+mid-transfer, the receiver keeps its partial state; rerunning the same two
+commands **resumes** — the receiver re-scans its temp file, unions it with the
+old file, and only the genuinely missing chunks cross the wire.
+
+Progress is single-line: `hashing → diffing → sending/receiving → verifying`,
+with bytes, throughput, and elapsed time per phase. A scan-bound sync says so
+instead of being silently disk-busy/network-idle — that silence in rsync is
+why this project exists.
 
 ## First numbers
 
@@ -72,10 +99,13 @@ cargo audit                                          # dependency advisory check
 - `src/chunking/` — the pipeline: `process_file()` memory-maps a file, chunks
   it (Fixed/FastCDC) on worker threads, hashes chunks (BLAKE3) on more workers,
   all connected by bounded crossbeam channels. Chunks travel as
-  `(offset, length)` — never copied.
+  `(offset, length)` — never copied. `scan_file_ordered()` returns chunks in
+  canonical file order (the chunk-tree root is order-sensitive).
 - `src/reconstruction/` — out-of-place reconstruction: pre-allocated temp file,
-  positional writes at arbitrary offsets, final BLAKE3 verification, atomic
-  rename.
+  positional writes at arbitrary offsets, final chunk-root verification, atomic
+  rename. `open_existing()` reopens a temp without truncating (resume).
+- `src/protocol/` — the v0.1 wire protocol: framing, typed messages, and the
+  sender/receiver state machines (`send()`/`receive()` over any duplex stream).
 - `src/bin/bench.rs` — the benchmark harness described above.
 - `concept/` — design docs: positioning, decision log (D1–D14), wire protocol
   draft, and the original concept notes.

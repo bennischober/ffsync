@@ -37,9 +37,19 @@ re-deriving design arguments. The reasoning lives in `Positioning.md` and
 ### 2.1 Content addressing is the only source of truth
 
 Every chunk is identified by its 32-byte BLAKE3 hash. The file is identified by
-its BLAKE3 **root hash** (BLAKE3's Merkle tree yields the root for free while
-chunking — see D5). Offsets are *descriptive*, never *authoritative*: two files
-with the same root hash are identical regardless of what any metadata claims.
+its **chunk-tree root**: `BLAKE3(CHUNK_ROOT_PREFIX || chunk_hashes_in_file_order)`
+with a 32-byte domain-separated prefix — *not* the standard BLAKE3 file hash,
+whose internal Merkle tree is over fixed 1024-byte blocks rather than CDC chunk
+boundaries (a standard root could not be computed from the chunk list and would
+require a second full read of the file). The chunk root is computed from the
+chunk list the pipeline already produces; it is order-sensitive, so all scans
+must produce chunks in canonical file order (sorted by offset — hash workers
+complete chunks concurrently and arrival order is not file order).
+
+Property: two files with equal root hashes are (collision-assumption)
+chunk-identical. The root is therefore simultaneously the change-detection
+identity (D11), the end-to-end verification oracle (§8), and the file identity
+for warm starts (§14.1). Offsets are *descriptive*, never *authoritative*.
 
 ### 2.2 One ordered wire, unordered storage
 
@@ -75,7 +85,7 @@ not by tolerating unknown frames).
 | 0x01  | HELLO          | both    | magic `FFSY` (4B), version u16 (=1), flags u16 (§4), role u8 (1=sender, 2=receiver), cdc_min u32, cdc_avg u32, cdc_max u32, file_size u64, file_mtime u64 (unix secs, 0 if absent), path (u16 len + UTF-8) |
 | 0x02  | MANIFEST_CHUNK | recv→send | hash 32B + offset u64 + length u32 (44 B) |
 | 0x03  | MANIFEST_DONE  | recv→send | empty |
-| 0x04  | PLAN_LOCAL     | send→recv | target_offset u64 + length u32 + source_offset u64 (20 B) |
+| 0x04  | PLAN_LOCAL     | send→recv | target_offset u64 + length u32 + source_offset u64 + hash 32B (52 B) |
 | 0x05  | PLAN_REMOTE    | send→recv | target_offset u64 + length u32 + hash 32B (44 B) |
 | 0x06  | PLAN_DONE      | send→recv | empty |
 | 0x07  | DATA           | send→recv | hash 32B + zstd-compressed chunk bytes |
@@ -139,9 +149,12 @@ The sender streams PLAN_LOCAL / PLAN_REMOTE frames as it diffs, then PLAN_DONE.
 ### 6.1 Exact-match rule (D12)
 
 A local match requires **(hash, length) exact match** against a manifest entry.
-The receiver's manifest entry is used verbatim as the local source range — the
-receiver never sub-slices a manifest entry, because content inside a chunk
-cannot be verified without re-hashing it.
+PLAN_LOCAL carries the chunk hash so the receiver can verify the local read
+against the expected content: a stale manifest entry (content changed since
+the manifest was computed) costs a clean ERROR — never silent corruption. On
+resume the hash also disambiguates *which* local file an entry refers to (see
+§10). The receiver never sub-slices a manifest entry, because content inside a
+chunk cannot be verified without re-hashing it.
 
 ### 6.2 Boundary-shift fallback
 
@@ -159,6 +172,15 @@ After PLAN_DONE, the sender streams one DATA frame per PLAN_REMOTE hash,
 compressed with zstd (level 3 default). Because the wire is ordered, the
 receiver has already seen the PLAN_REMOTE entry for every DATA hash when it
 arrives — it can write immediately to `target_offset`, no buffering needed.
+
+**Receiver write order (D10, empirically decided):** the receiver executes
+plan entries in order, resolving each PLAN_LOCAL chunk per hash from its union
+manifest (temp file before old file) and writing it *before* receiving the
+DATA frames. Local chunks are the bulk of the file and available offline, so a
+crash mid-DATA leaves a temp that is mostly real data — the precondition that
+makes §10 resume work. (The disconnect simulation measured the alternative:
+remotes-first leaves a ~97%-hole temp where every chunk straddles a hole and
+the re-scan matches nothing; locals-first recovers 30–32 of 32 MiB.)
 
 Receivers handle duplicate DATA hashes by ignoring repeats (can only happen
 with future eager mode or retries).
@@ -204,34 +226,36 @@ receiver to buffer DATA by hash until its PLAN_REMOTE arrives (the §7
 no-buffering guarantee is a lazy-mode property). Buffer memory cap is an open
 question (§13). Do not implement in v0.1.
 
-## 10. Resume (D10, receiver-authoritative)
+## 10. Resume (D10, decided and implemented)
 
 Resume is **not a separate protocol phase** — it reuses the normal flow with a
-different manifest source:
+different manifest source. Decided on simulation data (see D10 in
+`Design Decisions.md`); receiver-authoritative:
 
-1. Receiver persists its manifest (same 44-byte entry format) to
-   `<target>.ffsync-tmp.ffsync-manifest` as it scans, and keeps it after a
-   disconnect.
-2. On reconnect, the receiver checks for a temp file + manifest. If present:
-   it **re-scans the temp file** and sends *that* manifest (offsets are
-   temp-relative), with `flags.resuming` set in HELLO. If absent: cold start,
-   manifest of the current file.
-3. The sender diffs its source against whatever manifest it receives, exactly
-   as in §5–7. PLAN_LOCAL offsets then point into the temp file; the receiver
-   reads local sources from temp (and may consult its old file as well — its
-   choice, invisible to the sender).
+1. Receiver persists no manifest file: the **temp file's content is the
+   resume state** (locals-first write order per §7 makes it mostly real
+   data after a crash).
+2. On reconnect, the receiver checks for a temp file. If present (HELLO
+   carries `FLAG_RESUMING`): it **re-scans the temp file** and streams the
+   **union manifest** — temp chunks first, then old-file chunks the temp
+   does not cover. If absent: cold start, manifest of the old file.
+3. The sender diffs its source against whatever manifest it receives,
+   exactly as in §5–7. PLAN_LOCAL entries carry the hash; the receiver
+   resolves each local source per hash (temp before old file) and verifies
+   the read against it. The sender needs no state from the previous
+   attempt.
 4. Verification (§8) is unchanged and is the final oracle: a stale or wrong
    manifest can cost re-sends, never corruption.
+5. **Empty plan on resume:** if the previous attempt died after the last
+   DATA byte, the reconnect plan is empty but the temp is complete; the
+   receiver compares the temp's root against VERIFY and commits it (atomic
+   rename) on match.
 
-**Why re-scan the temp file instead of journaling written offsets:** the temp
+**Why re-scan the temp instead of journaling written offsets:** the temp
 file's content *is* the state, re-scanning reuses one code path, and CDC
 re-chunking of correct chunk data reproduces matching hashes except in
 boundary-shift regions (same bounded over-send as §6.2). A write-journal is a
 later optimization, not v0.1 (§13).
-
-Receiver-authoritative means: after a disconnect, the sender keeps no state and
-must re-scan its own file. That is the accepted cost (D10); the future index
-(§14.1) removes it.
 
 ## 11. Progress and observability
 
