@@ -6,6 +6,7 @@
 //!
 //! The sender connects to a receiver that is listening.
 
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -25,21 +26,30 @@ const USAGE: &str = "\
 ffsync: fast chunk-level file sync for big files and fast links
 
 Usage:
-  ffsync send <file> <host:port> [--checksum]
+  ffsync send <file> <host:port> [--checksum] [--plaintext] [--trust <fp>]
   ffsync receive <file> <port> [--checksum] [--from <old-file>]
+                [--plaintext] [--trust <fp>]
+  ffsync trust <fingerprint>       pin a peer fingerprint (TOFU first contact)
+  ffsync untrust <fingerprint>     remove a pinned fingerprint
+  ffsync fingerprints              show this peer's identity + all pins
   ffsync --help | --version
-
-Commands:
-  send      push a file to a listening receiver
-  receive   listen for a sender and converge <file> from its current state
 
 Options:
   --checksum         skip no metadata shortcuts; always compare chunk roots
                      (rsync -c semantics). Also disables the warm-start index.
   --from <old-file>  receive: serve local chunks from <old-file> instead of
                      <file> (useful when the target does not exist yet)
+  --plaintext        disable TLS (LAN use or inside an SSH tunnel); D16
+  --trust <fp>       non-interactive first contact: pin <fp> instead of
+                     prompting; also overrides which pinned peer to expect
   -h, --help         print this help
   -V, --version      print version
+
+Security (D16): TLS 1.3 with self-signed certificates is on by default.
+Both peers authenticate mutually by cert fingerprint — compare the
+fingerprints printed on first contact out-of-band (in person, chat, ...),
+confirm, and every later sync verifies silently. A mismatch refuses
+loudly and syncs nothing.
 
 Notes:
   <host:port> — for IPv6 use the bracketed form, e.g. [::1]:7788.
@@ -225,7 +235,13 @@ fn set_stream_timeouts(stream: &TcpStream, secs: u64) {
     let _ = stream.set_write_timeout(d);
 }
 
-fn run_send(file: PathBuf, addr: String, force_checksum: bool) -> std::io::Result<()> {
+fn run_send(
+    file: PathBuf,
+    addr: String,
+    force_checksum: bool,
+    plaintext: bool,
+    trust_flag: Option<String>,
+) -> std::io::Result<()> {
     if !file.is_file() {
         return Err(std::io::Error::other(format!(
             "source file not found: {}",
@@ -234,13 +250,35 @@ fn run_send(file: PathBuf, addr: String, force_checksum: bool) -> std::io::Resul
     }
     let (host, port) = parse_host_port(&addr);
     println!("connecting to {host}:{port} ...");
-    let mut stream = TcpStream::connect((host.as_str(), port)).map_err(|e| {
+    let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
         std::io::Error::other(format!(
             "cannot connect to {host}:{port}: {e} (is the receiver running?)"
         ))
     })?;
-    stream.set_nodelay(true).ok();
-    set_stream_timeouts(&stream, DEFAULT_TIMEOUT_SECS);
+    tcp.set_nodelay(true).ok();
+    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+
+    // Transport security (D16): TLS by default; --plaintext for LAN/SSH
+    // tunnels. Handshake first, then the sync protocol over the TLS stream.
+    let mut stream: Box<dyn ReadWrite> = if plaintext {
+        Box::new(tcp)
+    } else {
+        let (identity, created) = ffsync::transport::Identity::load_or_create()?;
+        if created {
+            println!("identity created: {}", identity.fingerprint());
+            println!("(share this fingerprint out-of-band so peers can pin it)");
+        }
+        let policy = resolve_pin_policy(trust_flag.as_deref(), &host)?;
+        let (tls, presented) = ffsync::transport::client_session(
+            tcp,
+            &identity,
+            &policy,
+            rustls_pki_types_server_name(&host)?,
+        )?;
+        enforce_first_use(&policy, &presented, format!("{host}:{port}"))?;
+        Box::new(tls)
+    };
+
     let display = &mut ProgressDisplay::new();
     let request = SendRequest {
         path: file.clone(),
@@ -272,6 +310,8 @@ fn run_receive(
     port: u16,
     force_checksum: bool,
     from: Option<PathBuf>,
+    plaintext: bool,
+    trust_flag: Option<String>,
 ) -> std::io::Result<()> {
     let local_source = from.unwrap_or_else(|| file.clone());
     if !local_source.is_file() {
@@ -287,11 +327,32 @@ fn run_receive(
     } else {
         println!("listening on 0.0.0.0:{bound} ...");
     }
-    let (stream, peer) = listener.accept()?;
+    let (tcp, peer) = listener.accept()?;
     println!("peer connected: {peer}");
-    let mut stream: TcpStream = stream;
-    stream.set_nodelay(true).ok();
-    set_stream_timeouts(&stream, DEFAULT_TIMEOUT_SECS);
+    tcp.set_nodelay(true).ok();
+    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+
+    // Transport security (D16): TLS by default; --plaintext for LAN/SSH
+    // tunnels. Handshake before any sync data (the receiver is the
+    // FirstUse-decision point: nothing is written before the pin is settled).
+    let mut stream: Box<dyn ReadWrite> = if plaintext {
+        Box::new(tcp)
+    } else {
+        let (identity, created) = ffsync::transport::Identity::load_or_create()?;
+        if created {
+            println!("identity created: {}", identity.fingerprint());
+            println!("(share this fingerprint out-of-band so peers can pin it)");
+        }
+        let policy = resolve_pin_policy(trust_flag.as_deref(), &peer.to_string())?;
+        let (tls, presented) = ffsync::transport::server_session(tcp, &identity, &policy)?;
+        enforce_first_use(&policy, &presented, peer.to_string())?;
+        println!(
+            "peer identity: {}",
+            ffsync::transport::format_fingerprint(&presented)
+        );
+        Box::new(tls)
+    };
+
     let display = &mut ProgressDisplay::new();
     let request = ReceiveRequest {
         path: file.clone(),
@@ -310,6 +371,84 @@ fn run_receive(
     Ok(())
 }
 
+/// The `Read + Write` object bound the sync state machines run over:
+/// a plain TCP stream (`--plaintext`) or a TLS stream (default).
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// Builds the pin policy from `--trust` (if given) or the pins file, for
+/// both roles (send = peer host label, receive = connected peer address).
+/// First-use (no pins, no flag) is allowed on both sides — the prompt
+/// happens after the handshake via `enforce_first_use`.
+fn resolve_pin_policy(
+    trust_flag: Option<&str>,
+    _peer_label: &str,
+) -> std::io::Result<ffsync::transport::PinPolicy> {
+    match trust_flag {
+        Some(fp) => {
+            let raw = ffsync::transport::parse_fingerprint(fp)
+                .ok_or_else(|| std::io::Error::other(format!("not a SHA-256 fingerprint: {fp}")))?;
+            Ok(ffsync::transport::PinPolicy::Pinned(vec![raw]))
+        }
+        None => {
+            let pins = ffsync::transport::load_pins()?;
+            if pins.is_empty() {
+                Ok(ffsync::transport::PinPolicy::FirstUse)
+            } else {
+                Ok(ffsync::transport::PinPolicy::Pinned(pins))
+            }
+        }
+    }
+}
+
+/// Converts the host string into a rustls ServerName (DNS name or IP).
+/// The name is never *validated* against the certificate (D16: the
+/// fingerprint is the identity) — it only feeds the TLS handshake state.
+fn rustls_pki_types_server_name(
+    host: &str,
+) -> std::io::Result<rustls::pki_types::ServerName<'static>> {
+    use rustls::pki_types::ServerName;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    ServerName::try_from(host.to_string())
+        .map_err(|e| std::io::Error::other(format!("invalid host: {e}")))
+}
+
+/// First-use enforcement (D16): with `PinPolicy::FirstUse`, the presented
+/// fingerprint must be explicitly accepted before any sync data flows —
+/// interactively, or non-interactively via `--trust <fp>` (which the caller
+/// already resolved into a Pinned policy; this function then only runs for
+/// genuine first use).
+fn enforce_first_use(
+    policy: &ffsync::transport::PinPolicy,
+    presented: &[u8],
+    peer_label: String,
+) -> std::io::Result<()> {
+    if !matches!(policy, ffsync::transport::PinPolicy::FirstUse) {
+        return Ok(());
+    }
+    let shown = ffsync::transport::format_fingerprint(presented);
+    println!();
+    println!("first contact with {peer_label}");
+    println!("peer fingerprint: {shown}");
+    print!("trust this peer? [y/N] ");
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let yes = matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES");
+    if !yes {
+        return Err(std::io::Error::other(format!(
+            "peer not trusted — nothing was synced. To pin this fingerprint \
+             non-interactively: ffsync trust {shown} (or pass --trust {shown})"
+        )));
+    }
+    ffsync::transport::add_pin(presented)?;
+    println!("fingerprint pinned (pins.conf); future syncs verify silently");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -325,9 +464,19 @@ fn main() {
         "send" => {
             let mut positional: Vec<String> = Vec::new();
             let mut force_checksum = false;
-            for a in &args[1..] {
+            let mut plaintext = false;
+            let mut trust_flag = None;
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
                 match a.as_str() {
                     "--checksum" => force_checksum = true,
+                    "--plaintext" => plaintext = true,
+                    "--trust" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--trust requires a fingerprint"));
+                        trust_flag = Some(v.to_string());
+                    }
                     "--help" | "-h" => {
                         print!("{}", USAGE);
                         return;
@@ -344,7 +493,7 @@ fn main() {
             }
             let file = PathBuf::from(&positional[0]);
             let addr = positional[1].clone();
-            run_send(file, addr, force_checksum).unwrap_or_else(|e| {
+            run_send(file, addr, force_checksum, plaintext, trust_flag).unwrap_or_else(|e| {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             });
@@ -352,11 +501,20 @@ fn main() {
         "receive" => {
             let mut positional: Vec<String> = Vec::new();
             let mut force_checksum = false;
+            let mut plaintext = false;
+            let mut trust_flag = None;
             let mut from = None;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--checksum" => force_checksum = true,
+                    "--plaintext" => plaintext = true,
+                    "--trust" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--trust requires a fingerprint"));
+                        trust_flag = Some(v.to_string());
+                    }
                     "--from" => {
                         let v = it.next().unwrap_or_else(|| die("--from requires a path"));
                         from = Some(PathBuf::from(v));
@@ -379,10 +537,63 @@ fn main() {
             let port: u16 = positional[1]
                 .parse()
                 .unwrap_or_else(|_| die(&format!("invalid port: {}", positional[1])));
-            run_receive(file, port, force_checksum, from).unwrap_or_else(|e| {
+            run_receive(file, port, force_checksum, from, plaintext, trust_flag).unwrap_or_else(
+                |e| {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                },
+            );
+        }
+        "trust" => {
+            // ffsync trust <fingerprint>  (or with a name label as comment)
+            let fp = args
+                .get(1)
+                .unwrap_or_else(|| die("trust requires a fingerprint (see 'ffsync fingerprints')"));
+            let raw = ffsync::transport::parse_fingerprint(fp)
+                .unwrap_or_else(|| die(&format!("not a SHA-256 fingerprint: {fp}")));
+            ffsync::transport::add_pin(&raw).unwrap_or_else(|e| {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             });
+            println!("pinned {}", ffsync::transport::format_fingerprint(&raw));
+        }
+        "untrust" => {
+            let fp = args
+                .get(1)
+                .unwrap_or_else(|| die("untrust requires a fingerprint"));
+            let raw = ffsync::transport::parse_fingerprint(fp)
+                .unwrap_or_else(|| die(&format!("not a SHA-256 fingerprint: {fp}")));
+            ffsync::transport::remove_pin(&raw).unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
+            println!("unpinned {}", ffsync::transport::format_fingerprint(&raw));
+        }
+        "fingerprints" => {
+            // This machine's identity + all pinned peers.
+            match ffsync::transport::Identity::load_or_create() {
+                Ok((id, _)) => println!("this peer: {}", id.fingerprint()),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            match ffsync::transport::load_pins() {
+                Ok(pins) => {
+                    if pins.is_empty() {
+                        println!("pinned peers: (none)");
+                    } else {
+                        println!("pinned peers:");
+                        for p in pins {
+                            println!("  {}", ffsync::transport::format_fingerprint(&p));
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         other => die(&format!("unknown command: {} (try 'ffsync --help')", other)),
     }
