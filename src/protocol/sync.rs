@@ -153,7 +153,7 @@ fn unix_secs(t: Option<SystemTime>) -> u64 {
         .unwrap_or(0)
 }
 
-fn send_error_and_finish(out: &mut impl Write, code: ErrorCode, msg: &str) -> SyncError {
+pub(crate) fn send_error_and_finish(out: &mut impl Write, code: ErrorCode, msg: &str) -> SyncError {
     let frame = message::encode_error(code, msg);
     let _ = frame.and_then(|f| f.encode(out));
     let _ = out.flush();
@@ -224,6 +224,7 @@ impl From<MessageError> for SyncError {
                 SyncError::Protocol("truncated frame".into())
             }
             MessageError::Frame(FrameError::Io(e)) => SyncError::Io(e),
+            MessageError::PeerError(code, msg) => SyncError::Peer(code, msg),
             MessageError::UnexpectedType(t) => {
                 SyncError::Protocol(format!("unexpected frame type 0x{:02X}", t))
             }

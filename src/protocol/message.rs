@@ -113,16 +113,38 @@ pub enum PlanEntry {
 pub enum MessageError {
     /// Frame with the wrong type byte for the expected message.
     UnexpectedType(u8),
+    /// The peer sent an ERROR frame where the expected message was due —
+    /// carries the peer's classification and message. Decoding an ERROR
+    /// *instead of* the expected type keeps abort announcements visible
+    /// (a peer that dies mid-session says so with an ERROR frame; without
+    /// this variant the receiver would report a bare "unexpected frame
+    /// type" and lose the reason).
+    PeerError(ErrorCode, String),
     /// Payload does not match the expected structure.
     Malformed(&'static str),
     /// Underlying frame-level error.
     Frame(framing::FrameError),
 }
 
+/// Reads one frame; on ERROR frames returns [`MessageError::PeerError`],
+/// otherwise hands the frame to the caller (used by `read_typed` so an
+/// aborting peer's ERROR is classified instead of swallowed).
+fn read_frame_or_error(inp: &mut impl Read) -> Result<Frame, MessageError> {
+    let frame = framing::read_frame(inp)?;
+    if frame.ftype == framing::T_ERROR {
+        let (code, msg) = read_error_payload(&frame)?;
+        return Err(MessageError::PeerError(code, msg));
+    }
+    Ok(frame)
+}
+
 impl std::fmt::Display for MessageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MessageError::UnexpectedType(t) => write!(f, "unexpected frame type 0x{:02X}", t),
+            MessageError::PeerError(code, msg) => {
+                write!(f, "peer aborted ({code:?}): {msg}")
+            }
             MessageError::Malformed(why) => write!(f, "malformed frame payload: {}", why),
             MessageError::Frame(e) => write!(f, "{}", e),
         }
@@ -369,7 +391,7 @@ pub fn read_empty(inp: &mut impl Read, ftype: u8) -> Result<(), MessageError> {
 
 /// Reads a typed message of exactly the expected type.
 pub fn read_typed<M: Message>(inp: &mut impl Read) -> Result<M, MessageError> {
-    let frame = framing::read_frame(inp)?;
+    let frame = read_frame_or_error(inp)?;
     M::from_frame(frame)
 }
 

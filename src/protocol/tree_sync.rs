@@ -28,8 +28,10 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::protocol::framing::{self};
-use crate::protocol::message::{self, TreeBegin, TreeEnd, TreeEntryWire};
-use crate::protocol::sync::{self, Progress, ReceiveRequest, SendRequest, SyncError, SyncOutcome};
+use crate::protocol::message::{self, ErrorCode, TreeBegin, TreeEnd, TreeEntryWire};
+use crate::protocol::sync::{
+    self, Progress, ReceiveRequest, SendRequest, SyncError, SyncOutcome, send_error_and_finish,
+};
 use crate::tree::{self, EntryKind, TREE_FLAG_CHECKSUM, TREE_FLAG_NO_DELETE, TreeManifest, Triage};
 
 /// Tree-level progress events (bridged to the CLI display).
@@ -233,8 +235,13 @@ where
     for (idx, rel) in actions.iter().enumerate() {
         progress(TreeProgress::FileStart(idx, total));
         let path = abs_path(&request.root, rel);
-        let meta = std::fs::metadata(&path)
-            .map_err(|e| SyncError::Protocol(format!("sender file vanished: {rel}: {e}")))?;
+        let meta = std::fs::metadata(&path).map_err(|e| {
+            let err = SyncError::Protocol(format!("sender file vanished: {rel}: {e}"));
+            // Announce the abort: the peer is waiting for the next per-file
+            // HELLO and must fail fast instead of timing out.
+            let _ = send_error_and_finish(stream, ErrorCode::Aborted, &err.to_string());
+            err
+        })?;
         let mtime = meta.modified().ok();
 
         let send_req = SendRequest {
@@ -251,7 +258,15 @@ where
                 progress: p,
             });
         };
-        let outcome = sync::send(stream, &send_req, pipeline, &mut file_progress)?;
+        let outcome = match sync::send(stream, &send_req, pipeline, &mut file_progress) {
+            Ok(o) => o,
+            Err(e) => {
+                // Announce the abort (best effort — the peer may be the one
+                // that caused it and is already gone).
+                let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
+                return Err(e);
+            }
+        };
         match outcome {
             SyncOutcome::InSync => in_sync += 1,
             SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
@@ -339,6 +354,16 @@ where
 
     for rel in &all_paths {
         let action = tree::triage(rel, peer_manifest.get(rel), manifest.get(rel), checksum);
+        // Local apply errors during triage are announced to the peer (best
+        // effort) — it sits in its own triage/conversation loop and must
+        // fail fast rather than time out.
+        macro_rules! announce {
+            ($err:expr) => {{
+                let err = $err;
+                let _ = send_error_and_finish(stream, ErrorCode::Aborted, &err.to_string());
+                return Err(err);
+            }};
+        }
         match action {
             Triage::Skip => {}
             Triage::Sync | Triage::Transfer => conversation_paths.push(rel.clone()),
@@ -346,8 +371,9 @@ where
                 // Sender-only dir: create it now (before conversations — a
                 // conversation file may land inside it).
                 let p = abs_path(&request.root, rel);
-                std::fs::create_dir_all(&p)
-                    .map_err(|e| SyncError::Protocol(format!("cannot create dir {rel}: {e}")))?;
+                if let Err(e) = std::fs::create_dir_all(&p) {
+                    announce!(SyncError::Protocol(format!("cannot create dir {rel}: {e}")));
+                }
             }
             Triage::Delete => {
                 // Receiver-only: delete after transfers (§16.5). Also covers
@@ -373,27 +399,27 @@ where
                         // Remove the receiver's dir at that path before the
                         // conversation can write the file there.
                         let p = abs_path(&request.root, rel);
-                        if p.is_dir() {
-                            std::fs::remove_dir_all(&p).map_err(|e| {
-                                SyncError::Protocol(format!(
-                                    "cannot replace dir {rel} with file: {e}"
-                                ))
-                            })?;
+                        if p.is_dir()
+                            && let Err(e) = std::fs::remove_dir_all(&p)
+                        {
+                            announce!(SyncError::Protocol(format!(
+                                "cannot replace dir {rel} with file: {e}"
+                            )));
                         }
                         conversation_paths.push(rel.clone());
                     }
                     EntryKind::Dir => {
                         let p = abs_path(&request.root, rel);
-                        if p.is_file() {
-                            std::fs::remove_file(&p).map_err(|e| {
-                                SyncError::Protocol(format!(
-                                    "cannot replace file {rel} with dir: {e}"
-                                ))
-                            })?;
+                        if p.is_file()
+                            && let Err(e) = std::fs::remove_file(&p)
+                        {
+                            announce!(SyncError::Protocol(format!(
+                                "cannot replace file {rel} with dir: {e}"
+                            )));
                         }
-                        std::fs::create_dir_all(&p).map_err(|e| {
-                            SyncError::Protocol(format!("cannot create dir {rel}: {e}"))
-                        })?;
+                        if let Err(e) = std::fs::create_dir_all(&p) {
+                            announce!(SyncError::Protocol(format!("cannot create dir {rel}: {e}")));
+                        }
                     }
                 }
             }
@@ -408,9 +434,11 @@ where
     for (idx, rel) in conversation_paths.iter().enumerate() {
         progress(TreeProgress::FileStart(idx, total));
         let path = abs_path(&request.root, rel);
-        ensure_parent_dir(&path).map_err(|e| {
-            SyncError::Protocol(format!("cannot create parent dirs for {rel}: {e}"))
-        })?;
+        if let Err(e) = ensure_parent_dir(&path) {
+            let err = SyncError::Protocol(format!("cannot create parent dirs for {rel}: {e}"));
+            let _ = send_error_and_finish(stream, ErrorCode::Aborted, &err.to_string());
+            return Err(err);
+        }
 
         // The per-file HELLO must arrive now (the sender initiates).
         // We answer with our own HELLO inside sync::receive; our request
@@ -430,7 +458,16 @@ where
                 progress: p,
             });
         };
-        let outcome = sync::receive(stream, &recv_req, pipeline, &mut file_progress)?;
+        let outcome = match sync::receive(stream, &recv_req, pipeline, &mut file_progress) {
+            Ok(o) => o,
+            Err(e) => {
+                // Announce the abort (best effort): the sender may still be
+                // reading its next conversation's reply and must fail fast
+                // instead of timing out.
+                let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
+                return Err(e);
+            }
+        };
         match outcome {
             SyncOutcome::InSync => in_sync += 1,
             SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
@@ -489,7 +526,14 @@ where
                         crate::index::remove_index(&p);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // Already gone — or its ancestor became a file when a kind
+                // conflict was resolved this session (the conflict removal
+                // destroyed the subtree, §16.3). On Linux that surfaces as
+                // ENOTDIR, on Windows as ERROR_PATH_NOT_FOUND; either way
+                // nothing is left to delete at this path.
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::NotADirectory => {}
                 Err(e) => {
                     return Err(SyncError::Protocol(format!("cannot delete {rel}: {e}")));
                 }
