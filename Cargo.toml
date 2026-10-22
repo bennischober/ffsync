@@ -6,6 +6,10 @@ description = "Chunk-level file synchronization for big files and fast links"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bennischober/ffsync"
 readme = "README.md"
+# Keep local-only tooling and CI config out of the published crate; the
+# design docs (concept/, evaluation/) stay in — README and AGENTS.md
+# reference them and they carry the protocol reasoning.
+exclude = [".opencode", ".github"]
 
 [dependencies]
 blake3 = { version = "1.8.7" }
