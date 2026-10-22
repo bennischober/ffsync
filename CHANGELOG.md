@@ -6,6 +6,10 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet - see [0.3.0]._
+
+## [0.3.0] - 2026-10-22
+
 ### Added
 
 - **Directory-tree sync (D17, protocol v3):** pass a directory to
@@ -144,5 +148,6 @@ First working implementation: single-file sync between two peers over TCP.
   fixed blocks); ffsync's advantage is the parallel scan (~3.8x cold start on
   the 72.7 GiB reference file) and resumability.
 
+[0.3.0]: https://github.com/bennischober/ffsync/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bennischober/ffsync/releases/tag/v0.2.0
 [0.1.0]: https://github.com/bennischober/ffsync/releases/tag/v0.1.0

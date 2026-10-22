@@ -6,8 +6,8 @@ Guidance for AI coding agents (and humans) working in this repository.
 
 `ffsync` is a file synchronization tool written in Rust that syncs data at the
 chunk level to minimize transfer and I/O, similar in spirit to rsync. As of
-v0.3 (unreleased), single-file sync **and directory-tree sync** between two
-peers over TCP work end-to-end: parallel chunking/hashing pipeline, file
+v0.3, single-file sync **and directory-tree sync** between two peers over TCP
+work end-to-end: parallel chunking/hashing pipeline, file
 reconstruction, manifest/plan exchange, zstd-compressed transfer,
 chunk-root verification, mtime/size fast path (sub-second mtimes),
 resume after mid-transfer disconnects, the persistent chunk index for warm
