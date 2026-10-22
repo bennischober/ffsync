@@ -6,11 +6,13 @@ Guidance for AI coding agents (and humans) working in this repository.
 
 `ffsync` is a file synchronization tool written in Rust that syncs data at the
 chunk level to minimize transfer and I/O, similar in spirit to rsync. As of
-v0.1.0, single-file sync between two peers over TCP works end-to-end: parallel
-chunking/hashing pipeline, file reconstruction, manifest/plan exchange,
-zstd-compressed transfer, chunk-root verification, mtime/size fast path, and
-resume after mid-transfer disconnects. Not implemented yet: directory/multi-file
-sync, the persistent chunk index (warm restarts), and encryption/TLS.
+v0.2 (unreleased), single-file sync between two peers over TCP works
+end-to-end: parallel chunking/hashing pipeline, file reconstruction,
+manifest/plan exchange, zstd-compressed transfer, chunk-root verification,
+mtime/size fast path (sub-second mtimes, protocol v2), resume after
+mid-transfer disconnects, and the persistent chunk index for warm starts
+(D15). Not implemented yet: directory/multi-file sync, authentication, and
+encryption/TLS.
 
 Design documents (read before making architectural changes):
 
@@ -19,9 +21,11 @@ Design documents (read before making architectural changes):
   "build around rsync" alternatives
 - `concept/Design Decisions.md` — recorded decisions with reasoning and
   alternatives; add new decisions there, do not silently change old ones
-- `concept/Protocol v0.1.md` — the v0.1 wire protocol: framing, handshake,
-  manifest/plan/data flow, verification, resume. The implementation follows
-  it; deviations are protocol bugs unless the spec is amended first
+- `concept/Protocol v0.1.md` — the wire protocol (named for its first
+  release; it tracks the protocol across versions — currently v2: HELLO
+  gained `file_mtime_nanos`): framing, handshake, manifest/plan/data flow,
+  verification, resume. The implementation follows it; deviations are
+  protocol bugs unless the spec is amended first
 - `concept/Deep Research Digest.md` — what the two deep-research runs
   (architecture + P2P connectivity, saved alongside as markdown) got right,
   and what we rejected
@@ -68,16 +72,18 @@ pre-existing.
 
 ## Architecture
 
-- `src/lib.rs` — lib target exposing `chunking` and `reconstruction` (the
-  integration test and the bench binary import through it).
-- `src/main.rs` — binary entry point; currently a scratch/benchmark harness,
-  not a stable API.
+- `src/lib.rs` — lib target; exposes `chunking`, `index`, `protocol`, and
+  `reconstruction` (tests and the bench binary import through it).
+- `src/main.rs` — the `ffsync` CLI (`send`/`receive`): argument parsing,
+  progress display, TCP setup, and error reporting. Thin by design; the sync
+  logic lives in `protocol::sync`.
 - `src/bin/bench.rs` — the benchmark harness: generates fixture variants
   (identical / modified / appended / fresh), scans both sides through the real
   pipeline, simulates the delta against a hash set, reconstructs the target
   through the real `Reconstructor` with hash verification, and projects
   transfer times across link speeds and zstd ratios. Optional `--rsync`
-  comparison (native or via WSL). Zero dependencies beyond the crate's own.
+  comparison (native or via WSL), `--disconnect` resume simulation, `--warm`
+  warm-start index measurement. Zero dependencies beyond the crate's own.
 - `src/chunking/` — the core data pipeline. The public API is re-exported from
   `mod.rs`.
   - `pipeline.rs` — `process_file()` is the entry point: it memory-maps the
@@ -102,6 +108,15 @@ pre-existing.
     payload), then verifies the final BLAKE3 hash and atomically renames.
   - `io_ext.rs` — `FileExt` trait for positional I/O (`read_at`/`write_at`)
     with separate `#[cfg(unix)]` and `#[cfg(windows)]` implementations.
+- `src/protocol/` — the wire protocol. `framing.rs` (length-prefixed frames),
+  `message.rs` (HELLO/manifest/plan/DATA/VERIFY/… codecs), `sync.rs` (the
+  sender/receiver state machines: manifest exchange, exact-hash diffing (D12),
+  zstd delta transfer, locals-first write order, mtime/size fast path,
+  resume (D10), warm-start integration (D15)). State machines are generic
+  over `S: Read + Write` — transport-agnostic by design.
+- `tests/loopback.rs` — two-peer integration tests over in-memory duplex
+  streams: identical/modified/fresh/fast-path/disconnect-resume plus the
+  warm-start, stale-index, and orphan-cleanup scenarios.
 - `tests/integration.rs` — end-to-end test: reconstruct a modified file from
   an older local version plus simulated "network" chunks.
 
@@ -115,9 +130,11 @@ pre-existing.
 - Keep submodules private and re-export the intended public API explicitly in
   each `mod.rs`.
 - Prefer native threads + `crossbeam` channels over async/tokio for the data
-  plane. The tokio runtime only wraps `main`; measurements in
-  `evaluation/chunking.md` showed async reads were roughly 5x slower than the
-  mmap + native-thread pipeline.
+  plane — there is no tokio in the tree anymore (removed in v0.1; the
+  measurement in `evaluation/chunking.md` showed async reads ~5x slower than
+  the mmap + native-thread pipeline). Keep it that way unless a transport
+  (QUIC) genuinely requires an async runtime at the edges; re-evaluate the
+  D13 decision when that comes up.
 
 ## Gotchas (non-obvious invariants)
 
@@ -149,9 +166,11 @@ pre-existing.
 
 ## Roadmap (from the concept docs)
 
-Not yet implemented: metadata scan and triage (Phase 1), file-level BLAKE3
-root-hash exchange (Phase 2), live chunk diffing and `SyncPlan` generation
-(Phase 3), and the network transfer/protocol layer including Zstd compression
-(Phase 4). See `concept/Design Decisions.md` D5 (checksum-based change
-detection), D8 (link-adaptive diff strategy), and D10 (resume state, open) for
-the design questions the protocol work must answer.
+Implemented: single-file sync end-to-end (Phases 2–4 of the workflow doc:
+root-hash identity, chunk diffing and plan generation, transfer + zstd),
+resume, and the persistent chunk index (D15). Not yet implemented: metadata
+scan and triage across a directory tree (Phase 1 — multi-file sync),
+authentication, and transport security (D13: QUIC/TLS decision). See
+`concept/Design Decisions.md` D5 (checksum-based change detection), D8
+(link-adaptive diff strategy), and D13 (transport security) for the design
+questions the next steps must answer.

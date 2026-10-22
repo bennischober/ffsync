@@ -175,13 +175,22 @@ fn drain_for_close(stream: &mut impl Read) -> io::Result<()> {
 }
 
 /// Validates the received HELLO against ours (§4). Returns the peer's HELLO
-/// or a terminal error.
+/// or a terminal error. On rejection the caller must send ERROR before
+/// closing; `validate_hello` only classifies, it does not write (it has no
+/// access to the stream).
 fn validate_hello(peer: &Hello, ours_role: Role) -> Result<Hello, SyncError> {
     if peer.version != super::VERSION {
-        return Err(send_error_and_finish(
-            &mut Vec::new(), // replaced below; see helper
+        // Classified as Peer(Version) so callers send ERROR(Version) on the
+        // wire — the old peer must learn WHY it was rejected, not just see a
+        // hangup (found by the version-mismatch loopback test: the v0.1
+        // code wrote the ERROR frame into a throwaway buffer).
+        return Err(SyncError::Peer(
             ErrorCode::Version,
-            &format!("unsupported version {}", peer.version),
+            format!(
+                "unsupported protocol version {} (this peer speaks {})",
+                peer.version,
+                super::VERSION
+            ),
         ));
     }
     if peer.role == ours_role {
@@ -296,6 +305,10 @@ where
         Ok(h) => h,
         Err(SyncError::Protocol(msg)) => {
             return Err(send_error_and_finish(stream, ErrorCode::RoleConflict, &msg));
+        }
+        Err(SyncError::Peer(code, msg)) => {
+            // Version rejection: the old peer must get an explicit ERROR.
+            return Err(send_error_and_finish(stream, code, &msg));
         }
         Err(other) => return Err(other),
     };
@@ -602,6 +615,10 @@ where
         Err(SyncError::Protocol(msg)) => {
             return Err(send_error_and_finish(stream, ErrorCode::RoleConflict, &msg));
         }
+        Err(SyncError::Peer(code, msg)) => {
+            // Version rejection: the old peer must get an explicit ERROR.
+            return Err(send_error_and_finish(stream, code, &msg));
+        }
         Err(other) => return Err(other),
     };
 
@@ -774,7 +791,9 @@ where
                         // attempt starts clean. If we warm-started (D15),
                         // also drop the index: it lied about content and
                         // must not poison the retry (same guard as the
-                        // sender's HashMismatch handling).
+                        // sender's HashMismatch handling). The index belongs
+                        // to `local_source` — the file the warm manifest
+                        // claims to describe — not necessarily the target.
                         if matches!(origin, LocalOrigin::Temp { .. }) {
                             let _ = std::fs::remove_file(&temp_path);
                         }
@@ -909,10 +928,14 @@ where
                         crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
                     ),
                 );
-            } else {
+            } else if request.local_source == request.path {
                 // Old file already matched (no transfer needed): persist its
                 // index so the NEXT sync warms (D15). The scan already ran;
-                // writing costs one file of bytes.
+                // writing costs one file of bytes. Only when the file we
+                // scanned IS the target: with --from <other-file> the index
+                // would claim the target's identity from another file's
+                // content (size/mtime of `local_source` keyed to `path`),
+                // and the next warm start would serve the wrong chunk list.
                 let _ = crate::index::write_index(
                     &request.path,
                     &FileIndex::from_scan(

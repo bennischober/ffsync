@@ -643,4 +643,155 @@ mod tests {
         assert!(matches!(r.unwrap(), SyncOutcome::InSync));
         assert_eq!(read_file(&target), data);
     }
+
+    #[test]
+    fn version_mismatch_is_rejected_loudly() {
+        // Protocol compatibility contract (§4): a peer speaking a different
+        // protocol version is rejected with ERROR(Version) by BOTH sides —
+        // never silently mis-interpreted. Pinned: the v0.2 wire change
+        // (HELLO file_mtime_nanos) bumped VERSION 1 -> 2; a v1 peer (e.g.
+        // ffsync 0.1.0) must fail the handshake, not corrupt a sync by
+        // reading a v2 frame with v1 expectations.
+        let fx = Fixture::new("versionmismatch");
+        let data = vec![7u8; 512 * 1024];
+        create_file(fx.source(), &data);
+        let target = fx.path("target.bin");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A fake "old peer" that speaks protocol version 1. Returns Err on
+        // purpose: it asserts the rejection inline and reports "done" as an
+        // error (join() propagates assertion panics).
+        let old_peer: std::thread::JoinHandle<std::io::Result<()>> =
+            std::thread::spawn(move || {
+                use ffsync::protocol::message::Message as _;
+                let mut sock = std::net::TcpStream::connect(addr).unwrap();
+                // Send a v1 HELLO as a sender would.
+                let hello = ffsync::protocol::message::Hello {
+                    version: 1,
+                    flags: ffsync::protocol::message::FLAG_TRUST_TIMES,
+                    role: ffsync::protocol::message::Role::Sender,
+                    cdc_min: 64 * 1024,
+                    cdc_avg: 256 * 1024,
+                    cdc_max: 1024 * 1024,
+                    file_size: data.len() as u64,
+                    file_mtime: 1_760_000_000,
+                    file_mtime_nanos: 0,
+                    path: "source.bin".into(),
+                };
+                hello.into_frame().unwrap().encode(&mut sock).unwrap();
+                sock.flush().unwrap();
+                // Read the receiver's answer. The receiver sends its own HELLO
+                // first (both sides greet immediately), so frame 1 is HELLO
+                // (0x01); the next readable frame must be ERROR(Version) — or
+                // the receiver hangs up (also acceptable, but a code is
+                // required if anything beyond the HELLO arrives).
+                loop {
+                    let frame = match ffsync::protocol::framing::read_frame(&mut sock) {
+                        Ok(f) => f,
+                        Err(_) => return Err(std::io::Error::other("connection closed (correct)")),
+                    };
+                    if frame.ftype == ffsync::protocol::framing::T_HELLO {
+                        continue; // expected: the receiver's own greeting
+                    }
+                    assert_eq!(
+                        frame.ftype,
+                        ffsync::protocol::framing::T_ERROR,
+                        "expected ERROR frame, got 0x{:02X}",
+                        frame.ftype
+                    );
+                    let (code, _msg) =
+                        ffsync::protocol::message::read_error_payload(&frame).unwrap();
+                    assert_eq!(code, ffsync::protocol::message::ErrorCode::Version);
+                    return Err(std::io::Error::other("peer rejected (correct)"));
+                }
+            });
+
+        let (sock, _) = listener.accept().unwrap();
+        let mut sock = sock;
+        let request = ReceiveRequest {
+            path: target.clone(),
+            local_source: target.clone(),
+            force_checksum: false,
+        };
+        let pipeline = PipelineConfig::default();
+        let mut progress = |_p: Progress| {};
+        let r = receive(&mut sock, &request, &pipeline, &mut progress);
+        // The old-peer closure returns Err deliberately once it has asserted
+        // the rejection; join() panics only if its assertions failed.
+        let _ = old_peer.join().expect("old peer thread panicked");
+
+        // The receiver must fail — and with the version error specifically.
+        match r {
+            Err(SyncError::Peer(code, msg)) => {
+                assert_eq!(code, ErrorCode::Version, "message: {msg}");
+            }
+            other => panic!("receiver must fail with Peer(Version, _), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receive_with_from_does_not_write_wrong_index() {
+        // D15 ownership rule: the index describes THE FILE IT WAS WRITTEN
+        // FROM. With --from <old-file>, an InSync outcome must not write an
+        // index for the target claiming the old file's content — otherwise
+        // the next warm start serves a chunk list the target does not have.
+        let fx = Fixture::new("fromindex");
+        let old_data = vec![3u8; 512 * 1024];
+        let new_data = vec![5u8; 512 * 1024];
+        let from_file = fx.path("from.bin");
+        create_file(&from_file, &old_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &new_data);
+
+        // Sync where the sender's content equals the OLD file (so the plan
+        // is empty relative to the from-file's manifest), receiver converges
+        // to... nothing (already InSync relative to from.bin).
+        let (s, r) = run_sync(
+            SendRequest {
+                path: from_file.clone(),
+                display_path: "from.bin".into(),
+                mtime: None,
+                force_checksum: true,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: from_file.clone(),
+                force_checksum: true,
+            },
+        );
+        let _s = s.expect("sender ok");
+        let _r = r.expect("receiver ok");
+
+        // The from-file's index is fine (it describes from.bin), but the
+        // TARGET must not have an index written from another file's content.
+        // (The InSync path must skip the index write when local_source !=
+        // target.)
+        let target_index = ffsync::index::index_path_for(&target);
+        if target_index.exists() {
+            // If an index exists for the target, it must VALIDATE against
+            // the target's actual content — it must not be a copy of the
+            // from-file's state.
+            let target_root = ffsync::chunking::chunk_root(
+                &ffsync::chunking::scan_file_ordered(
+                    &target,
+                    &PipelineConfig::default(),
+                    (
+                        ffsync::chunking::CHUNK_MIN,
+                        ffsync::chunking::CHUNK_AVG,
+                        ffsync::chunking::CHUNK_MAX,
+                    ),
+                )
+                .expect("target scan")
+                .1,
+            );
+            let idx =
+                ffsync::index::load_index(&target).expect("target index (if present) must load");
+            assert_eq!(
+                idx.root, target_root,
+                "target index must describe the target's own content"
+            );
+        }
+    }
 }

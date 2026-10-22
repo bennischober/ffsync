@@ -1,14 +1,17 @@
-# Wire Protocol v0.1
+# Wire Protocol
 
-Draft specification for the smallest useful ffsync sync: **one file pair,
-two peers, one TCP connection**. This document is implementation-facing: it
-should contain everything needed to build the first working sync without
+Specification for the ffsync wire protocol. Written for v0.1 (protocol
+version 1: **one file pair, two peers, one TCP connection**); it tracks the
+protocol across versions — changes ship with a `VERSION` bump and are
+recorded in the relevant sections. Current version: **2** (v0.2: HELLO
+gained `file_mtime_nanos`, see §3/§4). This document is implementation-
+facing: it should contain everything needed to build the sync without
 re-deriving design arguments. The reasoning lives in `Positioning.md` and
 `Design Decisions.md` (referenced as D-numbers).
 
 ## 1. Scope and non-goals
 
-**In scope (v0.1):**
+**In scope (v0.1, extended in v0.2):**
 
 - One explicitly named file pair per invocation (`ffsync send <file> <peer>` /
   `ffsync receive <file>` — exact CLI shape open, see §14).
@@ -16,12 +19,15 @@ re-deriving design arguments. The reasoning lives in `Positioning.md` and
   peer wanting to converge is the **receiver**. Roles are assigned by the CLI,
   not negotiated.
 - Transport: one ordered, reliable byte stream (TCP). Plaintext for v0.1 —
-  intended for LAN use or inside an SSH tunnel. TLS (rustls) is v0.2.
+  intended for LAN use or inside an SSH tunnel. TLS (rustls) is planned; see
+  D13 and §14.
 - Compression: zstd on chunk-data frames only.
 - Resume after disconnect (receiver-authoritative, D10).
 - Progress/observability derived from protocol flow (§11).
+- v0.2: peer-local persistent chunk index (warm starts, D15) — §14.1; HELLO
+  sub-second mtime (protocol v2).
 
-**Out of scope (v0.1), per D9:**
+**Out of scope, per D9:**
 
 - Directory recursion, deletes, renames (tree sync is Phase 1 concept work).
 - Metadata beyond (path, size, mtime): no permissions, xattrs, symlinks,
