@@ -16,8 +16,10 @@ tree sync (D17: protocol v3 — TREE_BEGIN/TREE_END envelope, sequential
 per-file conversations, mtime preservation on commit, deletes deferred to
 session end, `--no-delete` opt-out) and tree-mode excludes (§16.7:
 `--exclude`/`--exclude-from`, sender's patterns rule the session,
-receiver's patterns guard the delete pass). Not implemented yet: parallel
-per-file streams (QUIC, D13), permissions/xattrs/symlink policy (D9).
+receiver's patterns guard the delete pass), and parallel per-file
+conversations (§16.8, D13 step 1: `--parallel K` over K connections,
+measured 3.4×–6.1× at 30 ms RTT). Not implemented yet: QUIC transport
+(D13 step 2), permissions/xattrs/symlink policy (D9).
 
 Design documents (read before making architectural changes):
 
@@ -51,7 +53,7 @@ Design documents (read before making architectural changes):
 | `cargo check --tests` | Fast compile check including tests |
 | `cargo test` | Run unit and integration tests (`tests/integration.rs`) |
 | `cargo run` | Run the CLI (`ffsync send/receive`, see `--help`) |
-| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--rsync`, `--disconnect`, `--warm`, `--tree`, `--json`) |
+| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--rsync`, `--disconnect`, `--warm`, `--tree`, `--latency` (+ `--rtt-ms`, `--parallel K,...`), `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
 | `cargo clippy` | Lint (no `clippy.toml`) |
 | `cargo audit` | Check `Cargo.lock` against RustSec advisories (see D14 in `concept/Design Decisions.md`) |
@@ -124,8 +126,10 @@ pre-existing.
   resume (D10), warm-start integration (D15)), and `tree_sync.rs` (the v3
   tree session orchestrators: TREE_BEGIN/TREE_END envelope, deterministic
   triage on both sides, sequential per-file conversations, deferred
-  deletions). State machines are generic over `S: Read + Write` —
-  transport-agnostic by design.
+  deletions; plus the v4 parallel sessions of §16.8 — `--parallel K`
+  spreads conversations over K connections, one native thread per
+  connection, membership-validated via TREE_FILE). State machines are
+  generic over `S: Read + Write` — transport-agnostic by design.
 - `src/tree.rs` — the tree layer (D17): metadata-only directory scan
   (sorted, ffsync sidecar files excluded, optional exclude patterns with
   subtree pruning — §16.7), relative-path validation (no traversal, wire
@@ -158,7 +162,9 @@ pre-existing.
   everything (mtime preservation fast path), modified/new-only deltas,
   deletes after success, `--no-delete`, `--checksum`, empty-file
   convergence, kind conflicts, v2-flow peers rejecting TREE_BEGIN,
-  wire path traversal refused, vanished sender files fail closed.
+  wire path traversal refused, vanished sender files fail closed,
+  parallel sessions (§16.8: convergence, sequential-fallback rejection,
+  fail-closed on worker error).
 - `tests/integration.rs` — end-to-end test: reconstruct a modified file from
   an older local version plus simulated "network" chunks.
 
@@ -223,6 +229,20 @@ pre-existing.
   Do not "simplify" one to match the other — they differ because the
   session continues after a tree conversation but ends after a single-file
   one.
+- Parallel sessions (§16.8) replace wire ORDER with membership: every
+  conversation (control connection included) is announced by a TREE_FILE
+  frame and validated against the expected set, exactly once. Do not
+  "optimize" the membership check away or reintroduce order-based
+  expectations — the sender's worker threads race, and arrival order is
+  arbitrary on every connection. The receiver's control loop consumes the
+  sender's TREE_END itself (that is how it stops serving partition 0), so
+  the sequential §16.5 barrier read is gated on `sender_end_consumed` —
+  removing that gate deadlocks the sender on its TREE_END reply.
+- Worker connections authenticate with the SAME pin policy as the control
+  connection; the CLI's connect/accept closures handle that, and the
+  state machines stay transport-agnostic (the closures are injected).
+  A QUIC transport can later substitute streams for connections without
+  touching tree_sync's logic.
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
 - The identity file (`identity.bin`) holds the private key: `0600` on unix,
@@ -241,10 +261,11 @@ root-hash identity, chunk diffing and plan generation, transfer + zstd),
 resume, the persistent chunk index (D15), transport security (D16:
 rustls TLS 1.3, mutual TOFU fingerprint pinning), directory-tree sync
 (D17, protocol v3: Phase 1 metadata triage + per-file conversations,
-mtime preservation, deferred deletes), and tree-mode excludes (§16.7).
-Not yet implemented: parallel per-file streams — QUIC (D13 amendment:
-deferred until measurement shows parallel streams worthwhile), and
-permissions/xattrs/symlinks as first-class metadata (D9). See
+mtime preservation, deferred deletes), tree-mode excludes (§16.7), and
+parallel per-file conversations (§16.8, D13 step 1: `--parallel K` over
+K connections — measured 3.4×–6.1× on a 100-file full transfer at
+30 ms RTT; QUIC remains D13 step 2). Not yet implemented: QUIC transport
+and permissions/xattrs/symlinks as first-class metadata (D9). See
 `concept/Design Decisions.md` D5 (checksum-based change detection) and
 D8 (link-adaptive diff strategy) for the design questions the pipelining
 step must answer.

@@ -6,7 +6,21 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet - see [0.4.0]._
+### Added
+
+- **Parallel tree sessions (`--parallel <K>`; §16.8, D13 step 1):** a tree
+  session can run its per-file conversations over K connections at once
+  (2..=16) instead of sequentially on one. The sender partitions its
+  conversation set round-robin; every conversation is announced with a new
+  `TREE_FILE` frame and the receiver validates membership (each path
+  exactly once) instead of wire order. Per-file frames are byte-identical
+  to v3; sequential sessions (default) keep the exact v3 wire layout, so
+  v0.4 peers interoperate unchanged. Worker connections authenticate with
+  the same TLS + fingerprint pinning as the control connection; a failed
+  conversation fails the session and the receiver deletes nothing
+  (fail-closed, as before). Measured with the new `bench --latency`
+  harness (simulated 30 ms RTT, 100-file full transfer): sequential
+  21.0 s → 6.25 s at K=4 (3.36×) → 3.46 s at K=8 (6.07×).
 
 ## [0.4.0] - 2026-10-22
 

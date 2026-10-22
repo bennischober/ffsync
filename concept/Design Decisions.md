@@ -126,6 +126,21 @@ network layer lands (a hidden-file convention may be preferable).
 > transport edges (the mmap/thread data plane stays native, per the
 > measured 5x regression of async I/O in `evaluation/chunking.md`), and
 > parallel per-file QUIC streams become the optimization worth building.
+>
+> **Second amendment (2026-10-22, v0.5 work):** the parallel-streams half
+> of D13 landed WITHOUT QUIC and without tokio (§16.8, `--parallel K`):
+> K connections between the same peers, one native thread per connection,
+> each running the byte-identical v3 per-file flow; the conversation set
+> is membership-validated (TREE_FILE frames) instead of order-validated.
+> Measurement first, per this decision's own discipline — `bench
+> --latency` (in-process duplex, each direction delayed RTT/2, 100-file
+> full transfer, receiver empty): sequential 21.0 s → 6.25 s at K=4
+> (3.36×) → 3.46 s at K=8 (6.07×) at 30 ms simulated RTT. The dead air is
+> exactly the serialized round trips the amendment predicted. QUIC
+> (quinn) remains deferred as *step 2*: the parallel-session layer is
+> transport-agnostic (worker connections are injected closures), so a
+> quinn stream substitutes a connection without touching tree_sync's
+> logic. The tokio-at-the-edges question moves with it.
 
 **Decision:** v0.1 runs over one plain TCP stream (plaintext, LAN or inside an
 SSH tunnel). QUIC — not raw TCP hardening — is the default v0.2 transport plan.

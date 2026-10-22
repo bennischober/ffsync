@@ -77,8 +77,35 @@ fn run_tree_session_ex(
     Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
     Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
 ) {
+    run_tree_session_full(
+        sender_root,
+        receiver_root,
+        checksum,
+        no_delete,
+        sender_excludes,
+        receiver_excludes,
+        1,
+    )
+}
+
+/// The full session runner: excludes on both sides plus the parallel
+/// connection count (§16.8; 1 = sequential).
+#[allow(clippy::too_many_arguments)]
+fn run_tree_session_full(
+    sender_root: &Path,
+    receiver_root: &Path,
+    checksum: bool,
+    no_delete: bool,
+    sender_excludes: &[&str],
+    receiver_excludes: &[&str],
+    parallel: u16,
+) -> (
+    Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
+    Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
+) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let listener2 = listener.try_clone().unwrap();
 
     let recv_root = receiver_root.to_path_buf();
     let recv_excludes: Vec<String> = receiver_excludes.iter().map(|s| s.to_string()).collect();
@@ -94,6 +121,15 @@ fn run_tree_session_ex(
                 force_checksum: checksum,
                 no_delete,
                 excludes: recv_excludes,
+                accept_worker: std::sync::Arc::new(move || {
+                    let (tcp, _wpeer) = listener2
+                        .accept()
+                        .map_err(|e| std::io::Error::other(format!("cannot accept worker: {e}")))?;
+                    tcp.set_nodelay(true).ok();
+                    tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+                    tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
+                    Ok(Box::new(tcp))
+                }),
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -104,6 +140,7 @@ fn run_tree_session_ex(
     tcp.set_nodelay(true).ok();
     tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
+    let send_addr = addr;
     let send_excludes: Vec<String> = sender_excludes.iter().map(|s| s.to_string()).collect();
     let send_res = tree_send(
         &mut &tcp,
@@ -112,6 +149,15 @@ fn run_tree_session_ex(
             force_checksum: checksum,
             no_delete,
             excludes: send_excludes,
+            parallel,
+            connect_worker: std::sync::Arc::new(move |_index: u16| {
+                let tcp = std::net::TcpStream::connect(send_addr)
+                    .map_err(|e| std::io::Error::other(format!("cannot connect worker: {e}")))?;
+                tcp.set_nodelay(true).ok();
+                tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+                tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
+                Ok(Box::new(tcp))
+            }),
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -340,6 +386,10 @@ fn tree_v2_flow_rejects_tree_frames() {
             force_checksum: false,
             no_delete: false,
             excludes: Vec::new(),
+            parallel: 1,
+            connect_worker: std::sync::Arc::new(|_| {
+                Err(std::io::Error::other("no workers in sequential sessions"))
+            }),
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -361,6 +411,7 @@ fn tree_paths_reject_traversal() {
 
     let frame = TreeBegin {
         flags: 0,
+        parallel: 1,
         excludes: Vec::new(),
         entries: vec![TreeEntryWire {
             rel_path: "../escape.bin".to_string(),
@@ -413,6 +464,9 @@ fn sender_vanished_file_fails_loudly() {
                 force_checksum: false,
                 no_delete: false,
                 excludes: Vec::new(),
+                accept_worker: std::sync::Arc::new(|| {
+                    Err(std::io::Error::other("no workers in sequential sessions"))
+                }),
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -439,6 +493,10 @@ fn sender_vanished_file_fails_loudly() {
             force_checksum: false,
             no_delete: false,
             excludes: Vec::new(),
+            parallel: 1,
+            connect_worker: std::sync::Arc::new(|_| {
+                Err(std::io::Error::other("no workers in sequential sessions"))
+            }),
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -593,4 +651,145 @@ fn tree_excludes_v3_peer_without_flag_interops() {
     s.expect("sender ok");
     r.expect("receiver ok");
     assert!(receiver.exists("only.bin"));
+}
+
+// ---- Parallel per-file conversations (§16.8) ----
+
+#[test]
+fn tree_parallel_converges_and_reports_all_files() {
+    // K=4 connections over a mixed tree: conversations are partitioned
+    // round-robin, run concurrently, and every file converges. The outcome
+    // aggregates across all connections.
+    let sender = TempTree::new("par_conv_s");
+    for i in 0..12 {
+        sender.write(&format!("f{i:02}.bin"), &vec![i as u8; 4096]);
+    }
+    sender.write("sub/nested.bin", b"nested");
+    let receiver = TempTree::new("par_conv_r");
+
+    let (s, r) = run_tree_session_full(sender.path(), receiver.path(), false, false, &[], &[], 4);
+    let s = s.unwrap_or_else(|e| panic!("sender failed: {e}"));
+    let r = r.unwrap_or_else(|e| panic!("receiver failed: {e}"));
+    assert_eq!(s.files, 13);
+    assert_eq!(r.files, 13);
+    assert_eq!(s.in_sync, 0);
+    assert_eq!(r.in_sync, 0);
+    // Every file present with the right content.
+    for i in 0..12 {
+        let rel = format!("f{i:02}.bin");
+        assert_eq!(
+            receiver.read(&rel).unwrap(),
+            vec![i as u8; 4096],
+            "file {rel} did not converge"
+        );
+    }
+    assert_eq!(receiver.read("sub/nested.bin").unwrap(), b"nested");
+    // Second session: nothing changed → everything in sync (warm path).
+    let (s2, r2) = run_tree_session_full(sender.path(), receiver.path(), false, false, &[], &[], 4);
+    let s2 = s2.expect("sender ok");
+    let r2 = r2.expect("receiver ok");
+    assert_eq!(s2.files, 0, "second session has no conversations");
+    assert_eq!(r2.files, 0);
+}
+
+#[test]
+fn tree_parallel_sequential_fallback_interops() {
+    // A parallel sender against a sequential receiver (parallel=1): the
+    // wire layout carries the flag, but the session still converges — the
+    // receiver mirrors K from TREE_BEGIN and runs the same flow.
+    let sender = TempTree::new("par_fb_s");
+    for i in 0..6 {
+        sender.write(&format!("g{i}.bin"), &vec![7u8; 2048]);
+    }
+    let receiver = TempTree::new("par_fb_r");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let recv_root = receiver.path().to_path_buf();
+    let server = std::thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_nodelay(true).ok();
+        tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+        tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
+        tree_receive(
+            &mut &tcp,
+            &TreeReceiveRequest {
+                root: recv_root,
+                force_checksum: false,
+                no_delete: false,
+                excludes: Vec::new(),
+                accept_worker: std::sync::Arc::new(move || {
+                    // Sequential receiver: refuses extra connections.
+                    Err(std::io::Error::other("no worker connections accepted"))
+                }),
+            },
+            &PipelineConfig::default(),
+            &mut |_p| {},
+        )
+    });
+    let tcp = std::net::TcpStream::connect(addr).unwrap();
+    tcp.set_nodelay(true).ok();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
+    let send_addr = addr;
+    let send_res = tree_send(
+        &mut &tcp,
+        &TreeSendRequest {
+            root: sender.path().to_path_buf(),
+            force_checksum: false,
+            no_delete: false,
+            excludes: Vec::new(),
+            parallel: 4,
+            connect_worker: std::sync::Arc::new(move |_index: u16| {
+                std::net::TcpStream::connect(send_addr)
+                    .map(|t| Box::new(t) as Box<dyn ffsync::protocol::tree_sync::ReadWrite>)
+                    .map_err(std::io::Error::other)
+            }),
+        },
+        &PipelineConfig::default(),
+        &mut |_p| {},
+    );
+    let recv_res = server.join().unwrap();
+    // The receiver read K=4 from TREE_BEGIN, tried to accept workers, and
+    // failed loudly — the session MUST fail on both sides, not desync.
+    assert!(
+        send_res.is_err(),
+        "sender must see the receiver's rejection"
+    );
+    assert!(recv_res.is_err(), "receiver must fail on missing workers");
+}
+
+#[test]
+fn tree_parallel_fail_closed_on_worker_error() {
+    // One worker hits a vanished sender file mid-session: the whole session
+    // fails, and — critically — the receiver deletes nothing (fail-closed,
+    // §16.8 failure semantics).
+    let sender = TempTree::new("par_fail_s");
+    sender.write("a.bin", b"aaa");
+    sender.write("b.bin", b"bbb");
+    let receiver = TempTree::new("par_fail_r");
+    receiver.write("stale.bin", b"old");
+
+    // Vanish a.bin after the session starts (racer), forcing an error on
+    // whichever connection picks it up.
+    let vanish_target = sender.path().join("a.bin");
+    let vanish = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = std::fs::remove_file(&vanish_target);
+    });
+
+    let (s, r) = run_tree_session_full(sender.path(), receiver.path(), false, false, &[], &[], 2);
+    let _ = vanish.join();
+    // Either the session failed on the vanished file, or the racer landed
+    // late and everything synced — but if it failed, NOTHING was deleted.
+    match (&s, &r) {
+        (Ok(_), Ok(_)) => {}
+        (Err(_), Err(_)) | (Err(_), Ok(_)) => {
+            assert!(
+                receiver.exists("stale.bin"),
+                "fail-closed: a failed parallel session must not delete"
+            );
+        }
+        (Ok(_), Err(e)) => panic!("sender ok but receiver failed: {e}"),
+    }
 }

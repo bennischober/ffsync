@@ -5,10 +5,9 @@ version 1: **one file pair, two peers, one TCP connection**); it tracks the
 protocol across versions — changes ship with a `VERSION` bump and are
 recorded in the relevant sections. Current version: **3** (v0.2: HELLO
 gained `file_mtime_nanos`, see §3/§4; v0.3 adds the tree envelope, see
-§16). This document is implementation-facing: it should contain everything
-needed to build the sync without re-deriving design arguments. The
-reasoning lives in `Positioning.md` and `Design Decisions.md` (referenced
-as D-numbers).
+§16; v0.4/v0.5 work extends TREE_BEGIN additively under flag bits —
+§16.7 excludes, §16.8 parallel sessions — without a VERSION bump, since
+unknown flag bits are rejected and the default layouts are unchanged).
 
 ## 1. Scope and non-goals
 
@@ -579,4 +578,90 @@ any of its ancestor directories matches one (an excluded directory
 protects its whole subtree from deletion). Conflict resolution (§16.3) is
 not gated on excludes — the sender's kind change is explicit and
 authoritative.
+
+### 16.8 Parallel per-file conversations (v4 flag, D13 step 1)
+
+A tree session's conversations are independent of each other: each is a
+complete §4–§8 state machine over one path. Sequential execution costs
+~3 round trips per conversation (HELLO, manifest→plan, VERIFY→COMMIT_ACK)
+— on a WAN, a tree with many changed files spends most of its wall time
+waiting. §14.4 reserved parallel streams for exactly this.
+
+**K connections, one conversation at a time each.** The session runs over
+K connections total: connection 0 is the *control* connection (the one
+TREE_BEGIN/TREE_END and the delete pass live on), connections 1..K−1 are
+*worker* connections. Each connection carries at most one conversation at
+a time; the per-file frames themselves are byte-identical to §4–§8. The
+sender partitions its conversation set round-robin over the sorted list
+(conversation *i* → connection *i* mod K — deterministic, reproducible).
+
+**Wire form.** TREE_BEGIN gains flag bit 3 `parallel`. When set, the
+payload carries `parallel u16` (K, the total connection count) right
+after `flags` and before the optional excludes section:
+
+```
+flags u16
+parallel u16      (only when flag bit 3 set; 2..=16)
+[pattern section] (only when flag bit 2 set)
+entry_count u64 ...
+```
+
+`parallel` absent (flag unset) means K=1 — the §16.2 layout, unchanged.
+**A peer MUST reject unknown flag bits** (Malformed) — flag-gated fields
+are only safe if unknown bits are errors. A v3 peer receiving a parallel
+TREE_BEGIN misparses and fails loudly at TREE_BEGIN, before any tree
+state exists (same rejection semantics as v2↔v3); a v4 peer with
+`--parallel 1` interoperates with v3 peers fully. K is
+sender-authoritative; the receiver mirrors the value in its own
+TREE_BEGIN. Valid range 2..=16 (a session announcing 0, 1, or >16 is a
+protocol error).
+
+**New frames (worker connections only).**
+
+```
+S→R: TREE_WORKER (worker_index u16, 1..K-1)   on each worker connection
+R→S: TREE_WORKER_ACK (empty)
+S→R: TREE_FILE (rel path, u16 len + UTF-8)    before each conversation
+      ... §4–§8 per-file conversation, unchanged ...
+```
+
+The sender opens its worker connections AFTER sending TREE_BEGIN on the
+control connection (the receiver accepts them after reading TREE_BEGIN
+and scanning its own tree — no deadlock: each side's blocking step is
+unblocked by the peer's next step). Workers connect in ARBITRARY order
+(the sender's threads race); the receiver accepts any connection, reads
+its TREE_WORKER, places it by the ANNOUNCED index, and verifies the set
+is exactly {1..K−1} with no duplicates. Each worker is ACKed before the
+conversation phase starts.
+
+**Membership, not order (§16.4 amendment for parallel sessions).** In a
+parallel session the receiver does NOT expect conversations in manifest
+order. Every conversation — on worker connections AND the control
+connection — is named by a preceding TREE_FILE; the receiver checks the
+path is in its expected conversation set and removes it — every path
+exactly once. The control connection's service loop is the receiver's
+main thread: it reads TREE_FILEs (serving each) until the sender's
+TREE_END arrives THERE — in a parallel session the control connection
+carries partition 0's conversations plus that TREE_END, so the §16.5
+barrier read is already satisfied when the conversations phase ends (the
+receiver then joins its worker threads, requires the membership set to
+be empty, and proceeds to deletions). At session end the set must be
+empty (a worker that died leaves it non-empty, but then the session has
+already failed with that worker's error). Within one connection,
+conversations still run in the sender's sorted partition order.
+
+**Failure semantics (fail-closed, unchanged in spirit).** A failed
+conversation aborts its connection (ERROR `Aborted`, §16.4). Workers stop
+before *starting* the next conversation once any worker has failed
+(in-flight conversations finish). The sender then reports ERROR on the
+control connection; the receiver applies deletions only after ALL
+conversations succeeded — a failed session never destroys data. Tree
+flags, excludes, resume, warm indexes, and mtime preservation are
+per-conversation concerns and work unchanged on any connection.
+
+**Not async.** This is native threads + blocking I/O per connection —
+no async runtime enters the tree (the D13 amendment's constraint). QUIC
+(D13 step 2) can later substitute the transport: a QUIC stream is
+`Read + Write`, so worker connections map onto streams without touching
+this layer again.
 

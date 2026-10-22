@@ -102,6 +102,14 @@ struct BenchConfig {
     /// Run the tree-sync simulation (D17): multi-file fixture, both sides
     /// through the real scan + triage, per-file delta and warm/cold starts.
     tree: bool,
+    /// Run the latency simulation: REAL tree sessions over an in-process
+    /// duplex that delays every direction (§16.8 measurement) — sequential
+    /// vs parallel conversation execution at a configurable RTT.
+    latency: bool,
+    /// Simulated RTT in milliseconds for `--latency` (default 30).
+    rtt_ms: u64,
+    /// Parallel connection counts swept by `--latency` (default 1,4,8).
+    parallel_counts: Vec<u16>,
 }
 
 impl BenchConfig {
@@ -274,6 +282,9 @@ fn parse_args() -> BenchConfig {
         disconnect: false,
         warm: false,
         tree: false,
+        latency: false,
+        rtt_ms: 30,
+        parallel_counts: Vec::new(),
     };
 
     let mut args = std::env::args().skip(1);
@@ -321,6 +332,32 @@ fn parse_args() -> BenchConfig {
             "--disconnect" => cfg.disconnect = true,
             "--warm" => cfg.warm = true,
             "--tree" => cfg.tree = true,
+            "--latency" => cfg.latency = true,
+            "--rtt-ms" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| die("--rtt-ms requires a number"));
+                cfg.rtt_ms = value
+                    .parse()
+                    .unwrap_or_else(|_| die(&format!("invalid --rtt-ms value: {}", value)));
+            }
+            "--parallel" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| die("--parallel requires a comma list, e.g. 1,4,8"));
+                let counts: Vec<u16> = value
+                    .split(',')
+                    .map(|p| {
+                        p.trim()
+                            .parse()
+                            .unwrap_or_else(|_| die(&format!("invalid --parallel value: {}", p)))
+                    })
+                    .collect();
+                if counts.iter().any(|c| *c < 1 || *c > 16) {
+                    die("--parallel counts must be 1..=16");
+                }
+                cfg.parallel_counts = counts;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -1219,6 +1256,250 @@ fn simulate_tree_session(
     })
 }
 
+// ---- Latency simulation (§16.8 measurement) ----
+//
+// Real tree sessions over an in-process duplex that delays each direction
+// by RTT/2 (a read that finds data queued sleeps that long before
+// returning it, coalescing anything already queued like TCP does for
+// back-to-back writes). This models a WAN link: request/response
+// conversations cost real round trips; scan and I/O cost what they cost.
+//
+// The numbers are a MODEL, not a network measurement — the point is the
+// *ratio* between sequential and parallel conversation execution at the
+// same simulated RTT, which is what §16.8's design decision rests on.
+
+/// One end of a latency-injecting in-memory duplex.
+struct LatencyEnd {
+    /// Half the RTT: applied before returning queued data on a read.
+    one_way: Duration,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// Partially delivered chunk (a read may consume less than a chunk).
+    pending: Vec<u8>,
+    pending_pos: usize,
+}
+
+impl io::Read for LatencyEnd {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.pending = chunk;
+                    // Coalesce anything the peer already wrote (models TCP
+                    // batching back-to-back frame writes into one flight).
+                    while let Ok(more) = self.rx.try_recv() {
+                        self.pending.extend_from_slice(&more);
+                    }
+                    if self.one_way > Duration::ZERO {
+                        std::thread::sleep(self.one_way);
+                    }
+                }
+                Err(_) => return Ok(0), // peer dropped: clean EOF
+            }
+        }
+        let available = self.pending.len() - self.pending_pos;
+        let n = available.min(buf.len());
+        buf[..n].copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
+        self.pending_pos += n;
+        Ok(n)
+    }
+}
+
+impl io::Write for LatencyEnd {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Bounded channel: full = the peer is not reading — exactly the
+        // backpressure a TCP socket buffer gives; block like one. A dropped
+        // peer (its receiving end gone) surfaces as Disconnected.
+        match self.tx.send(buf.to_vec()) {
+            Ok(()) => Ok(buf.len()),
+            Err(_) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer is gone")),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Builds both ends of a latency duplex: `ends.0` is the sender's, `ends.1`
+/// the receiver's. Data written to one end appears on the other after
+/// one_way (RTT/2).
+fn latency_pair(one_way: Duration) -> (LatencyEnd, LatencyEnd) {
+    let (a_tx, b_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+    let (b_tx, a_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+    (
+        LatencyEnd {
+            one_way,
+            rx: a_rx,
+            tx: a_tx,
+            pending: Vec::new(),
+            pending_pos: 0,
+        },
+        LatencyEnd {
+            one_way,
+            rx: b_rx,
+            tx: b_tx,
+            pending: Vec::new(),
+            pending_pos: 0,
+        },
+    )
+}
+
+/// One session measurement: runs REAL tree_send/tree_receive over K
+/// latency-duplex pairs on two threads; returns the wall time.
+fn run_one_latency_session(
+    sender_root: &Path,
+    receiver_root: &Path,
+    rtt: Duration,
+    parallel: u16,
+) -> io::Result<Duration> {
+    use ffsync::protocol::tree_sync::{
+        ReadWrite, TreeReceiveRequest, TreeSendRequest, tree_receive, tree_send,
+    };
+
+    let mut pairs: Vec<(LatencyEnd, LatencyEnd)> = Vec::new();
+    for _ in 0..parallel {
+        pairs.push(latency_pair(rtt));
+    }
+
+    let send_root = sender_root.to_path_buf();
+    let recv_root = receiver_root.to_path_buf();
+    let send_addrs: Vec<LatencyEnd> = Vec::new();
+
+    let _ = send_addrs;
+    let mut sender_ends: Vec<LatencyEnd> = Vec::new();
+    let mut receiver_ends: Vec<LatencyEnd> = Vec::new();
+    for (s, r) in pairs {
+        sender_ends.push(s);
+        receiver_ends.push(r);
+    }
+    // The closure that hands out receiver-side worker ends is called from
+    // the accept loop sequentially but must be Send+Sync: share the ends
+    // through a Mutex.
+    let receiver_ends = std::sync::Mutex::new(receiver_ends);
+    let receiver_ends_for_closure = std::sync::Arc::new(receiver_ends);
+
+    let recv_root2 = recv_root;
+    let ends2 = std::sync::Arc::clone(&receiver_ends_for_closure);
+    let recv_thread = std::thread::spawn(move || -> Result<
+        ffsync::protocol::tree_sync::TreeOutcome,
+        ffsync::protocol::sync::SyncError,
+    > {
+        let receiver_ends = ends2;
+        // Take the control end FIRST, dropping the lock before tree_receive
+        // runs (a temporary guard on an argument would live for the whole
+        // call and deadlock the accept closure).
+        let mut control_end = receiver_ends.lock().unwrap().remove(0);
+        tree_receive(
+            &mut control_end,
+            &TreeReceiveRequest {
+                root: recv_root2,
+                force_checksum: false,
+                no_delete: false,
+                excludes: Vec::new(),
+                accept_worker: {
+                    let ends = std::sync::Arc::clone(&receiver_ends);
+                    std::sync::Arc::new(move || {
+                        Ok(Box::new(ends.lock().unwrap().remove(0)) as Box<dyn ReadWrite>)
+                    })
+                },
+            },
+            &PipelineConfig::default(),
+            &mut |_p| {},
+        )
+    });
+
+    let t = Instant::now();
+    let send_res = tree_send(
+        &mut sender_ends.remove(0),
+        &TreeSendRequest {
+            root: send_root,
+            force_checksum: false,
+            no_delete: false,
+            excludes: Vec::new(),
+            parallel,
+            connect_worker: {
+                let ends = std::sync::Mutex::new(sender_ends);
+                std::sync::Arc::new(move |_| {
+                    Ok(Box::new(ends.lock().unwrap().remove(0)) as Box<dyn ReadWrite>)
+                })
+            },
+        },
+        &PipelineConfig::default(),
+        &mut |_p| {},
+    );
+    let elapsed = t.elapsed();
+    let recv_res = recv_thread.join().unwrap();
+    if let Err(e) = send_res {
+        return Err(io::Error::other(format!("sender failed: {e}")));
+    }
+    if let Err(e) = recv_res {
+        return Err(io::Error::other(format!("receiver failed: {e}")));
+    }
+    Ok(elapsed)
+}
+
+/// The §16.8 measurement: diverged tree fixture, sessions at the configured
+/// RTT for each parallel count (1 = sequential baseline).
+fn run_latency_simulation(cfg: &BenchConfig, _pipeline: &PipelineConfig) -> io::Result<()> {
+    println!();
+    println!("==== latency simulation (§16.8): sequential vs parallel conversations ====");
+    let mut rng = match cfg.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x1CE_5EED),
+        None => StdRng::from_rng(&mut rand::rng()),
+    };
+
+    let sender = cfg.out_dir.join("lat_sender");
+    let receiver = cfg.out_dir.join("lat_receiver");
+    let _ = fs::remove_dir_all(&sender);
+    let _ = fs::remove_dir_all(&receiver);
+
+    // ~100 files × ~32 KiB: conversation-count dominated (the RTT regime),
+    // not bandwidth dominated. All files diverge (receiver starts empty) —
+    // the worst case for serialized round trips.
+    let total = generate_tree_fixture(&sender, &mut rng, 8, 100)?;
+    fs::create_dir_all(&receiver)?;
+
+    println!(
+        "fixture: 100 files ({}), receiver starts empty, simulated RTT = {} ms",
+        fmt_bytes(total),
+        cfg.rtt_ms
+    );
+    println!("  (model: each direction delayed by RTT/2, reads coalesce queued data;");
+    println!("   session wall time ≈ scan+I/O + conversations × round trips × RTT)");
+
+    let counts: Vec<u16> = if cfg.parallel_counts.is_empty() {
+        vec![1, 4, 8]
+    } else {
+        cfg.parallel_counts.clone()
+    };
+
+    println!();
+    println!(
+        "  {:>10} {:>14} {:>16}",
+        "parallel", "wall time", "vs sequential"
+    );
+    let mut baseline: Option<Duration> = None;
+    for k in counts {
+        // Fresh receiver per measurement: every session is the full-transfer
+        // worst case (comparable across K).
+        let _ = fs::remove_dir_all(&receiver);
+        fs::create_dir_all(&receiver)?;
+        let elapsed =
+            run_one_latency_session(&sender, &receiver, Duration::from_millis(cfg.rtt_ms), k)?;
+        let rel = match baseline {
+            None => {
+                baseline = Some(elapsed);
+                "baseline".to_string()
+            }
+            Some(b) => format!("{:.2}x", b.as_secs_f64() / elapsed.as_secs_f64()),
+        };
+        println!("  {:>10} {:>14} {:>16}", k, fmt_ms(elapsed), rel);
+    }
+    Ok(())
+}
+
 fn print_tree_stats(label: &str, s: &TreeStats) {
     println!();
     println!("---- {} ----", label);
@@ -2006,6 +2287,10 @@ fn main() -> io::Result<()> {
 
     if cfg.tree {
         run_tree_simulation(&cfg, &pipeline)?;
+    }
+
+    if cfg.latency {
+        run_latency_simulation(&cfg, &pipeline)?;
     }
 
     let rsync = if cfg.rsync {

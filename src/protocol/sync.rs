@@ -166,7 +166,11 @@ fn unix_secs(t: Option<SystemTime>) -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn send_error_and_finish(out: &mut impl Write, code: ErrorCode, msg: &str) -> SyncError {
+pub(crate) fn send_error_and_finish(
+    out: &mut (impl Write + ?Sized),
+    code: ErrorCode,
+    msg: &str,
+) -> SyncError {
     let frame = message::encode_error(code, msg);
     let _ = frame.and_then(|f| f.encode(out));
     let _ = out.flush();

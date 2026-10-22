@@ -23,8 +23,9 @@ commands.
 > conversations, synced files adopt the sender's mtime, and a run with
 > nothing changed reads metadata only. Deletions of receiver-only files
 > apply after every transfer succeeded, opt-out with `--no-delete`.
-> Exclude patterns filter tree sessions (§16.7). Not implemented yet:
-> parallel streams (QUIC). See [roadmap](#roadmap) below.
+> Exclude patterns filter tree sessions (§16.7). Parallel per-file
+> conversations (`--parallel K`, §16.8) cut WAN sync time by the connection
+> count; QUIC transport remains future work. See [roadmap](#roadmap) below.
 
 ## Why
 
@@ -200,9 +201,23 @@ depth; `[a-z]`/`[!a-z]` are character classes; a pattern containing `/`
 matches from the tree root, without it matches the basename at any depth;
 a trailing `/` restricts to directories. The sender's patterns rule the
 session (they travel in the protocol, so both peers filter identically);
-a receiver's own patterns additionally protect matching paths — and
-everything under an excluded directory — from deletion (e.g. keep local
+a receiver's own patterns additionally protect matching paths - and
+everything under an excluded directory - from deletion (e.g. keep local
 `secrets/` while syncing everything else).
+
+**Parallel tree sessions** (`--parallel <K>`, 2..=16) run per-file
+conversations over K connections at once:
+
+```powershell
+# Sender: 4 connections; the receiver accepts them automatically.
+ffsync send ./project 192.168.1.20:7788 --parallel 4
+```
+
+Each connection authenticates with the same TLS fingerprint pinning; a
+failed conversation fails the whole session and the receiver deletes
+nothing. On a WAN the wall-clock saving is roughly the connection count
+(measured: 3.4× at K=4, 6.1× at K=8 on a 100-file transfer at 30 ms RTT);
+on a LAN it changes little (the metadata scan already dominates there).
 
 **Transport security is on by default** (D16): both peers generate a
 self-signed certificate on first run and authenticate each other by
@@ -350,9 +365,16 @@ The reasoning is the product; it is all recorded:
   in the protocol so both peers filter identically, and a receiver's own
   patterns protect paths from deletion. No negation syntax yet
   (re-includes may come later).
-- **Next - parallel per-file streams / QUIC transport** (D13): connection
-  migration for the "friend over the internet" case; plain TCP and
-  TLS-over-TCP stay available.
+- **Done (unreleased) - parallel per-file conversations (§16.8, D13 step
+  1):** `--parallel K` spreads a tree session's conversations over K
+  connections (native threads, no async); measured 3.4×–6.1× on a
+  100-file full transfer at 30 ms simulated RTT. QUIC (one connection,
+  K streams + connection migration) can now slot in as a transport swap.
+- **Next - QUIC transport (D13 step 2)**: connection migration for the
+  "friend over the internet" case; the parallel-session layer is
+  transport-agnostic, so QUIC streams substitute worker connections
+  without touching the session logic. Plain TCP and TLS-over-TCP stay
+  available.
 - **Later - SeqCDC and other chunkers** as they mature; the `Chunker` trait
   makes swapping cheap (registered as F2).
 - **Later - permissions/xattrs/symlinks as first-class metadata** (D9).

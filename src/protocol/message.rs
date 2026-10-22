@@ -505,12 +505,16 @@ pub struct TreeEntryWire {
     pub mtime_nanos: u32,
 }
 
-/// TREE_BEGIN payload: flags u16, then — only when the `excludes` flag
-/// (bit 2, §16.7) is set — the pattern section, then `entry_count u64` and
-/// the entries (§16.2 layout).
+/// TREE_BEGIN payload: flags u16, then — only when the `parallel` flag
+/// (bit 3, §16.8) is set — `parallel u16`, then — only when the `excludes`
+/// flag (bit 2, §16.7) is set — the pattern section, then `entry_count u64`
+/// and the entries (§16.2 layout).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeBegin {
     pub flags: u16,
+    /// Total connection count (only meaningful with the parallel flag set;
+    /// 1 = sequential session, §16.8).
+    pub parallel: u16,
     /// Exclude patterns (present only when `TREE_FLAG_EXCLUDES` is set).
     pub excludes: Vec<String>,
     pub entries: Vec<TreeEntryWire>,
@@ -519,11 +523,25 @@ pub struct TreeBegin {
 /// TREE_BEGIN flag bit 2: the payload carries the exclude-pattern section
 /// (§16.7). Defined here next to the codec whose layout it gates.
 pub const TREE_FLAG_EXCLUDES: u16 = 1 << 2;
+/// TREE_BEGIN flag bit 3: the payload carries the `parallel u16` field
+/// (§16.8). Flag-gated fields are only safe when unknown flag bits are
+/// rejected — the decoder enforces that.
+pub const TREE_FLAG_PARALLEL: u16 = 1 << 3;
+/// Tree flags a decoder must reject as unknown (§16.8): everything beyond
+/// the bits this protocol version defines. CHECKSUM/NO_DELETE live in
+/// `crate::tree` next to the triage that consumes them.
+const TREE_FLAG_KNOWN: u16 = crate::tree::TREE_FLAG_CHECKSUM
+    | crate::tree::TREE_FLAG_NO_DELETE
+    | TREE_FLAG_EXCLUDES
+    | TREE_FLAG_PARALLEL;
 
 impl TreeBegin {
     pub fn into_frame(self) -> io::Result<Frame> {
         let mut payload = Vec::with_capacity(10 + self.entries.len() * 24);
         payload.extend_from_slice(&self.flags.to_le_bytes());
+        if self.flags & TREE_FLAG_PARALLEL != 0 {
+            payload.extend_from_slice(&self.parallel.to_le_bytes());
+        }
         if self.flags & TREE_FLAG_EXCLUDES != 0 {
             payload.extend_from_slice(&(self.excludes.len() as u32).to_le_bytes());
             for pat in &self.excludes {
@@ -564,6 +582,17 @@ impl TreeBegin {
         let p = &frame.payload[..];
         let mut pos = 0usize;
         let flags = read_u16_le(p, &mut pos)?;
+        if flags & !TREE_FLAG_KNOWN != 0 {
+            // Flag-gated fields (§16.7/§16.8) are only safe when unknown
+            // bits are rejected: a newer peer's extra bit would otherwise
+            // silently change what we parse out of this payload.
+            return Err(MessageError::Malformed("TREE_BEGIN has unknown flag bits"));
+        }
+        let parallel = if flags & TREE_FLAG_PARALLEL != 0 {
+            read_u16_le(p, &mut pos)?
+        } else {
+            1
+        };
         let mut excludes = Vec::new();
         if flags & TREE_FLAG_EXCLUDES != 0 {
             let pat_count = read_u32_le(p, &mut pos)? as usize;
@@ -618,9 +647,82 @@ impl TreeBegin {
         }
         Ok(Self {
             flags,
+            parallel,
             excludes,
             entries,
         })
+    }
+}
+
+/// TREE_WORKER (v4, §16.8): sender→receiver on a worker connection,
+/// announcing the connection's index. Payload: `worker_index u16`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeWorker {
+    pub worker_index: u16,
+}
+
+impl TreeWorker {
+    pub fn into_frame(self) -> io::Result<Frame> {
+        Ok(Frame::new(
+            framing::T_TREE_WORKER,
+            self.worker_index.to_le_bytes().to_vec(),
+        ))
+    }
+
+    pub fn from_frame(frame: Frame) -> Result<Self, MessageError> {
+        if frame.ftype != framing::T_TREE_WORKER {
+            return Err(MessageError::UnexpectedType(frame.ftype));
+        }
+        let p = &frame.payload[..];
+        if p.len() != 2 {
+            return Err(MessageError::Malformed(
+                "TREE_WORKER payload must be 2 bytes",
+            ));
+        }
+        Ok(Self {
+            worker_index: u16::from_le_bytes([p[0], p[1]]),
+        })
+    }
+}
+
+/// TREE_FILE (v4, §16.8): sender→receiver before each conversation,
+/// naming the path about to be synced. In a parallel session the receiver
+/// validates membership (expected set, exactly once) instead of order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeFile {
+    pub rel_path: String,
+}
+
+impl TreeFile {
+    pub fn into_frame(self) -> io::Result<Frame> {
+        let path_bytes = self.rel_path.as_bytes();
+        if path_bytes.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tree path longer than {} bytes", u16::MAX),
+            ));
+        }
+        let mut payload = Vec::with_capacity(2 + path_bytes.len());
+        payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        payload.extend_from_slice(path_bytes);
+        Ok(Frame::new(framing::T_TREE_FILE, payload))
+    }
+
+    pub fn from_frame(frame: Frame) -> Result<Self, MessageError> {
+        if frame.ftype != framing::T_TREE_FILE {
+            return Err(MessageError::UnexpectedType(frame.ftype));
+        }
+        let p = &frame.payload[..];
+        let mut pos = 0usize;
+        let path_len = read_u16_le(p, &mut pos)? as usize;
+        let path = read_bytes(p, &mut pos, path_len)?;
+        let rel_path = std::str::from_utf8(path)
+            .map_err(|_| MessageError::Malformed("tree path is not UTF-8"))?
+            .to_string();
+        if pos != p.len() {
+            return Err(MessageError::Malformed("trailing bytes in TREE_FILE"));
+        }
+        Ok(Self { rel_path })
     }
 }
 

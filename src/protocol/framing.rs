@@ -41,6 +41,14 @@ pub const T_TREE_END: u8 = 0x0D;
 /// receiver reads exactly one frame after HELLO (NOT_MODIFIED or FILE_SYNC)
 /// instead of racing manifest writes against a fast-path sender.
 pub const T_FILE_SYNC: u8 = 0x0E;
+/// Frame type byte for `TREE_WORKER` (v4, §16.8): announces a worker
+/// connection (worker_index) and is ACKed before conversations start.
+pub const T_TREE_WORKER: u8 = 0x0F;
+/// Frame type byte for `TREE_FILE` (v4, §16.8): names the path of the next
+/// conversation on a (worker) connection. Replaces the implicit sequential
+/// order of a parallel session — the receiver validates membership, not
+/// order.
+pub const T_TREE_FILE: u8 = 0x10;
 
 /// A raw frame: type byte plus payload. Typed frames are built on top of
 /// this in [`super::message`]; the codec layer only knows the envelope.
@@ -56,7 +64,7 @@ impl Frame {
     }
 
     /// Encodes the frame into `out`.
-    pub fn encode(&self, out: &mut impl Write) -> io::Result<()> {
+    pub fn encode(&self, out: &mut (impl Write + ?Sized)) -> io::Result<()> {
         if self.payload.len() as u64 > MAX_PAYLOAD as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -114,7 +122,7 @@ impl From<io::Error> for FrameError {
 /// Reads one frame. Clean EOF before any byte of a frame is reported as
 /// `Err(FrameError::Eof)` (callers match on it explicitly); a header or
 /// payload that ends mid-frame is `FrameError::Truncated`.
-pub fn read_frame(inp: &mut impl Read) -> Result<Frame, FrameError> {
+pub fn read_frame(inp: &mut (impl Read + ?Sized)) -> Result<Frame, FrameError> {
     // Read the header byte-wise so we can distinguish "stream ended cleanly
     // between frames" (Eof) from "stream ended inside a frame" (Truncated):
     // read_exact consumes a partial header without reporting how many bytes

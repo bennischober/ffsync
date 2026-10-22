@@ -9,7 +9,6 @@
 //! switches to tree sync (v0.3): the CONTENTS of the directory are synced
 //! (no trailing-slash semantics; `dir` and `dir/` are the same thing).
 
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -19,7 +18,8 @@ use ffsync::protocol::sync::{
     Progress, ReceiveRequest, SendRequest, SyncError, SyncOutcome, receive, send,
 };
 use ffsync::protocol::tree_sync::{
-    TreeOutcome, TreeProgress, TreeReceiveRequest, TreeSendRequest, tree_receive, tree_send,
+    ReadWrite, TreeOutcome, TreeProgress, TreeReceiveRequest, TreeSendRequest, tree_receive,
+    tree_send,
 };
 
 /// Default I/O timeout: a peer that sends nothing for this long kills the
@@ -293,13 +293,15 @@ fn set_stream_timeouts(stream: &TcpStream, secs: u64) {
 }
 
 /// Shared CLI flags for send/receive (tree and single-file runners pick
-/// what they need; single-file mode rejects excludes loudly).
+/// what they need; single-file mode rejects excludes and parallel loudly).
 struct CliOptions {
     force_checksum: bool,
     plaintext: bool,
     trust_flag: Option<String>,
     no_delete: bool,
     excludes: Vec<String>,
+    /// Parallel session width (§16.8); 1 = sequential (default).
+    parallel: u16,
 }
 
 fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()> {
@@ -317,11 +319,17 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
             opts.plaintext,
             opts.trust_flag,
             opts.excludes,
+            opts.parallel,
         );
     }
     if !opts.excludes.is_empty() {
         return Err(std::io::Error::other(
             "--exclude/--exclude-from apply to tree mode only (pass a directory)",
+        ));
+    }
+    if opts.parallel > 1 {
+        return Err(std::io::Error::other(
+            "--parallel applies to tree mode only (pass a directory)",
         ));
     }
     if !file.is_file() {
@@ -400,22 +408,26 @@ fn run_receive(
         trust_flag,
         no_delete,
         excludes,
+        parallel: _parallel, // single-file receive has no parallel sessions
     } = opts;
+    let listener = TcpListener::bind(("0.0.0.0", port))?;
+    let bound = listener.local_addr()?.port();
     if file.is_dir() {
         if from.is_some() {
             return Err(std::io::Error::other(
                 "--from is single-file only (tree sync has no old-file concept)",
             ));
         }
-        return run_tree_receive(
-            file,
-            port,
+        return run_tree_receive(TreeReceiveOpts {
+            root: file,
             force_checksum,
             plaintext,
             trust_flag,
             no_delete,
             excludes,
-        );
+            listener,
+            bound,
+        });
     }
     if !excludes.is_empty() {
         return Err(std::io::Error::other(
@@ -429,8 +441,6 @@ fn run_receive(
             local_source.display()
         )));
     }
-    let listener = TcpListener::bind(("0.0.0.0", port))?;
-    let bound = listener.local_addr()?.port();
     if port == 0 {
         println!("listening on 0.0.0.0:{bound} (OS-assigned port) ...");
     } else {
@@ -491,6 +501,7 @@ fn run_tree_send(
     plaintext: bool,
     trust_flag: Option<String>,
     excludes: Vec<String>,
+    parallel: u16,
 ) -> std::io::Result<()> {
     let (host, port) = parse_host_port(&addr);
     println!("connecting to {host}:{port} ...");
@@ -501,14 +512,25 @@ fn run_tree_send(
     })?;
     tcp.set_nodelay(true).ok();
     set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-    let mut stream = connect_authenticated(tcp, &host, true, plaintext, trust_flag)?;
+    let mut stream = connect_authenticated(tcp, &host, true, plaintext, trust_flag.clone())?;
 
     let display = &mut TreeDisplay::new();
+    // Worker connections (§16.8): same host/port, same TLS setup, one per
+    // worker index. Opened by the state machine after TREE_BEGIN.
+    let connect_worker = move |index: u16| -> std::io::Result<Box<dyn ReadWrite>> {
+        let tcp = TcpStream::connect((host.as_str(), port))
+            .map_err(|e| std::io::Error::other(format!("cannot connect worker {index}: {e}")))?;
+        tcp.set_nodelay(true).ok();
+        set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+        connect_authenticated(tcp, &host, true, plaintext, trust_flag.clone())
+    };
     let request = TreeSendRequest {
         root,
         force_checksum,
         no_delete: false, // the sender never deletes; the flag is receiver-side
         excludes,
+        parallel,
+        connect_worker: std::sync::Arc::new(connect_worker),
     };
     let pipeline = PipelineConfig::default();
     let outcome = match tree_send(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -522,36 +544,67 @@ fn run_tree_send(
     Ok(())
 }
 
-/// Tree mode (v0.3): receive a directory's contents. The target directory is
-/// created when missing (a first sync into an empty destination is the
-/// normal case).
-fn run_tree_receive(
+/// Options bundle for [`run_tree_receive`] (8 params exceeded clippy's
+/// limit; these are one logical unit — the receiver's setup).
+struct TreeReceiveOpts {
     root: PathBuf,
-    port: u16,
     force_checksum: bool,
     plaintext: bool,
     trust_flag: Option<String>,
     no_delete: bool,
     excludes: Vec<String>,
-) -> std::io::Result<()> {
+    listener: TcpListener,
+    bound: u16,
+}
+
+/// Tree mode (v0.3): receive a directory's contents. The target directory is
+/// created when missing (a first sync into an empty destination is the
+/// normal case).
+fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
+    let TreeReceiveOpts {
+        root,
+        force_checksum,
+        plaintext,
+        trust_flag,
+        no_delete,
+        excludes,
+        listener,
+        bound,
+    } = opts;
     if !root.exists() {
         std::fs::create_dir_all(&root)?;
     }
-    let listener = TcpListener::bind(("0.0.0.0", port))?;
-    let bound = listener.local_addr()?.port();
     println!("listening on 0.0.0.0:{bound} (tree mode) ...");
     let (tcp, peer) = listener.accept()?;
     println!("peer connected: {peer}");
     tcp.set_nodelay(true).ok();
     set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-    let mut stream = connect_authenticated(tcp, &peer.to_string(), false, plaintext, trust_flag)?;
+    let peer_label = peer.to_string();
+    let mut stream = connect_authenticated(tcp, &peer_label, false, plaintext, trust_flag.clone())?;
 
     let display = &mut TreeDisplay::new();
+    // Worker connections (§16.8): accept from the same listener (the sender
+    // connects them to the same port), same TLS setup.
+    let accept_worker = move || -> std::io::Result<Box<dyn ReadWrite>> {
+        let (tcp, wpeer) = listener
+            .accept()
+            .map_err(|e| std::io::Error::other(format!("cannot accept worker: {e}")))?;
+        tcp.set_nodelay(true).ok();
+        set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+        connect_authenticated(
+            tcp,
+            &wpeer.to_string(),
+            false,
+            plaintext,
+            trust_flag.clone(),
+        )
+    };
     let request = TreeReceiveRequest {
         root,
         force_checksum,
         no_delete,
         excludes,
+        accept_worker: std::sync::Arc::new(accept_worker),
     };
     let pipeline = PipelineConfig::default();
     let outcome = match tree_receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -604,11 +657,10 @@ fn connect_authenticated(
     Ok(tls)
 }
 
-/// The `Read + Write` object bound the sync state machines run over:
-/// a plain TCP stream (`--plaintext`) or a TLS stream (default).
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
-
+// The `Read + Write` object bound the sync state machines run over —
+// a plain TCP stream (`--plaintext`) or a TLS stream (default) — is
+// `ReadWrite`, re-exported from tree_sync (Read + Write + Send: worker
+// connections live on their own threads).
 /// Tree-mode progress display: one line per file conversation plus
 /// tree-level phases, mirroring ProgressDisplay's single-line discipline.
 struct TreeDisplay {
@@ -803,6 +855,7 @@ fn main() {
             let mut trust_flag = None;
             let mut no_delete = false;
             let mut excludes: Vec<String> = Vec::new();
+            let mut parallel: u16 = 1;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -826,6 +879,17 @@ fn main() {
                             .next()
                             .unwrap_or_else(|| die("--exclude-from requires a path"));
                         read_exclude_file(v, &mut excludes);
+                    }
+                    "--parallel" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--parallel requires a number"));
+                        parallel = v.parse().unwrap_or_else(|_| {
+                            die(&format!("invalid --parallel value: {v} (2..=16)"))
+                        });
+                        if !(2..=16).contains(&parallel) {
+                            die(&format!("--parallel must be 2..=16 (got {parallel})"));
+                        }
                     }
                     "--help" | "-h" => {
                         print!("{}", USAGE);
@@ -852,6 +916,7 @@ fn main() {
                     trust_flag,
                     no_delete,
                     excludes,
+                    parallel,
                 },
             )
             .unwrap_or_else(|e| {
@@ -867,6 +932,7 @@ fn main() {
             let mut from = None;
             let mut no_delete = false;
             let mut excludes: Vec<String> = Vec::new();
+            let mut parallel: u16 = 1;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -894,6 +960,17 @@ fn main() {
                             .next()
                             .unwrap_or_else(|| die("--exclude-from requires a path"));
                         read_exclude_file(v, &mut excludes);
+                    }
+                    "--parallel" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--parallel requires a number"));
+                        parallel = v.parse().unwrap_or_else(|_| {
+                            die(&format!("invalid --parallel value: {v} (2..=16)"))
+                        });
+                        if !(2..=16).contains(&parallel) {
+                            die(&format!("--parallel must be 2..=16 (got {parallel})"));
+                        }
                     }
                     "--help" | "-h" => {
                         print!("{}", USAGE);
@@ -923,6 +1000,7 @@ fn main() {
                     trust_flag,
                     no_delete,
                     excludes,
+                    parallel,
                 },
             )
             .unwrap_or_else(|e| {
