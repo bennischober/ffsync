@@ -236,6 +236,7 @@ dependencies = [
  "num_cpus",
  "rand",
  "rcgen",
+ "ring",
  "rustls",
  "zstd",
 ]
