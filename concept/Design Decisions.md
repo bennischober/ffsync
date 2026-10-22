@@ -287,3 +287,77 @@ boundary behavior unchanged. This check is mandatory for every future
 fastcdc upgrade; a boundary change would be a wire-protocol compatibility
 break (D12) and must ship with a protocol version bump.
 
+## D15 — Persistent chunk index: sidecar files, content-verified, written at commit
+
+**Decision (v0.2):** each synced file gets a sidecar index file
+`<target>.ffsync-index` storing the state that made the last successful sync
+work: the file's identity (size, mtime at commit, chunk-tree root) and its
+full ordered chunk list (`(hash, offset, length)` entries, the same 44-byte
+layout as the wire manifest). Both sides write their index at commit time
+(sender: after scanning its source, gated on VERIFY success; receiver: after
+the atomic rename). The index is *validated, not trusted*: a warm start uses
+the index only after (a) the file's size matches the index and (b) the mtime
+matches; if either check fails — or the index is missing/corrupt — the peer
+falls back to a full cold scan, exactly as today. Additionally, the
+receiving side never *writes* from the index without verifying against the
+plan's expected hash (already the case via PLAN_LOCAL's hash field, D12), so
+a stale index costs re-sends, never corruption. The end-to-end VERIFY (§8)
+remains the final oracle in all cases.
+
+**Index format:** plain binary, little-endian, no serde: 8-byte magic
+(`FFSYIX01`), file size u64, mtime u64 (unix secs), chunk-tree root 32 B,
+chunk count u64, then `count ×` (hash 32 B, offset u64, length u32). Same
+hand-rolled style as the wire framing (D1). Corrupt/truncated index ⇒ treat
+as missing.
+
+**Reasoning:** the positioning doc calls the persistent index the core product
+insight — cold starts repeat, and rsync is amnesiac. The measured scan cost
+(~350–390 ms/GiB, `evaluation/chunking.md`) bounds what the index saves: on
+repeated syncs of unchanged data, both peers go from a full scan to a stat +
+mtime/size check, and a *changed* file still needs its cold scan (the index
+of the old version is stale by definition — but the *sender* can keep the old
+index to skip... nothing; see Accepted costs). The index also carries Phase-2
+style root-hash change detection forward: mtime/size match ⇒ presumed
+unchanged (D11); index root can answer "would this sync do anything?" without
+reading file contents.
+
+**Alternatives considered:**
+- *One global database (SQLite/sled) per user/repo* — rejected for v0.2:
+  a new dependency class (D14 supply-chain bias toward few deps), a
+  concurrency model to design, and a migration story; sidecar files are
+  crash-atomic by construction (rename at commit), travel with the file, and
+  need zero new deps. Revisit when directory sync (tree index) lands — the
+  sidecar-per-file design degrades to thousands of tiny files at tree scale,
+  which is the known trigger to switch to a single per-directory database.
+- *Journal the index during transfer* — rejected: the D10 simulation showed
+  re-scan-from-content beats journals for the temp; same argument applies
+  here. The index is derived state; only write it from a verified state.
+- *Trust the index without validation* — rejected: D5's open question (stale
+  index claims break reconstruction) is answered by validation + PLAN_LOCAL
+  hash verification + VERIFY; "trust finalize-time verification alone" would
+  silently accept wrong local reads that cancel out — the hash-verified local
+  read closes that hole cheaply.
+
+**Accepted costs:** index files double the inode count per synced file
+(and appear in directory listings — D6's hidden-file question is now resolved
+for the index: `<target>.ffsync-index` sibling, same non-hidden style as the
+temp); a deleted target leaves an orphan index (cleanup rule: on receive,
+best-effort delete of `*.ffsync-index` files whose target is missing in the
+same directory); and mtime-only validation means an mtime-preserving
+in-place edit defeats the warm start — the same caveat as rsync's quick
+check and D11. In `--checksum` mode the index is never used as evidence that
+a scan can be skipped (the root must come from the scan); warm-start chunk
+reads themselves are always hash-verified against the plan, so both modes
+are safe.
+
+**Wire mapping:** none — the index is purely peer-local state. The protocol
+is unchanged; a warm-started receiver streams its manifest from the index
+instead of from a scan, and the sender is unaware. A future manifest-delta
+optimization (send only changed entries) is explicitly deferred; v0.2 keeps
+manifest streaming as-is.
+
+**Validation plan:** bench gains a `--warm` scenario: sync twice, assert the
+second run performs zero chunk-I/O on unchanged data (stat-only) and still
+hash-verifies; loopback test: warm receiver + changed file falls back to cold
+scan correctly; corrupt-index test: truncated index behaves as missing.
+
