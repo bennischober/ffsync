@@ -6,6 +6,10 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet - see [0.3.1]._
+
+## [0.3.1] - 2026-10-22
+
 ### Fixed
 
 - **All-Local plans now execute (single-file sync bug):** when the
@@ -22,6 +26,10 @@ All notable changes to ffsync are documented here. The format follows
 - Release executables are built with a **static CRT** on Windows
   (`crt-static`): the shipped `ffsync.exe` no longer requires the VC++
   redistributable.
+- **Tag-driven release workflow** (`.github/workflows/release.yml`):
+  pushing a `v*` tag runs the four gates + a tag↔version guard, publishes
+  to crates.io, builds Windows/Linux executables with SHA-256 sidecars,
+  and attaches them to the GitHub release.
 
 ## [0.3.0] - 2026-10-22
 
@@ -163,6 +171,7 @@ First working implementation: single-file sync between two peers over TCP.
   fixed blocks); ffsync's advantage is the parallel scan (~3.8x cold start on
   the 72.7 GiB reference file) and resumability.
 
+[0.3.1]: https://github.com/bennischober/ffsync/releases/tag/v0.3.1
 [0.3.0]: https://github.com/bennischober/ffsync/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bennischober/ffsync/releases/tag/v0.2.0
 [0.1.0]: https://github.com/bennischober/ffsync/releases/tag/v0.1.0
