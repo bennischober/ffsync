@@ -39,6 +39,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # cargo-audit is not preinstalled on runner images; install the
+      # prebuilt binary (fast) instead of compiling it from source.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       # Runs on every push/PR; the weekly scheduled cadence for drifted
       # advisories is covered by the separate audit-weekly workflow (D14).
       - run: cargo audit
