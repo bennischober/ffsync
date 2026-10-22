@@ -5,7 +5,8 @@
 ffsync transfers the difference between two files, not the files. It is rsync's
 behavior — minimal bytes on the wire, resumable, verified — built on a modern
 engine: parallel content-defined chunking, BLAKE3 hashing, zstd compression,
-and a hand-rolled, dependency-light wire protocol. No daemon, no config, two
+and a hand-rolled, dependency-light wire protocol (the release build has 31
+crate dependencies, none of them an async runtime). No daemon, no config, two
 commands.
 
 > **Status: v0.1.0 — first working implementation.** Single-file sync between
@@ -84,7 +85,7 @@ length-prefixed, no protobuf, three direct dependencies in the data plane.
 | [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) | Chunk + tree hashing | Extremely fast (SIMD, multi-threaded), one primitive for chunk IDs, verification, and the file identity |
 | [zstd](https://github.com/facebook/zstd) | Chunk compression | Measured best ratio/speed trade-off for chunk-sized payloads |
 | [memmap2](https://github.com/RazrFalcon/memmap2-rs) | File I/O | Zero-copy slicing for hash workers; no read() syscalls per chunk |
-| [crossbeam](https://github.com/crossbeam-rs/crossbeam) | Bounded channels | Backpressure between chunkers and hash workers on native threads |
+| [crossbeam](https://github.com/crossbeam-rs/crossbeam) | Bounded channels | Backpressure between chunkers and hash workers on native threads; no async runtime in the data plane |
 | rsync (comparison only) | Baseline | The tool this project is measured against, and its delta algorithm is respected, not wrapped |
 
 Design decisions and their alternatives are recorded in
