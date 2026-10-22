@@ -108,6 +108,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          # Windows MSVC links the dynamic CRT by default, which makes the
+          # exe depend on VCRUNTIME140.dll (absent on machines without the
+          # VC++ redistributable — hardly "portable"). crt-static embeds the
+          # runtime; verified locally: no VCRUNTIME imports in the PE.
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static' || '' }}
       - name: Package (zip)
         id: package
         if: matrix.archive == 'zip'

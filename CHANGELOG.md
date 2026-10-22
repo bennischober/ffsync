@@ -6,7 +6,22 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet - see [0.3.0]._
+### Fixed
+
+- **All-Local plans now execute (single-file sync bug):** when the
+  receiver's file contains every chunk hash of the sender's file at
+  *different positions* (a prefix or shifted region — e.g. sender
+  `pattern × 8192`, receiver `pattern × 4096`), the plan has no Remote
+  entries and the old "nothing to send ⇒ in sync" shortcut errored
+  `HashMismatch` instead of reconstructing. Chunk dedup is by hash, not
+  position; such plans now execute (0 bytes on the wire, chunks
+  repositioned locally). Identical files still report `up to date`.
+
+### Changed
+
+- Release executables are built with a **static CRT** on Windows
+  (`crt-static`): the shipped `ffsync.exe` no longer requires the VC++
+  redistributable.
 
 ## [0.3.0] - 2026-10-22
 

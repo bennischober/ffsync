@@ -263,6 +263,10 @@ cargo run --release --bin bench -- --quick --rsync  # also time rsync (native or
 cargo audit                                          # dependency advisory check
 ```
 
+Release executables are built by the tag-driven release workflow: Windows
+(MSVC, static CRT — runs without the VC++ redistributable) and Linux (musl,
+fully static), each with a SHA-256 sidecar attached to the GitHub release.
+
 Requires a stable Rust toolchain (developed on 1.99, edition 2024). Windows is
 the primary development platform; the I/O layer is `#[cfg]`-split for Unix.
 
