@@ -32,6 +32,15 @@ pub const T_COMMIT_ACK: u8 = 0x09;
 pub const T_NOT_MODIFIED: u8 = 0x0A;
 /// Frame type byte for `ERROR`.
 pub const T_ERROR: u8 = 0x0B;
+/// Frame type byte for `TREE_BEGIN` (v0.3, §16).
+pub const T_TREE_BEGIN: u8 = 0x0C;
+/// Frame type byte for `TREE_END` (v0.3, §16).
+pub const T_TREE_END: u8 = 0x0D;
+/// Frame type byte for `FILE_SYNC` (v0.3, §16.4): the sender's "this file
+/// needs a full conversation" signal inside a tree session — the tree-mode
+/// receiver reads exactly one frame after HELLO (NOT_MODIFIED or FILE_SYNC)
+/// instead of racing manifest writes against a fast-path sender.
+pub const T_FILE_SYNC: u8 = 0x0E;
 
 /// A raw frame: type byte plus payload. Typed frames are built on top of
 /// this in [`super::message`]; the codec layer only knows the envelope.

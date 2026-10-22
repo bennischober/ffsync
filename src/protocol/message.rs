@@ -467,6 +467,130 @@ pub fn write_frame(out: &mut impl Write, frame: &Frame) -> io::Result<usize> {
     Ok(frame.encoded_len())
 }
 
+// ---------------------------------------------------------------------------
+// Tree sync frames (v0.3, §16) — TREE_BEGIN / TREE_END
+// ---------------------------------------------------------------------------
+
+/// One entry of the TREE_BEGIN manifest (§16.2). Mirrors
+/// `crate::tree::TreeEntry`; kept wire-local to avoid the protocol module
+/// depending on the tree module (the tree module depends on this one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntryWire {
+    pub rel_path: String,
+    pub kind: u8, // 0 = file, 1 = dir (crate::tree::EntryKind values)
+    pub size: u64,
+    pub mtime_secs: u64,
+    pub mtime_nanos: u32,
+}
+
+/// TREE_BEGIN payload: flags u16, entry_count u64, then entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeBegin {
+    pub flags: u16,
+    pub entries: Vec<TreeEntryWire>,
+}
+
+impl TreeBegin {
+    pub fn into_frame(self) -> io::Result<Frame> {
+        let mut payload = Vec::with_capacity(10 + self.entries.len() * 24);
+        payload.extend_from_slice(&self.flags.to_le_bytes());
+        payload.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
+        for e in &self.entries {
+            let path_bytes = e.rel_path.as_bytes();
+            if path_bytes.len() > u16::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("tree path longer than {} bytes", u16::MAX),
+                ));
+            }
+            payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+            payload.extend_from_slice(path_bytes);
+            payload.push(e.kind);
+            payload.extend_from_slice(&e.size.to_le_bytes());
+            payload.extend_from_slice(&e.mtime_secs.to_le_bytes());
+            payload.extend_from_slice(&e.mtime_nanos.to_le_bytes());
+        }
+        Ok(Frame::new(framing::T_TREE_BEGIN, payload))
+    }
+
+    pub fn from_frame(frame: Frame) -> Result<Self, MessageError> {
+        if frame.ftype != framing::T_TREE_BEGIN {
+            return Err(MessageError::UnexpectedType(frame.ftype));
+        }
+        let p = &frame.payload[..];
+        let mut pos = 0usize;
+        let flags = read_u16_le(p, &mut pos)?;
+        let count = read_u64_le(p, &mut pos)? as usize;
+        // Resource limit (§12 spirit): a manifest claiming absurd counts must
+        // not allocate for them upfront. Each entry is at least 24 bytes on
+        // the wire (2 + 1 + 8 + 8 + 4 + path), so the payload bounds the count.
+        if count > (p.len().saturating_sub(pos)) / 24 + 1 {
+            return Err(MessageError::Malformed("tree entry count exceeds payload"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let path_len = read_u16_le(p, &mut pos)? as usize;
+            let path = read_bytes(p, &mut pos, path_len)?;
+            let rel_path = std::str::from_utf8(path)
+                .map_err(|_| MessageError::Malformed("tree path is not UTF-8"))?
+                .to_string();
+            if pos >= p.len() {
+                return Err(MessageError::Malformed("short tree entry"));
+            }
+            let kind = p[pos];
+            pos += 1;
+            let size = read_u64_le(p, &mut pos)?;
+            let mtime_secs = read_u64_le(p, &mut pos)?;
+            let mtime_nanos = read_u32_le(p, &mut pos)?;
+            entries.push(TreeEntryWire {
+                rel_path,
+                kind,
+                size,
+                mtime_secs,
+                mtime_nanos,
+            });
+        }
+        if pos != p.len() {
+            return Err(MessageError::Malformed("trailing bytes in TREE_BEGIN"));
+        }
+        Ok(Self { flags, entries })
+    }
+}
+
+/// TREE_END payload: on the receiver→sender leg, the delete report
+/// (§16.5); on the sender→receiver leg, empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TreeEnd {
+    pub deleted_count: u32,
+    pub deleted_bytes: u64,
+}
+
+impl TreeEnd {
+    pub fn into_frame(self) -> io::Result<Frame> {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&self.deleted_count.to_le_bytes());
+        payload.extend_from_slice(&self.deleted_bytes.to_le_bytes());
+        Ok(Frame::new(framing::T_TREE_END, payload))
+    }
+
+    pub fn from_frame(frame: Frame) -> Result<Self, MessageError> {
+        if frame.ftype != framing::T_TREE_END {
+            return Err(MessageError::UnexpectedType(frame.ftype));
+        }
+        if frame.payload.len() != 12 {
+            return Err(MessageError::Malformed("TREE_END payload must be 12 bytes"));
+        }
+        let mut pos = 0usize;
+        let p = &frame.payload[..];
+        let deleted_count = read_u32_le(p, &mut pos)?;
+        let deleted_bytes = read_u64_le(p, &mut pos)?;
+        Ok(Self {
+            deleted_count,
+            deleted_bytes,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

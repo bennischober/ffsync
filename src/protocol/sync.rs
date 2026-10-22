@@ -114,14 +114,28 @@ pub struct SendRequest {
     pub mtime: Option<SystemTime>,
     /// Disable the size+mtime fast path (rsync `--checksum` semantics, D11).
     pub force_checksum: bool,
+    /// Tree mode (v3, D17): the sync runs inside a tree session. Changes
+    /// stream-positional behavior — the fast path does NOT close the
+    /// connection after NOT_MODIFIED (the tree session continues with the
+    /// next file), and the receiver's success paths apply the sender's
+    /// mtime before COMMIT_ACK (§16.6).
+    pub tree: bool,
 }
 
 /// The receiver's view of what to build.
+#[derive(Clone)]
 pub struct ReceiveRequest {
     pub path: PathBuf,
     /// The file we already have (used as the manifest source); may not exist.
     pub local_source: PathBuf,
     pub force_checksum: bool,
+    /// Tree mode (v3, D17): see [`SendRequest::tree`]. In tree mode the
+    /// receiver also applies the sender's mtime at commit (§16.6) and does
+    /// NOT drain-for-close after the conversation (the session continues).
+    pub tree: bool,
+    /// Tree mode only: the sender's mtime to apply at commit (from the
+    /// per-file HELLO). `None` in single-file mode (mtime is left alone).
+    pub apply_mtime: Option<(u64, u32)>,
 }
 
 /// Outcome of a completed sync.
@@ -327,14 +341,32 @@ where
     {
         message::encode_empty(framing::T_NOT_MODIFIED)?.encode(stream)?;
         stream.flush()?;
-        // TCP note: exiting now would close the socket while the receiver
-        // may still be writing manifest frames, and the resulting RST can
-        // discard the receiver's buffered NOT_MODIFIED before it reads it
-        // (the classic TCP reset race). Draining until the peer closes (or
-        // a bound is hit) lets the receiver read the frame cleanly.
+        if request.tree {
+            // Tree mode (§16.4): the session continues with the next file —
+            // do NOT drain or close. The receiver reads NOT_MODIFIED in its
+            // plan loop and returns; the stream position is back in lockstep
+            // (receiver sends nothing on this path).
+            progress(Progress::NothingToDo);
+            return Ok(SyncOutcome::InSync);
+        }
+        // Single-file mode: exiting now would close the socket while the
+        // receiver may still be writing manifest frames, and the resulting
+        // RST can discard the receiver's buffered NOT_MODIFIED before it
+        // reads it (the classic TCP reset race). Draining until the peer
+        // closes (or a bound is hit) lets the receiver read the frame
+        // cleanly.
         let _ = drain_for_close(stream);
         progress(Progress::NothingToDo);
         return Ok(SyncOutcome::InSync);
+    }
+    if request.tree {
+        // Tree mode (§16.4): tell the receiver the conversation proceeds.
+        // Without this the receiver would have to race its manifest writes
+        // against a possible fast-path NOT_MODIFIED (single-file mode
+        // tolerates that; inside a session a broken stream would kill the
+        // whole tree sync).
+        message::encode_empty(framing::T_FILE_SYNC)?.encode(stream)?;
+        stream.flush()?;
     }
 
     // ---- Receive the manifest (§5) ----
@@ -621,37 +653,55 @@ where
         }
         Err(other) => return Err(other),
     };
+    // Tree mode (§16.6): the sender's HELLO mtime is what the receiver must
+    // carry after commit — fill the per-conversation apply_mtime here.
+    let peer_mtime = if request.tree {
+        Some((peer.file_mtime, peer.file_mtime_nanos))
+    } else {
+        None
+    };
+    let request = ReceiveRequest {
+        apply_mtime: request.apply_mtime.or(peer_mtime),
+        ..(*request).clone()
+    };
 
-    // ---- Fast path (§4): the sender may immediately answer NOT_MODIFIED
-    // when size+mtime match and both sides trust times. Note the sender
-    // sends its HELLO first and ours second, so a fast-path sender exits
-    // right after reading our HELLO: the next frame here is either
-    // NOT_MODIFIED or the sender's demand for our manifest (i.e. anything
-    // else means the sender did NOT fast-path). ----
-    // We must check this BEFORE streaming our manifest, otherwise the
-    // sender's exit races our writes (the BrokenPipe the loopback test
-    // caught). The check is a peek at the next frame's type: read it now,
-    // and if it is not NOT_MODIFIED, process it as the start of the normal
-    // flow (the plan loop consumes plan frames; the manifest sender only
-    // starts writing its plan after MANIFEST_DONE, so an early plan frame
-    // cannot arrive while our manifest is still streaming... except the
-    // sender diffs only after MANIFEST_DONE, so the first frame after
-    // HELLO from a non-fast-path sender is nothing — it waits. Reading one
-    // frame here would block. Therefore: do NOT read; rely on the sender
-    // never sending plan frames before MANIFEST_DONE and just stream the
-    // manifest. The NOT_MODIFIED frame arrives *while* we stream, and the
-    // plan loop below handles it.)
+    // ---- Fast path (§4): the sender may answer NOT_MODIFIED right after
+    // the HELLO exchange when size+mtime match and both sides trust times.
     //
-    // BUT: the sender closes after NOT_MODIFIED (one-shot HELLO exchange),
-    // so our subsequent manifest writes hit a dead peer and fail with
-    // BrokenPipe — which is *harmless* (the sync is done). We catch that
-    // case in the plan loop instead: the first frame we read after our
-    // manifest is either NOT_MODIFIED (already consumed... no, the plan
-    // loop reads it), or an ERROR, or plan frames.
+    // Tree mode (§16.4): the sender makes the branch explicit — the next
+    // frame is NOT_MODIFIED (skip; done with this file, session continues)
+    // or FILE_SYNC (proceed; stream our manifest). Read exactly one frame
+    // here: no write races, no broken-pipe tolerance.
     //
-    // Conclusion: stream the manifest, tolerate write failures during it
-    // (broken pipe means the sender fast-pathed), and handle NOT_MODIFIED
-    // in the plan loop (already implemented).
+    // Single-file mode: there is no FILE_SYNC frame (connection end is the
+    // session end). The sender never sends plan frames before MANIFEST_DONE,
+    // so reading one frame here would block; instead we stream the manifest
+    // and tolerate write failures (a fast-path sender exits right after
+    // reading our HELLO, closing the stream — the BrokenPipe the loopback
+    // test caught), handling NOT_MODIFIED in the plan loop. ----
+    if request.tree {
+        let frame = framing::read_frame(stream)?;
+        match frame.ftype {
+            framing::T_NOT_MODIFIED => {
+                // The sender's mtime is our file's mtime already (that is
+                // why it skipped us); nothing to do, stay in the session.
+                progress(Progress::NothingToDo);
+                return Ok(SyncOutcome::InSync);
+            }
+            framing::T_FILE_SYNC => {} // conversation proceeds
+            framing::T_ERROR => {
+                let (code, msg) = message::read_error_payload(&frame)?;
+                return Err(SyncError::Peer(code, msg));
+            }
+            other => {
+                return Err(send_error_and_finish(
+                    stream,
+                    ErrorCode::BadFrame,
+                    &format!("expected NOT_MODIFIED or FILE_SYNC, got 0x{:02X}", other),
+                ));
+            }
+        }
+    }
 
     // ---- Stream our manifest (§5) ----
     // The union manifest (D10): temp chunks first, then old-file chunks
@@ -880,8 +930,11 @@ where
         // Hash verified; commit. Reconstruct the Reconstructor state: the
         // temp file exists and is verified — rename atomically.
         std::fs::rename(&temp_path, &request.path)?;
+        apply_commit_mtime(&request)?;
         // Persist the verified state for the next warm start (D15): the
-        // verified temp scan is exactly the index content.
+        // verified temp scan is exactly the index content. The index
+        // records the mtime AFTER it was set to the sender's (§16.6), so
+        // both peers' indexes agree and the next tree sync's triage skips.
         let _ = crate::index::write_index(
             &request.path,
             &FileIndex::from_scan(
@@ -905,7 +958,57 @@ where
     // compare against the root of our current state. On resume the temp file
     // is the newest state (a previous attempt may have died after the last
     // DATA byte), so prefer it when present. ----
+    // v3 (§16): an empty plan with a zero-size sender file means "converge
+    // to empty" — truncate (or drop a resume temp) and verify the empty
+    // root. Must be checked BEFORE the state comparison: a non-empty local
+    // state would otherwise take the HashMismatch path below (v0.2
+    // behavior), making empty sender files unconvergeable. Empty files are
+    // common in trees (§16.2), so this is the load-bearing empty-file fix.
     let verify_root = message::read_verify(stream)?;
+    // v3 (§16): an empty plan with a zero-size sender file means "converge
+    // to empty" — truncate (or drop a resume temp) and verify the empty
+    // root. Must be checked BEFORE the state comparison: a non-empty local
+    // state would otherwise take the HashMismatch path below (v0.2
+    // behavior), making empty sender files unconvergeable. Empty files are
+    // common in trees (§16.2), so this is the load-bearing empty-file fix.
+    //
+    // The empty root is verified explicitly: target_size and verify_root
+    // come from the same sender state, so a mismatch is a protocol
+    // violation — and without this check a sender claiming size 0 could
+    // truncate receiver files while never matching any root.
+    if target_size == 0 {
+        if verify_root != chunk_root(&[]) {
+            return Err(send_error_and_finish(
+                stream,
+                ErrorCode::BadFrame,
+                "sender reports zero size but a non-empty root",
+            ));
+        }
+        if resuming {
+            // A stale temp cannot contain anything the sender wants (its
+            // file is empty); drop it before truncating.
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        // Truncate the target to empty (create if absent), carry the
+        // sender's mtime, and persist the empty index (D15).
+        std::fs::File::create(&request.path)?.set_len(0)?;
+        apply_commit_mtime(&request)?;
+        let _ = crate::index::write_index(
+            &request.path,
+            &FileIndex::from_scan(
+                Vec::new(),
+                0,
+                crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+            ),
+        );
+        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        stream.flush()?;
+        progress(Progress::NothingToDo);
+        return Ok(SyncOutcome::Transferred {
+            bytes: 0,
+            chunks: 0,
+        });
+    }
     let (state_root, state_desc): (Option<Hash>, &str) = if resuming {
         let chunks = scan_file_plain(&temp_path, pipeline)?;
         (Some(chunk_root(&chunks)), "temp")
@@ -917,6 +1020,7 @@ where
             if resuming {
                 // The previous attempt actually completed the data; commit it.
                 std::fs::rename(&temp_path, &request.path)?;
+                apply_commit_mtime(&request)?;
                 // Persist the committed state (D15). The temp scan above is
                 // the verified chunk list; reuse it instead of re-scanning.
                 let chunks = scan_file_plain(&temp_path, pipeline).unwrap_or_default();
@@ -936,6 +1040,7 @@ where
                 // would claim the target's identity from another file's
                 // content (size/mtime of `local_source` keyed to `path`),
                 // and the next warm start would serve the wrong chunk list.
+                apply_commit_mtime(&request)?;
                 let _ = crate::index::write_index(
                     &request.path,
                     &FileIndex::from_scan(
@@ -959,9 +1064,39 @@ where
             ),
         )),
         None => {
-            // We have no local file but the plan was empty: the sender thinks
-            // we have everything. That is only possible if our manifest said
-            // so — contradiction; treat as protocol error.
+            // We have no local file but the plan was empty. v3 (§16): this
+            // is legitimate when the sender's file is EMPTY (an empty chunk
+            // list yields an empty plan) and the receiver's state is a
+            // non-empty old file or temp — the correct convergence is to
+            // truncate the target to zero bytes and verify the empty root.
+            // (v0.2 errored here; an empty sender file could never converge
+            // a non-empty receiver file — found by the tree tests, where
+            // empty files are common.)
+            if target_size == 0 {
+                if resuming {
+                    std::fs::remove_file(&temp_path).ok();
+                }
+                // Truncate the target to empty (or create it).
+                std::fs::File::create(&request.path)?.set_len(0)?;
+                apply_commit_mtime(&request)?;
+                let _ = crate::index::write_index(
+                    &request.path,
+                    &FileIndex::from_scan(
+                        Vec::new(),
+                        0,
+                        crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                    ),
+                );
+                message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+                stream.flush()?;
+                progress(Progress::NothingToDo);
+                return Ok(SyncOutcome::Transferred {
+                    bytes: 0,
+                    chunks: 0,
+                });
+            }
+            // Otherwise: the sender thinks we have everything but we have
+            // nothing — our manifest said so, contradiction; protocol error.
             Err(send_error_and_finish(
                 stream,
                 ErrorCode::BadFrame,
@@ -969,6 +1104,25 @@ where
             ))
         }
     }
+}
+
+/// Applies the sender's mtime to the committed target file (§16.6, tree
+/// mode only): the receiver's file must carry the sender's mtime so the
+/// next tree sync's metadata triage skips it, and both peers' D15 indexes
+/// record the same mtime. Best-effort: a failure to set mtime must not
+/// fail a verified sync — but it WILL cause the next tree sync to re-check
+/// this file (its triage metadata will differ), which is self-healing.
+fn apply_commit_mtime(request: &ReceiveRequest) -> io::Result<()> {
+    let Some((secs, nanos)) = request.apply_mtime else {
+        return Ok(());
+    };
+    if secs == 0 && nanos == 0 {
+        return Ok(()); // sender had no mtime; leave ours
+    }
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&request.path)?;
+    f.set_modified(UNIX_EPOCH + std::time::Duration::new(secs, nanos))
 }
 
 /// Scans a file with progress callbacks bridged from the pipeline events.

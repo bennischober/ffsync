@@ -8,13 +8,19 @@
 pub mod framing;
 pub mod message;
 pub mod sync;
+pub mod tree_sync;
 
 /// Protocol magic sent in the HELLO payload.
 pub const MAGIC: [u8; 4] = *b"FFSY";
 /// Protocol version implemented by this crate.
 ///
-/// v2 (v0.2): HELLO gains `file_mtime_nanos` (u32) — the §4 fast path must
+/// v2 (v0.2): HELLO gains `file_mtime_nanos` (u32) - the §4 fast path must
 /// compare sub-second mtimes; whole-second comparison let a same-second
 /// same-size rewrite pass as "in sync" (D15 follow-up). v1 peers are
 /// rejected by the version check.
-pub const VERSION: u16 = 2;
+///
+/// v3 (v0.3): tree sync (D17, §16) - TREE_BEGIN/TREE_END envelope, mtime
+/// preservation on commit, empty-file convergence fix. v2 peers reject the
+/// unknown TREE_BEGIN frame loudly (strict framing, §3), and the HELLO
+/// version check rejects them before any tree state exists.
+pub const VERSION: u16 = 3;

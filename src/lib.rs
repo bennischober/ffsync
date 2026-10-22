@@ -9,3 +9,4 @@ pub mod index;
 pub mod protocol;
 pub mod reconstruction;
 pub mod transport;
+pub mod tree;
