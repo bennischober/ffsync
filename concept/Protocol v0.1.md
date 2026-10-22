@@ -213,14 +213,27 @@ and (c) VERIFY has arrived. It must not finalize before (a)–(c) all hold.
 4. Mismatch → delete the temp file, send ERROR 4. The original file is
    untouched. Retry is the sender's decision (fresh connection).
 
-**Already-in-sync edge case:** if the sender's plan is empty (every chunk
-matched the manifest) the sender still sends VERIFY. The receiver then hashes
-its *current* file (it already has the root from its own scan — free) and
-compares: match → NOT_MODIFIED-style done via COMMIT_ACK without ever creating
-a temp file; mismatch → the receiver's file content does not match what its
-manifest claimed (corrupted index/trust assumption) → ERROR 4. This makes
-"files identical despite metadata mismatch" discoverable without any transfer,
-and it is the hook the future index plugs into (§14.1).
+**Already-in-sync edge case:** if the sender's plan is empty (no chunks at
+all) the sender still sends VERIFY. The receiver then hashes its *current*
+file (it already has the root from its own scan — free) and compares: match →
+COMMIT_ACK without ever creating a temp file; mismatch → the receiver's file
+content does not match what its manifest claimed (corrupted index/trust
+assumption) → ERROR 4. This makes "files identical despite metadata mismatch"
+discoverable without any transfer, and it is the hook the future index plugs
+into (§14.1).
+
+**All-Local plans (v3, found by the static-binary smoke test):** an empty plan
+is *not* the only zero-wire-bytes shape. A receiver whose file contains the
+sender's chunk bytes at *different positions* (a prefix or shifted region of
+the sender's file) yields an all-Local plan — Locals are dedup'd by hash, not
+by position. The receiver must then **execute** the plan (write chunks at the
+sender's offsets from wherever its manifest holds them) and both peers report
+the executed plan (Transferred, 0 wire bytes). The receiver skips the rewrite
+only when the plan's Local spans exactly reproduce the receiver's own chunk
+layout (same count, same offsets, same lengths — identical files under
+`--checksum`, including periodic content whose repeated hashes collapse in
+the diff map; the sender mirrors the check against the raw manifest chunk
+list). VERIFY guards every path regardless.
 
 ## 9. Diff strategy (D8) — lazy now, eager reserved
 

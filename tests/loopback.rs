@@ -471,6 +471,54 @@ mod tests {
     }
 
     #[test]
+    fn sync_all_local_plan_repositions_chunks() {
+        // Found by the static-binary smoke test: the receiver's file contains
+        // every chunk hash of the sender's file (a prefix of it), so the plan
+        // is all-Local — but the chunks sit at DIFFERENT positions. The old
+        // "no Remote ⇒ in sync" shortcut skipped the writes and errored
+        // HashMismatch at VERIFY; the receiver must execute the plan (locals
+        // are dedup'd by hash, not position) and the sender must report the
+        // executed plan (Transferred, 0 wire bytes).
+        let fx = Fixture::new("all_local_reposition");
+        // Periodic content: chunks hit the 1 MiB cap, so the receiver's
+        // single 1 MiB chunk hash-equals the sender's first 1 MiB chunk.
+        let sender_data: Vec<u8> = (0..=255u8).cycle().take(2 * 1024 * 1024).collect();
+        let receiver_data: Vec<u8> = (0..=255u8).cycle().take(1024 * 1024).collect();
+        create_file(fx.source(), &sender_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &receiver_data);
+
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: false,
+                tree: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: false,
+                tree: false,
+                apply_mtime: None,
+            },
+        );
+
+        let s = s.expect("sender ok");
+        let r = r.expect("receiver ok");
+        assert!(
+            matches!(r, SyncOutcome::Transferred { chunks: 2, .. }),
+            "receiver must execute the all-Local plan: {r:?}"
+        );
+        assert!(
+            matches!(s, SyncOutcome::Transferred { bytes, .. } if bytes == 0),
+            "sender transferred nothing over the wire: {s:?}"
+        );
+        assert_eq!(read_file(&target), sender_data);
+    }
+
+    #[test]
     fn sync_fresh_file_transfers_everything() {
         let fx = Fixture::new("fresh");
         let data = vec![7u8; 2 * 1024 * 1024];

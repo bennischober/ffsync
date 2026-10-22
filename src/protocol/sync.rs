@@ -373,8 +373,12 @@ where
     // ---- Receive the manifest (§5) ----
     // On resume the manifest is the union of temp and old-file chunks
     // (D10); the receiver resolves which file to read from per hash. The
-    // sender only needs the hash set for diffing.
+    // sender needs hash -> offset for diffing AND the raw chunk list (in
+    // arrival order, duplicates kept - identical periodic content repeats
+    // hashes and the map must not collapse the layout) for the
+    // layout-reproduction check below.
     let mut manifest: HashMap<Hash, u64> = HashMap::new();
+    let mut manifest_chunks: Vec<(Hash, u64, u32)> = Vec::new();
     loop {
         let frame = framing::read_frame(stream)?;
         match frame.ftype {
@@ -382,6 +386,7 @@ where
                 let entry = ManifestChunk::from_frame(frame)
                     .map_err(|e| SyncError::Protocol(format!("bad manifest chunk: {}", e)))?;
                 manifest.insert(entry.hash, entry.offset);
+                manifest_chunks.push((entry.hash, entry.offset, entry.length));
             }
             framing::T_MANIFEST_DONE => break,
             other => {
@@ -419,6 +424,32 @@ where
             }
         }
     }
+
+    // Layout-reproduction check (mirrors the receiver's decision, §8): an
+    // all-Local plan whose target spans equal the receiver's raw chunk spans
+    // (same count, same offsets, same lengths — hash equality implies length
+    // equality) means the receiver's file is already chunked exactly like
+    // ours: same CDC parameters, same root. The receiver will skip the
+    // rewrite and report InSync, so the sender reports InSync too (identical
+    // files under --checksum, including periodic content whose repeated
+    // hashes collapse in the diff map but not in the positional list — the
+    // comparison therefore uses the positional list, not the collapsed map).
+    // Any other all-Local plan (Locals dedup'd across positions — a prefix
+    // or shifted region) executes on the receiver and reports Transferred
+    // with 0 wire bytes.
+    let layout_reproduced = !plan.is_empty()
+        && plan.len() == manifest_chunks.len()
+        && plan
+            .iter()
+            .zip(manifest_chunks.iter())
+            .all(|(e, (_, off, len))| match e {
+                PlanEntry::Local {
+                    target_offset,
+                    length,
+                    ..
+                } => target_offset == off && length == len,
+                _ => false,
+            });
 
     for entry in &plan {
         entry.into_frame()?.encode(stream)?;
@@ -475,13 +506,18 @@ where
                 crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
             );
             let _ = crate::index::write_index(&request.path, &index);
-            if remote_total > 0 {
+            // InSync is for plans that changed nothing on the receiver: the
+            // zero-entry plan, or an all-Local plan that reproduced the
+            // receiver's chunk layout (no rewrite). Any executed plan —
+            // including an all-Local one that repositioned chunks — reports
+            // Transferred (with 0 wire bytes when no Remote entry existed).
+            if plan.is_empty() || layout_reproduced {
+                Ok(SyncOutcome::InSync)
+            } else {
                 Ok(SyncOutcome::Transferred {
                     bytes: sent,
                     chunks: sent_chunks,
                 })
-            } else {
-                Ok(SyncOutcome::InSync)
             }
         }
         framing::T_ERROR => {
@@ -785,7 +821,40 @@ where
 
     // ---- Prepare the temp file (§8.1) ----
     let target_size = peer.file_size;
-    if remote_total > 0 || plan.iter().any(|e| matches!(e, PlanEntry::Remote { .. })) {
+    // Decide whether a rewrite is needed WITHOUT the sender's VERIFY root
+    // (§8 keeps VERIFY after the data phase on the wire — moving it before
+    // the plan would break v0.2 ↔ v0.3 single-file compat, and the receiver
+    // cannot read it early without desyncing the frame order).
+    //
+    // Plans that must execute:
+    // - anything with a Remote entry (bytes cross the wire), and
+    // - ALL-LOCAL plans whose Local spans do not exactly reproduce the
+    //   receiver's own chunk list: Locals are dedup'd by hash, not position,
+    //   so a receiver whose file contains the sender's chunk bytes elsewhere
+    //   (a prefix, a shifted region) still needs chunks written at the
+    //   sender's offsets (found by the static-binary smoke test: sender
+    //   2 MiB = pattern × 8192, receiver 1 MiB = pattern × 4096 — every
+    //   chunk hash matched, the plan was [Local, Local], and the old
+    //   "no Remote ⇒ in sync" shortcut errored HashMismatch instead of
+    //   reconstructing).
+    //
+    // An all-Local plan covering the receiver's file exactly as it is chunked
+    // means the file already carries the sender's chunk layout — same CDC
+    // parameters on both sides produce the same root — so writing would be a
+    // no-op rewrite: report InSync without touching the file (the
+    // --checksum identical-files case). VERIFY still guards every path.
+    let plan_reproduces_local_layout = !plan.is_empty()
+        && plan.iter().all(|e| matches!(e, PlanEntry::Local { .. }))
+        && plan.len() == local_chunks.len()
+        && plan.iter().zip(local_chunks.iter()).all(|(e, c)| match e {
+            PlanEntry::Local {
+                target_offset,
+                length,
+                ..
+            } => *target_offset == c.offset && *length as usize == c.length,
+            _ => false,
+        });
+    if !plan.is_empty() && !plan_reproduces_local_layout {
         let reconstructor = if resuming {
             // D10: never truncate — the temp content IS the resume state.
             Reconstructor::open_existing(&request.path, &request.local_source, target_size)?
@@ -948,30 +1017,23 @@ where
         stream.flush()?;
         return Ok(SyncOutcome::Transferred {
             bytes: received,
-            chunks: plan
-                .iter()
-                .filter(|e| matches!(e, PlanEntry::Remote { .. }))
-                .count(),
+            // Every executed entry wrote something (Locals reposition content,
+            // Remotes carry wire bytes) — count them all.
+            chunks: plan.len(),
         });
     }
 
-    // ---- Empty plan (§8 already-in-sync): the sender still sends VERIFY;
-    // compare against the root of our current state. On resume the temp file
-    // is the newest state (a previous attempt may have died after the last
-    // DATA byte), so prefer it when present. ----
-    // v3 (§16): an empty plan with a zero-size sender file means "converge
-    // to empty" — truncate (or drop a resume temp) and verify the empty
-    // root. Must be checked BEFORE the state comparison: a non-empty local
-    // state would otherwise take the HashMismatch path below (v0.2
-    // behavior), making empty sender files unconvergeable. Empty files are
-    // common in trees (§16.2), so this is the load-bearing empty-file fix.
+    // ---- Zero-entry plan (§8) or an all-Local plan that already reproduces
+    // the receiver's chunk layout: nothing to write. The sender still sends
+    // VERIFY; compare against the root of our current state (temp when
+    // resuming, else the old file). ----
     let verify_root = message::read_verify(stream)?;
-    // v3 (§16): an empty plan with a zero-size sender file means "converge
-    // to empty" — truncate (or drop a resume temp) and verify the empty
-    // root. Must be checked BEFORE the state comparison: a non-empty local
-    // state would otherwise take the HashMismatch path below (v0.2
-    // behavior), making empty sender files unconvergeable. Empty files are
-    // common in trees (§16.2), so this is the load-bearing empty-file fix.
+    // v3 (§16): a zero-size sender file means "converge to empty" — truncate
+    // (or drop a resume temp) and verify the empty root. Must be checked
+    // BEFORE the state comparison: a non-empty local state would otherwise
+    // take the HashMismatch path below (v0.2 behavior), making empty sender
+    // files unconvergeable. Empty files are common in trees (§16.2), so this
+    // is the load-bearing empty-file fix.
     //
     // The empty root is verified explicitly: target_size and verify_root
     // come from the same sender state, so a mismatch is a protocol
