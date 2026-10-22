@@ -63,6 +63,40 @@ With this final optimization, the memory usage was significantly reduced while m
 performance. The drive utilization remained at 100%, indicating that the SSD was fully utilized during
 the chunking and hashing process.
 
+## Scale validation: 1 GiB with the v0.1 defaults (2026-10-22)
+
+The F1 chunk-size sweep (see `rsync.md`) picked the v0.1 defaults
+(64 KiB / 256 KiB / 1 MiB) from 32 MiB fixtures — page-cache resident, which
+cast doubt on the flat scan-cost finding. Re-run at 1 GiB with the shipped
+defaults (`--size-mib 1024 --seed 42`, release build, NVMe + SATA mixed
+read path), everything hash-verified:
+
+| scenario | src scan | tgt scan | missing | delta % | dedup | recon | verified |
+|---|---|---|---|---|---|---|---|
+| identical | 348.7 ms | 347.1 ms | 0 B | 0.00% | inf | 1.48 s | yes |
+| modified | 372.7 ms | 383.5 ms | 21.70 MiB | 2.12% | 47.2x | 1.42 s | yes |
+| appended | 373.4 ms | 429.9 ms | 102.40 MiB | 9.09% | 11.0x | 1.58 s | yes |
+| fresh | 391.1 ms | 360.4 ms | 1.00 GiB | 100.00% | 1.0x | 1.25 s | yes |
+
+Findings:
+
+- **Scan cost stays flat at scale**: ~350–390 ms per GiB (vs. 24–29 ms per
+  32 MiB in the sweep — same order, no cliff). First chunk lands at ~1 ms
+  regardless of size, so pipeline warm-up is negligible.
+- **Delta % improves with file size** on localized modifications:
+  4.79% (32 MiB) → 2.12% (1 GiB) for the same ~1% × 2 edit pattern. With
+  fixed-size edit regions, the boundary-shift over-send (D12) is bounded by
+  chunk size, so its *share* shrinks as the file grows. Dedup 47.2x.
+- **Chunk counts confirm the manifest projection**: ~3370 chunks per GiB at
+  avg 256 KiB (sweep rationale projected ~288k for 72 GiB — consistent).
+- Reconstruction at 1 GiB: 1.25–1.58 s (write-bound, ~0.7–0.8 GiB/s) — the
+  verify re-scan included.
+
+Caveats unchanged: seeded random data (worst case for compression, best case
+for CDC boundary stability), warm page cache even at 1 GiB on this machine,
+development-machine noise. Real-content samples are still open (registered as
+F3-adjacent work for the real-world test).
+
 > [!NOTE]
 > These results are no real benchmarks but rather observations during development. Actual benchmarks
 > may vary based on hardware, file types, and other factors. Benchmarks should also run in isolated
