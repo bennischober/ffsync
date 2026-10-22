@@ -8,15 +8,27 @@ All notable changes to ffsync are documented here. The format follows
 
 ### Added
 
+- **Transport security (D16):** TLS 1.3 (rustls, ring provider) is on by
+  default for both `send` and `receive`; `--plaintext` opts out (LAN use or
+  inside an SSH tunnel). Each peer generates a self-signed certificate on
+  first run (stored in the ffsync state directory) and peers authenticate
+  *mutually* by pinning the certificate's SHA-256 fingerprint: first contact
+  shows the fingerprint and asks `trust this peer? [y/N]` (or pass
+  `--trust <fingerprint>` non-interactively); every later sync verifies
+  silently. A non-matching fingerprint is a loud, terminal rejection before
+  any sync data flows. Manage pins with `ffsync trust <fingerprint>`,
+  `ffsync untrust <fingerprint>`, `ffsync fingerprints` (one plain-text
+  `pins.conf` in the state dir; no usernames, no passwords, no secrets on
+  disk — the SSH `known_hosts` mental model, mutual by default).
 - **Persistent chunk index (warm starts, D15):** each synced file gets a
   sidecar `<file>.ffsync-index` (size, mtime, chunk-tree root, ordered chunk
   list) written only from verified state at commit time. On the next sync, a
   peer whose index validates (size + mtime at nanosecond granularity) skips
-  its file scan entirely — repeated syncs of unchanged data become stat-only
+  its file scan entirely - repeated syncs of unchanged data become stat-only
   operations. Corrupt indexes are refused at load (the decoder re-derives the
   chunk-tree root from the chunk list and rejects mismatches); a
   stale-but-validating index fails the sync loudly and is invalidated, so a
-  retry cold-scans and recovers — never a poison loop, never silent
+  retry cold-scans and recovers - never a poison loop, never silent
   corruption.
 
 ### Fixed

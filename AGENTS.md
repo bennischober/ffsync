@@ -72,11 +72,13 @@ pre-existing.
 
 ## Architecture
 
-- `src/lib.rs` — lib target; exposes `chunking`, `index`, `protocol`, and
-  `reconstruction` (tests and the bench binary import through it).
-- `src/main.rs` — the `ffsync` CLI (`send`/`receive`): argument parsing,
-  progress display, TCP setup, and error reporting. Thin by design; the sync
-  logic lives in `protocol::sync`.
+- `src/lib.rs` — lib target; exposes `chunking`, `index`, `protocol`,
+  `reconstruction`, and `transport` (tests and the bench binary import
+  through it).
+- `src/main.rs` — the `ffsync` CLI (`send`/`receive`/`trust`/`untrust`/
+  `fingerprints`): argument parsing, progress display, TCP setup, TLS
+  wiring, and error reporting. Thin by design; the sync logic lives in
+  `protocol::sync`.
 - `src/bin/bench.rs` — the benchmark harness: generates fixture variants
   (identical / modified / appended / fresh), scans both sides through the real
   pipeline, simulates the delta against a hash set, reconstructs the target
@@ -114,9 +116,23 @@ pre-existing.
   zstd delta transfer, locals-first write order, mtime/size fast path,
   resume (D10), warm-start integration (D15)). State machines are generic
   over `S: Read + Write` — transport-agnostic by design.
+- `src/transport.rs` — transport security (D16): rustls TLS 1.3 as a thin
+  wrapper. `Identity` (self-signed cert + PKCS#8 key, raw-DER codec in
+  `identity.bin`, created on first run), SHA-256 fingerprint codec
+  (`AA:BB:…`), `PinPolicy` (`Pinned(set)` vs `FirstUse`), and
+  `client_session`/`server_session` — each completes the TLS handshake
+  eagerly and returns the presented fingerprint; the CLI applies the TOFU
+  decision (prompt or `--trust`) *after* the handshake, before any sync
+  data. The verifier never makes trust decisions by itself. Pins live in
+  `<state-dir>/pins.conf` (one fingerprint per line, atomic rewrite).
+  `--plaintext` bypasses TLS entirely.
 - `tests/loopback.rs` — two-peer integration tests over in-memory duplex
   streams: identical/modified/fresh/fast-path/disconnect-resume plus the
   warm-start, stale-index, and orphan-cleanup scenarios.
+- `tests/tls.rs` — TLS transport tests over real TCP loopback: pin-match
+  converges, third-party cert rejected by the client, unpinned client
+  rejected by the pinned receiver (error names the attacker's
+  fingerprint), FirstUse handshake + sync, pins-file codec round trip.
 - `tests/integration.rs` — end-to-end test: reconstruct a modified file from
   an older local version plus simulated "network" chunks.
 
@@ -160,6 +176,11 @@ pre-existing.
   at the finest available granularity.
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
+- The identity file (`identity.bin`) holds the private key: `0600` on unix,
+  inherited user-profile ACLs on Windows; corrupt identity files are
+  refused loudly (never silently regenerated — that would break every
+  peer's pin). Pins are a set, not per-name entries; any pinned fingerprint
+  may connect in either role.
 - Never commit generated artifacts. `.gitignore` covers `*.bin` and
   `/bench_tmp/` (bench fixtures); `.opencode/` holds local-only configuration
   and credentials.
@@ -168,9 +189,10 @@ pre-existing.
 
 Implemented: single-file sync end-to-end (Phases 2–4 of the workflow doc:
 root-hash identity, chunk diffing and plan generation, transfer + zstd),
-resume, and the persistent chunk index (D15). Not yet implemented: metadata
-scan and triage across a directory tree (Phase 1 — multi-file sync),
-authentication, and transport security (D13: QUIC/TLS decision). See
-`concept/Design Decisions.md` D5 (checksum-based change detection), D8
-(link-adaptive diff strategy), and D13 (transport security) for the design
-questions the next steps must answer.
+resume, the persistent chunk index (D15), and transport security (D16:
+rustls TLS 1.3, mutual TOFU fingerprint pinning). Not yet implemented:
+metadata scan and triage across a directory tree (Phase 1 — multi-file
+sync), and QUIC (D13 amendment: deferred until directory sync makes
+parallel streams worthwhile). See `concept/Design Decisions.md` D5
+(checksum-based change detection), D8 (link-adaptive diff strategy), and
+D13 for the design questions the next steps must answer.

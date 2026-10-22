@@ -17,11 +17,13 @@ commands.
 
 </div>
 
-> **Status: v0.1.0 + warm-start index (unreleased).** Single-file sync between
-> two peers over TCP works end-to-end, including resume after mid-transfer
-> disconnects. Fresh off the bench: a persistent per-file chunk index turns
-> repeated syncs into stat-only operations (D15). Not implemented yet:
-> directory sync and transport security. See [roadmap](#roadmap) below.
+> **Status: v0.1.0 + v0.2 security & warm-start index (unreleased).**
+> Single-file sync between two peers over TLS works end-to-end, including
+> resume after mid-transfer disconnects. Fresh off the bench: a persistent
+> per-file chunk index turns repeated syncs into stat-only operations (D15),
+> and transport security landed (D16): TLS 1.3 by default, mutual
+> fingerprint pinning, no secrets on disk. Not implemented yet: directory
+> sync. See [roadmap](#roadmap) below.
 
 ## Why
 
@@ -105,14 +107,16 @@ length-prefixed, no protobuf, three direct dependencies in the data plane.
 | [zstd](https://github.com/facebook/zstd) | Chunk compression | Measured best ratio/speed trade-off for chunk-sized payloads |
 | [memmap2](https://github.com/RazrFalcon/memmap2-rs) | File I/O | Zero-copy slicing for hash workers; no read() syscalls per chunk |
 | [crossbeam](https://github.com/crossbeam-rs/crossbeam) | Bounded channels | Backpressure between chunkers and hash workers on native threads; no async runtime in the data plane |
+| [rustls](https://github.com/rustls/rustls) + [ring](https://github.com/briansmith/ring) | Transport security (D16) | TLS 1.3 as a thin `Read + Write` wrapper around TCP; the audited, mainstream Rust choice — no hand-rolled channel crypto |
+| [rcgen](https://github.com/rustls/rcgen) | Identity certs | Generates the self-signed peer certificate on first run |
 | rsync (comparison only) | Baseline | The tool this project is measured against, and its delta algorithm is respected, not wrapped |
 
 Design decisions and their alternatives are recorded in
-[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1–D15).
+[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1-D16).
 
 ## Using it
 
-Two terminals on the same machine (or LAN — replace `127.0.0.1` with the
+Two terminals on the same machine (or LAN - replace `127.0.0.1` with the
 receiver's address):
 
 ```bash
@@ -123,11 +127,23 @@ ffsync receive ./big-file.bin 7788
 ffsync send ./big-file.bin 127.0.0.1:7788
 ```
 
+**Transport security is on by default** (D16): both peers generate a
+self-signed certificate on first run and authenticate each other by
+fingerprint. On first contact each side prints the peer's fingerprint and
+asks `trust this peer? [y/N]`; compare it out-of-band (in person, chat,
+whatever you would use to exchange a key), confirm once, and every later
+sync verifies silently. A fingerprint mismatch refuses loudly and syncs
+nothing. For scripts, pass `--trust <fingerprint>` instead of the prompt;
+`ffsync trust <fingerprint>` / `ffsync untrust <fingerprint>` /
+`ffsync fingerprints` manage the pins (`pins.conf` in the ffsync state
+directory - no usernames, no passwords, no secrets on disk). Use
+`--plaintext` for trusted LANs or inside an SSH tunnel.
+
 Flags: `--checksum` disables the mtime/size fast path *and* the warm-start
-index (rsync `-c` semantics — always compare chunk roots); receiver-side
+index (rsync `-c` semantics - always compare chunk roots); receiver-side
 `--from <old-file>` reads the local chunks from a different file than the
 target. If the connection drops mid-transfer, the receiver keeps its partial
-state; rerunning the same two commands **resumes** — the receiver re-scans
+state; rerunning the same two commands **resumes** - the receiver re-scans
 its temp file, unions it with the old file, and only the genuinely missing
 chunks cross the wire. After a successful sync, both peers keep
 `<file>.ffsync-index` sidecars; the next run of an unchanged file shows
@@ -212,13 +228,18 @@ The reasoning is the product; it is all recorded:
 
 ## Roadmap
 
-- **Done (unreleased) — persistent chunk index (warm restarts, D15):** chunks
+- **Done (unreleased) - transport security (D16):** TLS 1.3 by default,
+  mutual authentication by self-signed-cert fingerprint pinning (TOFU with
+  an out-of-band compare on first contact); `--plaintext` keeps LAN/SSH
+  tunnels. QUIC is deferred until directory sync makes parallel streams
+  worthwhile (D13 amendment).
+- **Done (unreleased) - persistent chunk index (warm restarts, D15):** chunks
   are content-addressed, so a persisted index turns repeated syncs into
   stat-only operations. This is the core product insight; rsync rescans
   everything from scratch every run.
-- **v0.2 — QUIC transport** (via connection migration for the
-  "friend over the internet" case) and TLS; plain TCP stays available. The
-  decision is recorded as D13.
+- **v0.3 - QUIC transport** (via connection migration for the
+  "friend over the internet" case); plain TCP and TLS-over-TCP stay
+  available. The decision is recorded as D13.
 - **Later — directory and multi-file sync** with a Merkle tree over per-file
   chunk roots, generalizing the fast path from file to tree. At tree scale
   the per-file sidecar index gives way to a per-directory database (the

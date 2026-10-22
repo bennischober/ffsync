@@ -479,31 +479,51 @@ $ ffsync send big-file.bin 192.168.1.20:7788
 # every later sync: no prompts, pinned fingerprints verified silently
 ```
 
-`ffsync trust <name> <fingerprint>` / `ffsync fingerprints` manage pins in
-the state dir (`~/.ffsync/` / `%APPDATA%\ffsync\`, one TOML file, no
-secrets — fingerprints are public). No config file, no daemon config, no
-users: two commands and a one-time compare. Setup cost vs rsync-over-ssh:
-comparable; vs rsync-daemon: strictly less (no plaintext secrets file, no
-module config); security: strictly more (mutual, pinning beats
-password-over-TLS challenge-response).
+`ffsync trust <fingerprint>` / `ffsync untrust <fingerprint>` /
+`ffsync fingerprints` manage pins in the state dir (`~/.ffsync/` /
+`%APPDATA%\ffsync\`, one plain-text `pins.conf`, one fingerprint per line,
+`#` comments, no secrets — fingerprints are public). Pins are a **set**,
+not per-name entries: any pinned fingerprint may connect, in either role
+(names would be per-host bookkeeping with nothing to enforce — a 1:1 peer
+set has no "user" concept to separate). No config file, no daemon config,
+no users: two commands and a one-time compare. Setup cost vs
+rsync-over-ssh: comparable; vs rsync-daemon: strictly less (no plaintext
+secrets file, no module config); security: strictly more (mutual, pinning
+beats password-over-TLS challenge-response). *(Amended at implementation
+2026-10-22: `trust` takes the fingerprint, not a name; storage is a
+hand-rolled text file, not TOML — D1's no-serde bias; set semantics
+recorded.)*
 
 **Wire mapping:** none — TLS wraps the TCP stream before frame 1; HELLO
 and everything above are unchanged (protocol version stays 2; the framing
 was transport-agnostic by construction, §14.3). Port: TLS is the default
 on the same port scheme; `--plaintext` flag keeps LAN/SSH-tunnel use
 explicit. Fingerprint = SHA-256 over the DER-encoded self-signed cert,
-formatted like SSH's (`AA:BB:…`, 16 groups).
+formatted like SSH's (`AA:BB:…`, uppercase hex pairs). The identity is
+stored raw-DER in `<state-dir>/identity.bin` (4-byte LE cert length,
+cert DER, PKCS#8 key DER; atomic temp+rename; `0600` on unix) — no PEM
+parsing anywhere.
 
-**Validation plan:** loopback tests over an in-memory rustls pair
-(accept, pin-match → sync converges; pin-mismatch → loud rejection with
-distinct error; untrusted first-use without `--trust` → prompt/abort);
-integration test: receiver refuses an unauthenticated writer entirely
-(no file touched). Transport work is confined to `src/transport.rs` +
-CLI wiring; `protocol::sync` signatures unchanged.
+**Validation plan (as implemented):** loopback tests over real TCP
+(`tests/tls.rs`): pin-match on both sides → sync converges; client pinning
+a third-party cert → loud client-side rejection; unpinned client vs pinned
+receiver → server-side refusal naming the attacker's fingerprint; FirstUse
+on both sides → handshake + sync succeed (the CLI's post-handshake prompt
+is a CLI concern, not a transport one — the verifier never makes trust
+decisions by itself, it only *records* what was presented). One deviation
+from the plan as written: the tests run over real TCP loopback, not an
+in-memory rustls pair — same code path the CLI uses, and it exercises the
+eager-handshake contract. Live two-process check (done): interactive TOFU
+prompt on the sender, pre-pinned receiver via `ffsync trust`, silent
+second sync, attacker rejected on both sides.
 
-**Accepted costs:** a new dependency class (rustls + rcgen + a crypto
-provider — the D14 ledger grows by design, recorded when it lands);
-certs never expire practically (self-signed, 10-year, regenerated on
-demand); TOFU's known weakest-link property (documented above); Windows
-state-dir conventions need care (`%APPDATA%`, not the temp dir).
+**Accepted costs:** a new dependency class (rustls + rcgen + ring — the
+D14 ledger grew from 10 to 12 direct crates, recorded in the deps commit);
+the receiver scans its local file *before* the TLS handshake completes
+(no data leaves before authentication, but a rejected peer costs a wasted
+scan — fixing that needs a pre-handshake identity exchange, which defeats
+TLS; accepted); certs never expire practically (self-signed, rcgen
+defaults, regenerated on demand); TOFU's known weakest-link property
+(documented above); Windows state-dir conventions need care (`%APPDATA%`,
+not the temp dir).
 
