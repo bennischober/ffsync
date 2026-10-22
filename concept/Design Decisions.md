@@ -178,22 +178,41 @@ zstd compression. Explicitly out of scope until the core is proven:
 rsync" is entirely in the deferred list. The core loop (scan → diff → transfer
 → reconstruct → verify) is a few hundred lines on top of the existing pipeline.
 
-## D10 — Resume state: open question (receiver-authoritative is the leaning)
+## D10 — Resume state: receiver-authoritative, locals-first write order
 
-**Status:** undecided, leaning receiver-authoritative.
+**Status:** decided on simulation data (2026-10-22).
 
-The receiver's chunk manifest is the natural resume state (see D2). But the
-Phase 3 concept has *both* peers streaming hashes from unfinished scans, so a
-mid-phase disconnect leaves partial state on both ends. Options:
+**Decision:**
+1. **Receiver-authoritative:** after a disconnect, the sender keeps no state
+   and re-scans its file; the receiver's on-disk state is the single source
+   of truth for resume.
+2. **The receiver writes local chunk copies BEFORE remote chunks.** This
+   ordering is not an implementation detail — it is what makes resume work
+   at all: local chunks are ~98% of the file and available offline, so a
+   crash leaves a temp file that is mostly real data. The disconnect
+   simulation measured the alternatives on the 32 MiB modified scenario:
+   - remotes-first (current v0.1 receiver): temp is ~97% zero-filled holes;
+     every chunk straddles a hole; the temp re-scan matched **zero** variant
+     chunks → resume re-sends the full delta. Resume worthless.
+   - locals-first: temp re-scan matches 30–32 MiB; with the union manifest
+     (temp chunks ∪ old-file chunks), resume needs **796 KiB at 50–75%
+     killed** vs. 1.53 MiB cold restart — a ~2x saving at half the transfer,
+     and completion verified end-to-end at every kill rate (25/50/75%).
+3. Resume uses the **union manifest**: on reconnect the receiver re-scans
+   the temp file and unions it with its old-file manifest. The temp-first
+   offset claim keeps each hash mapped to exactly one file. Zero-filled
+   holes produce hashes that match nothing, costing at most a re-send of
+   hole-adjacent chunks — never corruption (final verification is the
+   oracle, unchanged).
+4. A write-journal (recording exact written extents) would beat re-scan
+   slightly, but re-scan reuses one code path and needs no new state
+   format; adopted only if the simulation shows re-scan cost mattering at
+   GiB scale.
 
-- **Receiver-authoritative:** receiver persists its manifest; sender re-scans
-  on reconnect. One source of truth, simpler staleness reasoning, slower
-  reconnects.
-- **Symmetric:** both peers keep manifests. Faster reconnects, but a two-party
-  staleness problem.
-
-A mid-transfer disconnect simulation (planned harness extension) should be
-built before deciding.
+**Why the old "open question" framing was wrong:** the options were framed
+as receiver-manifest vs. symmetric-manifest state. The simulation showed the
+real variable is *what is on disk at crash time* — write ordering — which no
+manifest design can fix retroactively.
 
 ## D11 — mtime/size fast path, with a checksum-only trust mode
 

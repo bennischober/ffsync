@@ -541,6 +541,35 @@ where
     if remote_total > 0 || plan.iter().any(|e| matches!(e, PlanEntry::Remote { .. })) {
         let reconstructor = Reconstructor::new(&request.path, &request.local_source, target_size)?;
 
+        // ---- Local chunk copies FIRST (D10) ----
+        // Local chunks are the bulk of the file and available offline;
+        // writing them before DATA means a mid-transfer crash leaves a temp
+        // that is mostly real data, so a resume's union manifest recovers
+        // nearly everything. (Simulation: remotes-first resume recovers
+        // ~nothing — every chunk straddles a zero-filled hole; locals-first
+        // recovers 30–32 of 32 MiB and halves the resume transfer.)
+        {
+            let mut scratch: Vec<u8> = Vec::new();
+            for entry in &plan {
+                if let PlanEntry::Local {
+                    target_offset,
+                    length,
+                    source_offset,
+                } = entry
+                {
+                    let task = ReconstructionTask {
+                        target_offset: *target_offset,
+                        source: ChunkSource {
+                            offset: *source_offset,
+                            length: *length as usize,
+                            is_local: true,
+                        },
+                    };
+                    reconstructor.write_chunk(&task, &mut scratch, None)?;
+                }
+            }
+        }
+
         // ---- Receive DATA frames (§7) ----
         let mut received: u64 = 0;
         let mut scratch: Vec<u8> = Vec::new();
@@ -580,26 +609,6 @@ where
             reconstructor.write_chunk(&task, &mut scratch, Some(&decompressed))?;
             received += length as u64;
             progress(Progress::Receiving(received, remote_total));
-        }
-
-        // ---- Local chunk copies ----
-        for entry in &plan {
-            if let PlanEntry::Local {
-                target_offset,
-                length,
-                source_offset,
-            } = entry
-            {
-                let task = ReconstructionTask {
-                    target_offset: *target_offset,
-                    source: ChunkSource {
-                        offset: *source_offset,
-                        length: *length as usize,
-                        is_local: true,
-                    },
-                };
-                reconstructor.write_chunk(&task, &mut scratch, None)?;
-            }
         }
 
         // ---- VERIFY (§8) ----

@@ -56,7 +56,7 @@ mod tests {
 
         // 4. Initialize Reconstructor
         // We are trying to build `rec_path` using `v1_path` as our local cache
-        let mut reconstructor = Reconstructor::new(
+        let reconstructor = Reconstructor::new(
             Path::new(rec_path),
             Path::new(v1_path),
             v2_data.len() as u64,

@@ -54,7 +54,7 @@ impl FastCDCChunker {
     /// shift boundaries by one byte).
     pub fn new(min_size: usize, avg_size: usize, max_size: usize) -> Self {
         debug_assert!(
-            min_size % 2 == 0 && avg_size % 2 == 0 && max_size % 2 == 0,
+            min_size.is_multiple_of(2) && avg_size.is_multiple_of(2) && max_size.is_multiple_of(2),
             "fastcdc requires even chunk sizes"
         );
         Self {

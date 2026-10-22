@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
-use super::chunker::Chunker;
-use super::hasher::Hasher;
+use super::chunker::{Chunker, FastCDCChunker};
+use super::hasher::{Blake3Hasher, Hasher};
 use super::types::{Chunk, ChunkEvent};
 
 pub struct PipelineConfig {
@@ -30,6 +30,42 @@ impl Default for PipelineConfig {
 struct ChunkWork {
     offset: u64,
     length: usize,
+}
+
+/// Scans a file through the pipeline and returns all chunks in canonical
+/// file order (sorted by offset).
+///
+/// Hash workers complete chunks concurrently, so the channel's arrival
+/// order is worker-completion order, not file order. Every consumer that
+/// needs a deterministic chunk list (chunk-tree roots, delta diffing,
+/// reconstruction plans) must use this ordering. Offsets are unique because
+/// chunks partition the file.
+pub fn scan_file_ordered(
+    path: &Path,
+    config: &PipelineConfig,
+    cdc: (usize, usize, usize),
+) -> io::Result<(u64, Vec<Chunk>)> {
+    let (min, avg, max) = cdc;
+    let rx = process_file(
+        path,
+        move || FastCDCChunker::new(min, avg, max),
+        Blake3Hasher,
+        config,
+    )?;
+    let mut hashed: u64 = 0;
+    let mut chunks = Vec::new();
+    loop {
+        match rx.recv() {
+            Ok(ChunkEvent::Chunk(chunk)) => {
+                hashed += chunk.length as u64;
+                chunks.push(chunk);
+            }
+            Ok(ChunkEvent::Done) => {}
+            Err(_) => break,
+        }
+    }
+    chunks.sort_by_key(|c| c.offset);
+    Ok((hashed, chunks))
 }
 
 pub fn process_file<C, H>(

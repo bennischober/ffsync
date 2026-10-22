@@ -94,6 +94,8 @@ struct BenchConfig {
     cdc: Option<(usize, usize, usize)>,
     /// Run the chunk-size sweep instead of the default single pass.
     sweep: bool,
+    /// Run the disconnect/resume simulation on the modified scenario.
+    disconnect: bool,
 }
 
 impl BenchConfig {
@@ -189,6 +191,7 @@ Options:
   --seed <N>       deterministic fixture seed (comparable runs across code changes)
   --cdc <m/a/M>    FastCDC sizes, e.g. 64k/256k/1m (default 256k/1m/4m)
   --sweep          run a chunk-size sweep (6 CDC configs) and compare deltas
+  --disconnect     simulate a mid-transfer disconnect and compare resume costs
   --out-dir <path> directory for fixtures and scratch output (default: {})
   --rsync          additionally compare against rsync (native, or via WSL)
   --json           print a machine-readable JSON summary as the last line
@@ -257,6 +260,7 @@ fn parse_args() -> BenchConfig {
         seed: None,
         cdc: None,
         sweep: false,
+        disconnect: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -301,6 +305,7 @@ fn parse_args() -> BenchConfig {
                 cfg.cdc = Some(parsed);
             }
             "--sweep" => cfg.sweep = true,
+            "--disconnect" => cfg.disconnect = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -474,6 +479,293 @@ fn compute_delta(source_chunks: &[Chunk], target_chunks: &[Chunk]) -> DeltaStats
 /// Streams the file through the BLAKE3 hasher to get its root hash.
 fn file_root_hash(path: &Path) -> io::Result<Hash> {
     Blake3Hasher.hash_reader(&mut File::open(path)?)
+}
+
+/// Result of one disconnect/resume simulation point.
+struct DisconnectStats {
+    /// Percentage of remote (DATA) chunks written before the "disconnect".
+    kill_pct: u32,
+    /// Bytes a cold restart would send (delta vs the old file only).
+    cold_restart_bytes: u64,
+    /// Bytes needed when resuming with a temp-file-only manifest.
+    temp_only_resume_bytes: u64,
+    /// Bytes needed when resuming with a union manifest (temp ∪ old file).
+    union_resume_bytes: u64,
+    /// Total bytes already in the temp file when the disconnect happened.
+    temp_written_bytes: u64,
+    /// Whether completing from the temp state reproduced the target file.
+    completion_verified: bool,
+}
+
+/// Simulates a disconnect during the DATA phase and measures what a resume
+/// would cost under three manifest strategies.
+///
+/// Setup mirrors the receiver implementation: the receiver's old file is
+/// `source`, the desired state is `variant`; remote chunks (variant chunks
+/// missing from `source`) are written to the temp file in plan order and the
+/// "disconnect" happens after `kill_pct` of them. Local copies are not yet
+/// written at that point (the current receiver writes them after DATA), so
+/// the temp file contains written remote chunks plus zero-filled holes —
+/// exactly the resume state of a crashed transfer.
+///
+/// Strategies (bytes the sender must put on the wire to finish):
+/// - cold restart: manifest = old file only → equals the original delta.
+/// - temp-only: manifest = re-scan of the temp file. Zero-filled holes
+///   produce hashes that (usually) match nothing and are re-sent; written
+///   regions re-chunk to matching hashes except near hole boundaries.
+/// - union: manifest = temp chunks ∪ old-file chunks. Strictly ≤ both.
+///
+/// Finally the temp file is *completed* (remaining remote chunks + all
+/// local copies) and verified against the target's full-file BLAKE3 hash,
+/// proving the partial state is genuinely recoverable.
+fn simulate_disconnect(
+    source: &Path,
+    variant: &Path,
+    source_chunks: &[Chunk],
+    variant_chunks: &[Chunk],
+    variant_size: u64,
+    variant_hash: Hash,
+    cdc: (usize, usize, usize),
+    kill_pct: u32,
+) -> io::Result<DisconnectStats> {
+    // The Reconstructor derives its on-disk temp path by replacing the last
+    // extension with "ffsync-tmp"; mirror that here.
+    let rec_path = variant.with_file_name("disconnect_sim.bin");
+    let temp_path = rec_path.with_extension("ffsync-tmp");
+    let _ = fs::remove_file(&temp_path);
+
+    let source_hashes: HashSet<Hash> = source_chunks.iter().map(|c| c.hash).collect();
+    let remote_total = variant_chunks
+        .iter()
+        .filter(|c| !source_hashes.contains(&c.hash))
+        .count();
+    let kill_count = ((remote_total as u64 * kill_pct as u64) / 100) as usize;
+
+    // ---- Phase 1: write local copies FIRST, then remote chunks in plan
+    // order, dropping mid-way ----
+    // Rationale (this ordering IS the D10 finding): local chunks are ~98%
+    // of the file and are available offline; writing them first means a
+    // crash leaves a temp that is mostly real data with few holes, and the
+    // union manifest recovers nearly everything. Writing remotes first (the
+    // current receiver does locals *after* DATA) leaves a 97%-hole temp
+    // where every chunk straddles a hole and re-scan recovery collapses to
+    // ~zero — verified empirically (temp-only resume = 32 MiB re-send).
+    let reconstructor = Reconstructor::new(&rec_path, source, variant_size)?;
+    let source_file = File::open(source)?;
+    {
+        let mut local_scratch: Vec<u8> = Vec::new();
+        for chunk in variant_chunks {
+            if let Some(&src_off) = source_index_lookup(source_chunks, chunk.hash) {
+                local_scratch.clear();
+                local_scratch.resize(chunk.length, 0);
+                let read = source_file.read_at(&mut local_scratch[..chunk.length], src_off)?;
+                if read != chunk.length {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+                }
+                let task = ReconstructionTask {
+                    target_offset: chunk.offset,
+                    source: ChunkSource {
+                        offset: src_off,
+                        length: chunk.length,
+                        is_local: true,
+                    },
+                };
+                reconstructor.write_chunk(&task, &mut local_scratch, None)?;
+            }
+        }
+    }
+    let variant_file = File::open(variant)?;
+    let mut scratch: Vec<u8> = Vec::new();
+    let mut remote_seen = 0usize;
+    let mut temp_written_bytes = 0u64;
+    for chunk in variant_chunks {
+        if source_hashes.contains(&chunk.hash) {
+            continue; // locals already written above
+        }
+        if remote_seen >= kill_count {
+            break; // "disconnect"
+        }
+        remote_seen += 1;
+        scratch.clear();
+        scratch.resize(chunk.length, 0);
+        let read = variant_file.read_at(&mut scratch[..chunk.length], chunk.offset)?;
+        if read != chunk.length {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+        }
+        let task = ReconstructionTask {
+            target_offset: chunk.offset,
+            source: ChunkSource {
+                offset: 0,
+                length: chunk.length,
+                is_local: false,
+            },
+        };
+        let payload = scratch.clone();
+        reconstructor.write_chunk(&task, &mut scratch, Some(&payload))?;
+        temp_written_bytes += chunk.length as u64;
+    }
+    drop(reconstructor); // close the handle without finalize; temp remains
+
+    // ---- Phase 2: scan the temp file (the resume manifest source) ----
+    let (_, temp_chunks) = scan_file(&temp_path, &PipelineConfig::default(), cdc)?;
+    let temp_hashes: HashSet<Hash> = temp_chunks.iter().map(|c| c.hash).collect();
+
+    // Diagnostics: how much of the temp matches variant chunks at all?
+    let temp_matching: u64 = variant_chunks
+        .iter()
+        .filter(|c| temp_hashes.contains(&c.hash))
+        .map(|c| c.length as u64)
+        .sum();
+    eprintln!(
+        "    [dbg] kill={} wrote={} variant_chunks={} temp_chunks={} temp_bytes_matching_variant={}",
+        kill_pct,
+        temp_written_bytes,
+        variant_chunks.len(),
+        temp_chunks.len(),
+        temp_matching
+    );
+
+    // ---- Byte accounting per strategy ----
+    // The sender diffs ITS chunk list (variant_chunks, since the sender owns
+    // the desired state) against the receiver's manifest. A chunk is covered
+    // iff its hash is in the manifest set.
+    let source_hashes = source_hashes; // already computed
+    let mut cold_restart_bytes = 0u64;
+    let mut temp_only_resume_bytes = 0u64;
+    let mut union_resume_bytes = 0u64;
+    for chunk in variant_chunks {
+        let len = chunk.length as u64;
+        if !source_hashes.contains(&chunk.hash) {
+            cold_restart_bytes += len;
+        }
+        if !temp_hashes.contains(&chunk.hash) {
+            temp_only_resume_bytes += len;
+        }
+        if !temp_hashes.contains(&chunk.hash) && !source_hashes.contains(&chunk.hash) {
+            union_resume_bytes += len;
+        }
+    }
+
+    // ---- Phase 3: complete from the temp state and verify ----
+    // NOTE: do NOT touch Reconstructor::new here — it truncates the temp
+    // file and would erase phase 1's state. The killed remotes are skipped
+    // as "already written", which is only true if we did not truncate.
+    let completion_verified = {
+        let mut temp = OpenOptions::new().read(true).write(true).open(&temp_path)?;
+        let mut local_scratch: Vec<u8> = Vec::new();
+        // Remaining remote chunks (skip the ones already written).
+        let mut remote_seen = 0usize;
+        for chunk in variant_chunks {
+            if source_hashes.contains(&chunk.hash) {
+                continue;
+            }
+            let already = remote_seen < kill_count;
+            remote_seen += 1;
+            if already {
+                continue;
+            }
+            scratch.clear();
+            scratch.resize(chunk.length, 0);
+            let read = variant_file.read_at(&mut scratch[..chunk.length], chunk.offset)?;
+            if read != chunk.length {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+            }
+            temp.write_at(&scratch[..chunk.length], chunk.offset)?;
+        }
+        // Local copies from the old file.
+        let source_file = File::open(source)?;
+        for chunk in variant_chunks {
+            if let Some(&src_off) = source_index_lookup(source_chunks, chunk.hash) {
+                local_scratch.clear();
+                local_scratch.resize(chunk.length, 0);
+                let read = source_file.read_at(&mut local_scratch[..chunk.length], src_off)?;
+                if read != chunk.length {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+                }
+                temp.write_at(&local_scratch[..chunk.length], chunk.offset)?;
+            }
+        }
+        temp.sync_all()?;
+        // Verify against the target's standard full-file hash (same oracle
+        // as the bench's reconstruct()).
+        let actual = file_root_hash(&temp_path)?;
+        actual == variant_hash
+    };
+    let _ = fs::remove_file(&temp_path);
+
+    Ok(DisconnectStats {
+        kill_pct,
+        cold_restart_bytes,
+        temp_only_resume_bytes,
+        union_resume_bytes,
+        temp_written_bytes,
+        completion_verified,
+    })
+}
+
+/// Looks up a chunk's offset in the source chunk list.
+fn source_index_lookup<'a>(source_chunks: &'a [Chunk], hash: Hash) -> Option<&'a u64> {
+    source_chunks
+        .iter()
+        .find(|c| c.hash == hash)
+        .map(|c| &c.offset)
+}
+
+/// Runs the disconnect simulation on the modified scenario across kill
+/// percentages and prints the resume-cost comparison table.
+fn run_disconnect_simulation(
+    source: &Path,
+    variant: &Path,
+    source_chunks: &[Chunk],
+    variant_chunks: &[Chunk],
+    cdc: (usize, usize, usize),
+) -> io::Result<()> {
+    let variant_size = fs::metadata(variant)?.len();
+    let variant_hash = file_root_hash(variant)?;
+
+    println!();
+    println!("==== disconnect simulation (scenario: modified) ====");
+    println!("kill %   written      cold restart   temp-only resume   union resume   completed");
+    let mut all_verified = true;
+    for kill_pct in [25u32, 50, 75] {
+        let stats = simulate_disconnect(
+            source,
+            variant,
+            source_chunks,
+            variant_chunks,
+            variant_size,
+            variant_hash,
+            cdc,
+            kill_pct,
+        )?;
+        all_verified &= stats.completion_verified;
+        println!(
+            "{:>5}%  {:>9}  {:>13}  {:>17}  {:>13}  {:>9}",
+            stats.kill_pct,
+            fmt_bytes(stats.temp_written_bytes),
+            fmt_bytes(stats.cold_restart_bytes),
+            fmt_bytes(stats.temp_only_resume_bytes),
+            fmt_bytes(stats.union_resume_bytes),
+            if stats.completion_verified {
+                "yes"
+            } else {
+                "NO"
+            },
+        );
+    }
+    println!();
+    println!(
+        "Reading: 'cold restart' is what v0.1 does today (re-send the full delta);\
+\n'temp-only' resumes from the temp file re-scan; 'union' also matches the old\
+\nfile's chunks (temp-first). Completion 'yes' proves the partial temp state\
+\nis recoverable end-to-end."
+    );
+    if !all_verified {
+        return Err(io::Error::other(
+            "disconnect simulation failed verification",
+        ));
+    }
+    Ok(())
 }
 
 /// Reconstructs the target variant from the source file via `Reconstructor`.
@@ -1224,6 +1516,20 @@ fn main() -> io::Result<()> {
     }
 
     print_summary(&results);
+
+    if cfg.disconnect {
+        // Simulate a mid-transfer disconnect on the modified scenario: the
+        // receiver's old file is the source, the desired state is the
+        // modified variant.
+        let modified = &variants
+            .iter()
+            .find(|(s, _)| *s == Scenario::Modified)
+            .expect("modified variant")
+            .1;
+        let (_, variant_chunks) = scan_file(modified, &pipeline, cdc)?;
+        let (_, source_chunks) = scan_file(&source, &pipeline, cdc)?;
+        run_disconnect_simulation(&source, modified, &source_chunks, &variant_chunks, cdc)?;
+    }
 
     let rsync = if cfg.rsync {
         Some(run_rsync_comparison(&cfg, &source, &variants)?)
