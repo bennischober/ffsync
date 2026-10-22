@@ -3,6 +3,43 @@
 First real head-to-head numbers, from the bench harness (`--rsync`, via WSL:
 Ubuntu 20.04, rsync 3.1.3, reading fixtures through `/mnt/c`).
 
+## F1: chunk-size sweep (2026-10-22)
+
+Sweep across CDC configurations on the 32 MiB seeded fixtures
+(`--sweep --seed 42`; delta % = share of the target file the sender must
+transmit):
+
+| min/avg/max | modified | appended | src scan |
+|---|---|---|---|
+| 16k / 64k / 256k | **2.35%** | 9.21% | 28.1 ms |
+| 32k / 128k / 512k | 4.24% | 9.21% | 28.1 ms |
+| 64k / 256k / 1m | 4.79% | 9.21% | 27.4 ms |
+| 128k / 512k / 2m | 6.11% | 10.62% | 24.3 ms |
+| 256k / 1m / 4m (old default) | 11.24% | 9.21% | 23.9 ms |
+| 512k / 2m / 8m | 14.34% | 13.72% | 28.7 ms |
+
+Findings:
+
+- Delta % on `modified` scales roughly linearly with chunk size (2.35% at
+  64k avg vs 11.24% at 1m avg) — the boundary-shift over-send (D12) dominates
+  the delta at large chunks. Smaller is dramatically better here.
+- Scan cost is *flat* across the sweep (24–29 ms for 32 MiB): the pipeline is
+  not chunk-size-bound at these sizes. The page-cache caveat applies; the GiB
+  run should be re-checked, but nothing suggests a cliff.
+- `appended` is insensitive to chunk size at ≤1m avg (append-only content
+  re-chunks identically after the boundary) and degrades at ≥512k avg.
+- **v0.1 defaults picked: 64 KiB / 256 KiB / 1 MiB.** Rationale: ~2.3x less
+  over-send than the old default on localized modifications at essentially
+  no scan cost, chunk counts stay modest (≈1 chunk per 256 KiB ⇒ a 72 GiB
+  file yields ~288k chunks; manifest and plan traffic remain small), and the
+  max of 1 MiB caps reconstruction scratch buffers. The deep-research
+  recommendation of 32–256 KiB average was directionally right; 256 KiB is
+  the sweet spot between over-send and per-chunk overhead in this sweep.
+
+Caveats: 32 MiB is page-cache resident; sweep fixtures are random data
+(worst case for compression, best case for CDC boundary stability). Real
+media files chunk differently — worth re-running on a real file sample.
+
 ## Measurement traps (learned the hard way)
 
 1. **Same-host rsync disables delta transmission.** For local copies rsync

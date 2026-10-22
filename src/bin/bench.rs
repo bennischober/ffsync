@@ -24,12 +24,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
-/// FastCDC lower bound used for every scan.
-const CHUNK_MIN: usize = 256 * 1024;
-/// FastCDC average target used for every scan.
-const CHUNK_AVG: usize = 1024 * 1024;
-/// FastCDC upper bound used for every scan.
-const CHUNK_MAX: usize = 4 * 1024 * 1024;
+/// FastCDC lower bound used for every scan (default).
+const CHUNK_MIN: usize = 64 * 1024;
+/// FastCDC average target used for every scan (default).
+const CHUNK_AVG: usize = 256 * 1024;
+/// FastCDC upper bound used for every scan (default).
+const CHUNK_MAX: usize = 1024 * 1024;
 
 /// Fixture files are written in blocks of this size.
 const WRITE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -90,6 +90,10 @@ struct BenchConfig {
     /// Deterministic fixtures make bench runs comparable across code changes
     /// (chunk hashes, deltas, and rsync's view of the files are all stable).
     seed: Option<u64>,
+    /// FastCDC (min, avg, max) chunk sizes; `None` = defaults.
+    cdc: Option<(usize, usize, usize)>,
+    /// Run the chunk-size sweep instead of the default single pass.
+    sweep: bool,
 }
 
 impl BenchConfig {
@@ -183,6 +187,8 @@ Options:
   --size-mib <N>   fixture size in MiB (default: {})
   --quick          use a {} MiB fixture for a fast run
   --seed <N>       deterministic fixture seed (comparable runs across code changes)
+  --cdc <m/a/M>    FastCDC sizes, e.g. 64k/256k/1m (default 256k/1m/4m)
+  --sweep          run a chunk-size sweep (6 CDC configs) and compare deltas
   --out-dir <path> directory for fixtures and scratch output (default: {})
   --rsync          additionally compare against rsync (native, or via WSL)
   --json           print a machine-readable JSON summary as the last line
@@ -197,6 +203,49 @@ fn die(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+/// Parses a `min/avg/max` triple in bytes (e.g. `64k/256k/1m`), all even.
+fn parse_cdc(value: &str) -> (usize, usize, usize) {
+    let parse_unit = |s: &str| -> usize {
+        let s = s.trim().to_ascii_lowercase();
+        let (digits, mult) = match s.as_bytes().last() {
+            Some(b'k') => (&s[..s.len() - 1], 1024usize),
+            Some(b'm') => (&s[..s.len() - 1], 1024 * 1024),
+            Some(b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+            _ => (s.as_str(), 1usize),
+        };
+        let n: usize = digits
+            .parse()
+            .unwrap_or_else(|_| die(&format!("invalid cdc size: {}", s)));
+        n * mult
+    };
+    let parts: Vec<&str> = value.split('/').collect();
+    if parts.len() != 3 {
+        die("--cdc expects min/avg/max, e.g. --cdc 64k/256k/1m");
+    }
+    let triple = (
+        parse_unit(parts[0]),
+        parse_unit(parts[1]),
+        parse_unit(parts[2]),
+    );
+    if triple.0 == 0 || triple.1 < triple.0 || triple.2 < triple.1 {
+        die("--cdc requires 0 < min <= avg <= max");
+    }
+    if triple.0 % 2 != 0 || triple.1 % 2 != 0 || triple.2 % 2 != 0 {
+        die("--cdc values must be even (fastcdc 5.0 requirement)");
+    }
+    triple
+}
+
+/// CDC configurations swept by `--sweep`, roughly on a log scale.
+const SWEEP_POINTS: [(usize, usize, usize); 6] = [
+    (16 * 1024, 64 * 1024, 256 * 1024),
+    (32 * 1024, 128 * 1024, 512 * 1024),
+    (64 * 1024, 256 * 1024, 1024 * 1024),
+    (128 * 1024, 512 * 1024, 2 * 1024 * 1024),
+    (256 * 1024, 1024 * 1024, 4 * 1024 * 1024),
+    (512 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024),
+];
+
 fn parse_args() -> BenchConfig {
     let mut cfg = BenchConfig {
         size_mib: DEFAULT_SIZE_MIB,
@@ -206,6 +255,8 @@ fn parse_args() -> BenchConfig {
         json: false,
         size_explicit: false,
         seed: None,
+        cdc: None,
+        sweep: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -242,6 +293,14 @@ fn parse_args() -> BenchConfig {
                     .unwrap_or_else(|_| die(&format!("invalid --seed value: {}", value)));
                 cfg.seed = Some(parsed);
             }
+            "--cdc" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| die("--cdc requires min/avg/max"));
+                let parsed = parse_cdc(&value);
+                cfg.cdc = Some(parsed);
+            }
+            "--sweep" => cfg.sweep = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -351,11 +410,16 @@ fn generate_fixtures(cfg: &BenchConfig) -> io::Result<(PathBuf, Vec<(Scenario, P
 }
 
 /// Scans `path` with the production pipeline and collects all chunks.
-fn scan_file(path: &Path, pipeline: &PipelineConfig) -> io::Result<(ScanStats, Vec<Chunk>)> {
+fn scan_file(
+    path: &Path,
+    pipeline: &PipelineConfig,
+    cdc: (usize, usize, usize),
+) -> io::Result<(ScanStats, Vec<Chunk>)> {
     let start = Instant::now();
+    let (min, avg, max) = cdc;
     let rx = process_file(
         path,
-        || FastCDCChunker::new(CHUNK_MIN, CHUNK_AVG, CHUNK_MAX),
+        move || FastCDCChunker::new(min, avg, max),
         Blake3Hasher,
         pipeline,
     )?;
@@ -482,9 +546,10 @@ fn run_scenario(
     source: &Path,
     variant: &Path,
     pipeline: &PipelineConfig,
+    cdc: (usize, usize, usize),
 ) -> io::Result<ScenarioResult> {
-    let (source_scan, source_chunks) = scan_file(source, pipeline)?;
-    let (target_scan, target_chunks) = scan_file(variant, pipeline)?;
+    let (source_scan, source_chunks) = scan_file(source, pipeline, cdc)?;
+    let (target_scan, target_chunks) = scan_file(variant, pipeline, cdc)?;
     let delta = compute_delta(&source_chunks, &target_chunks);
 
     let source_index: HashMap<Hash, u64> =
@@ -600,6 +665,48 @@ fn print_projection_table(delta: &DeltaStats, scan_max: Duration) {
 }
 
 /// Prints the compact one-line-per-scenario summary table.
+/// Cross-config comparison of the sweep: one row per CDC configuration,
+/// one column per scenario, showing delta % (the over-send metric) and scan
+/// cost. The interesting columns are `modified`/`appended` delta % versus
+/// `fresh`/`identical` scan throughput.
+fn print_sweep_conclusion(all_results: &[Vec<ScenarioResult>]) {
+    println!();
+    println!("==== sweep conclusion (delta % per scenario) ====");
+    println!(
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "cdc avg/min/max", "identical", "modified", "appended", "fresh", "src scan"
+    );
+    for (point, results) in SWEEP_POINTS.iter().zip(all_results) {
+        let get = |name: &str| -> &ScenarioResult {
+            results
+                .iter()
+                .find(|r| r.scenario.name() == name)
+                .expect("scenario in sweep results")
+        };
+        let scan = get("modified").source_scan.total;
+        println!(
+            "{:<22} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10}",
+            format!(
+                "{}/{}/{}",
+                fmt_bytes(point.0 as u64),
+                fmt_bytes(point.1 as u64),
+                fmt_bytes(point.2 as u64)
+            ),
+            get("identical").delta.pct(),
+            get("modified").delta.pct(),
+            get("appended").delta.pct(),
+            get("fresh").delta.pct(),
+            fmt_ms(scan),
+        );
+    }
+    println!();
+    println!(
+        "Reading: lower delta % on modified/appended = fewer bytes on the wire;\
+\nsmaller chunks cost scan throughput and produce more chunks (plan frames).\
+\nPick the smallest avg size whose scan cost is acceptable for the target link."
+    );
+}
+
 fn print_summary(results: &[ScenarioResult]) {
     println!();
     println!("==== summary ====");
@@ -1080,9 +1187,33 @@ fn main() -> io::Result<()> {
     let (source, variants) = generate_fixtures(&cfg)?;
     let pipeline = PipelineConfig::default();
 
+    let cdc = cfg.cdc.unwrap_or((CHUNK_MIN, CHUNK_AVG, CHUNK_MAX));
+
+    if cfg.sweep {
+        let mut all_results: Vec<Vec<ScenarioResult>> = Vec::new();
+        for cdc_point in SWEEP_POINTS {
+            println!(
+                "\n==== cdc min/avg/max = {}/{}/{} ====",
+                fmt_bytes(cdc_point.0 as u64),
+                fmt_bytes(cdc_point.1 as u64),
+                fmt_bytes(cdc_point.2 as u64)
+            );
+            let mut results = Vec::new();
+            for (scenario, path) in &variants {
+                let result = run_scenario(*scenario, &source, path, &pipeline, cdc_point)?;
+                print_scenario_report(&result, path);
+                results.push(result);
+            }
+            print_summary(&results);
+            all_results.push(results);
+        }
+        print_sweep_conclusion(&all_results);
+        return Ok(());
+    }
+
     let mut results = Vec::new();
     for (scenario, path) in &variants {
-        let result = run_scenario(*scenario, &source, path, &pipeline)?;
+        let result = run_scenario(*scenario, &source, path, &pipeline, cdc)?;
         print_scenario_report(&result, path);
         results.push(result);
     }

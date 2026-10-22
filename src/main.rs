@@ -61,7 +61,7 @@ async fn main() -> std::io::Result<()> {
         let start = Instant::now();
         let rx = process_file(
             path,
-            || FastCDCChunker::new(256 * 1024, 1024 * 1024, 4 * 1024 * 1024),
+            || FastCDCChunker::new(64 * 1024, 256 * 1024, 1024 * 1024),
             Blake3Hasher,
             &config,
         )?;

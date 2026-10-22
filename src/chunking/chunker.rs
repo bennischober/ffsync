@@ -1,3 +1,10 @@
+/// FastCDC lower bound of the default configuration.
+pub const CHUNK_MIN: usize = 64 * 1024;
+/// FastCDC average target of the default configuration.
+pub const CHUNK_AVG: usize = 256 * 1024;
+/// FastCDC upper bound of the default configuration.
+pub const CHUNK_MAX: usize = 1024 * 1024;
+
 /// Trait for different chunking strategies
 pub trait Chunker: Send {
     fn chunk<'a>(&'a mut self, data: &'a [u8]) -> Box<dyn Iterator<Item = ChunkBoundary> + 'a>;
