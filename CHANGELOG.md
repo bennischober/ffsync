@@ -6,7 +6,47 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet — see [0.2.0]._
+### Added
+
+- **Directory-tree sync (D17, protocol v3):** pass a directory to
+  `ffsync send` / `ffsync receive` and the *contents* of the directory sync
+  into the destination directory (`dir` and `dir/` mean the same thing —
+  no rsync trailing-slash semantics). Both peers exchange metadata-only
+  tree manifests (relative path, kind, size, mtime), triage locally and
+  identically, then run the proven per-file machinery sequentially over
+  one connection for exactly the files that need it. Matching files are
+  skipped without a byte of file I/O; nested and empty directories are
+  created; kind conflicts (file vs. dir on the same path) resolve with the
+  sender's kind winning.
+- **`--no-delete` (tree mode):** by default the receiver deletes files that
+  exist only locally — the sender's tree is authoritative, like
+  `rsync --delete`. The flag keeps them. Deletions always apply only
+  after every transfer succeeded: a failed session never destroys data.
+- **Wire protocol v3:** new frames TREE_BEGIN (0x0C), TREE_END (0x0D),
+  FILE_SYNC (0x0E). v0.2 peers reject v3 loudly (strict framing + version
+  check); single-file sync between v0.3 peers is unchanged apart from the
+  two behaviors below.
+
+### Changed
+
+- **mtime preservation on commit (breaking-ish, §16.6):** after a verified
+  transfer the receiver sets the target file's mtime to the sender's.
+  Without this, tree syncs would re-check every synced file forever; with
+  it, an unchanged tree syncs metadata-only. Single-file syncs benefit the
+  same way (the next run fast-paths instead of re-verifying). Matches
+  rsync's default `--times` behavior.
+- **Empty sender files now converge (bug fix):** a zero-byte sender file
+  used to fail with `HashMismatch` against a non-empty receiver file; it
+  now truncates the target to empty (verified against the empty root).
+
+### Fixed
+
+- Tree manifests exclude ffsync's own bookkeeping (`*.ffsync-index`,
+  `*.ffsync-tmp`); syncing them would have synced internal state and
+  desynced warm starts.
+- Receiver-only directories are deleted (deepest-first) with their files;
+  directories the sender still has survive even when empty on the
+  receiver.
 
 ## [0.2.0] - 2026-10-22
 

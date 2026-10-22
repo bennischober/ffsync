@@ -1,5 +1,15 @@
 The `ffsync` synchronisation process is a multi-phase pipeline designed to eliminate redundant work at every step. It uses a series of progressively deeper "diffs" to ensure that the expensive work of chunk-level analysis is only performed on the absolute minimum set of files required.
 
+> **Status (v0.3):** Phase 1 is implemented as the tree manifest exchange and
+> triage (`Design Decisions.md` D17, wire spec §16 of `Protocol v0.1.md`).
+> Phase 2 is **absorbed into Phase 3**: the per-file conversation's VERIFY
+> (chunk-tree root comparison) is a strictly stronger identity check than a
+> per-file root exchange, and with warm indexes (D15) it costs no extra scan.
+> A separate whole-file-hash exchange would only save wire frames for
+> touched-but-identical files with warm indexes — measured to be a marginal
+> win, not implemented (recorded in D17). Phases 3–4 are the existing
+> per-file state machines, run sequentially inside the tree envelope.
+
 *   **Phase 1: Fast Metadata Reconciliation ("Shallow Diff")**
     1.  **Concurrent Scan:** Immediately after the connection is established, both client and server begin a parallel, non-blocking scan of their respective directory trees. This scan is lightweight, gathering only file metadata: `(relative_path, size, modification_time)`.
     2.  **Metadata Exchange:** The client and server stream their metadata lists to each other.

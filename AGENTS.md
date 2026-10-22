@@ -6,13 +6,17 @@ Guidance for AI coding agents (and humans) working in this repository.
 
 `ffsync` is a file synchronization tool written in Rust that syncs data at the
 chunk level to minimize transfer and I/O, similar in spirit to rsync. As of
-v0.2 (unreleased), single-file sync between two peers over TCP works
-end-to-end: parallel chunking/hashing pipeline, file reconstruction,
-manifest/plan exchange, zstd-compressed transfer, chunk-root verification,
-mtime/size fast path (sub-second mtimes, protocol v2), resume after
-mid-transfer disconnects, and the persistent chunk index for warm starts
-(D15). Not implemented yet: directory/multi-file sync, authentication, and
-encryption/TLS.
+v0.3 (unreleased), single-file sync **and directory-tree sync** between two
+peers over TCP work end-to-end: parallel chunking/hashing pipeline, file
+reconstruction, manifest/plan exchange, zstd-compressed transfer,
+chunk-root verification, mtime/size fast path (sub-second mtimes),
+resume after mid-transfer disconnects, the persistent chunk index for warm
+starts (D15), TLS transport with mutual TOFU fingerprint pinning (D16), and
+tree sync (D17: protocol v3 — TREE_BEGIN/TREE_END envelope, sequential
+per-file conversations, mtime preservation on commit, deletes deferred to
+session end, `--no-delete` opt-out). Not implemented yet: excludes/pattern
+matching, parallel per-file streams (QUIC, D13), permissions/xattrs/symlink
+policy (D9).
 
 Design documents (read before making architectural changes):
 
@@ -114,8 +118,16 @@ pre-existing.
   `message.rs` (HELLO/manifest/plan/DATA/VERIFY/… codecs), `sync.rs` (the
   sender/receiver state machines: manifest exchange, exact-hash diffing (D12),
   zstd delta transfer, locals-first write order, mtime/size fast path,
-  resume (D10), warm-start integration (D15)). State machines are generic
-  over `S: Read + Write` — transport-agnostic by design.
+  resume (D10), warm-start integration (D15)), and `tree_sync.rs` (the v3
+  tree session orchestrators: TREE_BEGIN/TREE_END envelope, deterministic
+  triage on both sides, sequential per-file conversations, deferred
+  deletions). State machines are generic over `S: Read + Write` —
+  transport-agnostic by design.
+- `src/tree.rs` — the tree layer (D17): metadata-only directory scan
+  (sorted, ffsync sidecar files excluded), relative-path validation
+  (no traversal, wire paths always `/`-separated), the `triage` pure
+  function (skip/sync/transfer/create-dir/delete/kind-conflict), and
+  the tree manifest type. Pure computation — no protocol frames here.
 - `src/transport.rs` — transport security (D16): rustls TLS 1.3 as a thin
   wrapper. `Identity` (self-signed cert + PKCS#8 key, raw-DER codec in
   `identity.bin`, created on first run), SHA-256 fingerprint codec
@@ -133,6 +145,12 @@ pre-existing.
   converges, third-party cert rejected by the client, unpinned client
   rejected by the pinned receiver (error names the attacker's
   fingerprint), FirstUse handshake + sync, pins-file codec round trip.
+- `tests/tree.rs` — tree-session tests over real TCP loopback: converge a
+  mixed tree (nested dirs, empty files/dirs), second session skips
+  everything (mtime preservation fast path), modified/new-only deltas,
+  deletes after success, `--no-delete`, `--checksum`, empty-file
+  convergence, kind conflicts, v2-flow peers rejecting TREE_BEGIN,
+  wire path traversal refused, vanished sender files fail closed.
 - `tests/integration.rs` — end-to-end test: reconstruct a modified file from
   an older local version plus simulated "network" chunks.
 
@@ -174,6 +192,24 @@ pre-existing.
   comparisons let a same-second same-size rewrite pass as unchanged — a
   silent wrong-content sync. Any new metadata-based fast path must compare
   at the finest available granularity.
+- mtime preservation on commit (§16.6, v3) is what makes tree syncs skip:
+  the receiver sets the target's mtime to the sender's *before* writing the
+  D15 index (order: rename → set_modified → stat → write_index). Reversing
+  the order leaves the index recording the wrong mtime and every subsequent
+  tree sync re-checks the file.
+- Tree manifests must exclude `*.ffsync-index` / `*.ffsync-tmp` — they are
+  ffsync's own bookkeeping; syncing them would sync internal state and
+  desync warm starts (an index written at commit changes mtime → re-sync
+  loop). The scan filter in `src/tree.rs` is the single place this lives.
+- Tree triage must be deterministic and identical on both peers (same two
+  manifests, same flags — the receiver derives its flags from the sender's
+  TREE_BEGIN). Any nondeterminism desyncs the per-file conversation
+  sequence; the receiver fails loudly on the first unexpected HELLO.
+- Tree sessions make the fast-path branch explicit (FILE_SYNC frame);
+  single-file mode still relies on the drain-after-NOT_MODIFIED dance.
+  Do not "simplify" one to match the other — they differ because the
+  session continues after a tree conversation but ends after a single-file
+  one.
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
 - The identity file (`identity.bin`) holds the private key: `0600` on unix,
@@ -189,10 +225,13 @@ pre-existing.
 
 Implemented: single-file sync end-to-end (Phases 2–4 of the workflow doc:
 root-hash identity, chunk diffing and plan generation, transfer + zstd),
-resume, the persistent chunk index (D15), and transport security (D16:
-rustls TLS 1.3, mutual TOFU fingerprint pinning). Not yet implemented:
-metadata scan and triage across a directory tree (Phase 1 — multi-file
-sync), and QUIC (D13 amendment: deferred until directory sync makes
-parallel streams worthwhile). See `concept/Design Decisions.md` D5
-(checksum-based change detection), D8 (link-adaptive diff strategy), and
-D13 for the design questions the next steps must answer.
+resume, the persistent chunk index (D15), transport security (D16:
+rustls TLS 1.3, mutual TOFU fingerprint pinning), and directory-tree sync
+(D17, protocol v3: Phase 1 metadata triage + per-file conversations,
+mtime preservation, deferred deletes). Not yet implemented: excludes/
+pattern matching, parallel per-file streams — QUIC (D13 amendment:
+deferred until measurement shows parallel streams worthwhile), and
+permissions/xattrs/symlinks as first-class metadata (D9). See
+`concept/Design Decisions.md` D5 (checksum-based change detection) and
+D8 (link-adaptive diff strategy) for the design questions the pipelining
+step must answer.
