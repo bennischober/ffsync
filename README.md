@@ -217,6 +217,22 @@ case for compression, best case for CDC boundary stability). Treat the numbers
 as structural, not as your-hardware numbers; the harness reproduces them with
 `--size-mib 1024` on real-sized files.
 
+**Tree sessions** (`--tree`, D17): a 40-file / 135 MiB fixture across 6 dirs
+run through three simulated sessions — everything transfers when the receiver
+is empty, a diverged session moves only the changed bytes, and the warm
+unchanged session is stat-only:
+
+```
+session 1 (receiver empty)   scan 0.9 ms   40 conversations   135.0 MiB transferred
+session 2 (diverged, cold)   scan 1.5 ms   15 conversations   17.44 MiB transferred (54.5% of touched files)
+session 3 (unchanged, warm)  scan 1.5 ms    0 conversations    0 B transferred
+```
+
+The unchanged session skips hashing entirely (mtime preservation at commit
+makes the metadata fast path hold tree-wide); the diverged session deletes
+receiver-only files only after every conversation succeeded. Measured details
+in [`evaluation/chunking.md`](evaluation/chunking.md).
+
 ## Building and benchmarking
 
 ```bash
@@ -224,6 +240,7 @@ cargo build --release
 cargo test
 cargo run --release --bin bench -- --quick          # fast run (32 MiB)
 cargo run --release --bin bench -- --size-mib 1024  # 1 GiB, stresses the pipeline
+cargo run --release --bin bench -- --tree --seed 42 # tree sessions (D17)
 cargo run --release --bin bench -- --quick --rsync  # also time rsync (native or WSL)
 cargo audit                                          # dependency advisory check
 ```

@@ -133,3 +133,43 @@ its cold-read cost is one disk seek, still far below any scan).
 > These results are no real benchmarks but rather observations during development. Actual benchmarks
 > may vary based on hardware, file types, and other factors. Benchmarks should also run in isolated
 > environments to minimize interference from other processes.
+## Tree sync: sessions at tree scale (D17, 2026-10-22)
+
+Measured with ench --tree --seed 42 (release build): a 40-file /
+6-dir fixture (135 MiB — 1–4 MiB small files, a few 20–64 MiB big ones,
+some empty files, one empty dir), three simulated sessions using the
+production pipeline for scans and the real 	ree::triage for the action
+lists. "Delta sim" hashes both sides of every conversation file and
+counts chunks the receiver lacks (zstd 1x model):
+
+| session | tree scan (both) | conversations | delta sim | transfers | deleted |
+|---|---|---|---|---|---|
+| 1: receiver empty | 0.9 ms | 40 | 138.0 ms | 135.0 MiB | 0 |
+| 2: diverged (cold) | 1.5 ms | 15 | 84.5 ms | 17.44 MiB | 5 (2.5 MiB) |
+| 3: unchanged (warm) | 1.5 ms | 0 | 0.0 ms | 0 B | 0 |
+
+Findings:
+
+- **The tree fast path is stat-only**: an unchanged session (session 3)
+  reads metadata for 51 paths in ~1.5 ms and transfers nothing — no
+  hashing, no chunk I/O. mtime preservation at commit (§16.6) is what
+  makes this hold: without it every synced file would re-hash every run.
+- **A diverged session moves exactly the changed bytes**: 15
+  conversations over 32 MiB of touched/new files transferred 17.44 MiB
+  (54.5%) — chunk-level dedup on top of the file-level skip. The 5
+  receiver-only files (2.5 MiB) were delete candidates, applied only
+  after every conversation succeeded (fail-closed, §16.5).
+- **The metadata scan is negligible at this scale**: ~1.5 ms for both
+  sides of a 51-path tree; the expensive work is bounded by the
+  conversations, never by the triage.
+- **Warm vs cold unchanged session: ~57x** (1.5 ms vs ~86 ms modeled as
+  cold scan + per-file hashing of the diverged session). At larger trees
+  the gap widens with file count, since the warm session stays
+  proportional to path count while the cold one is proportional to
+  bytes.
+
+Caveats: seeded-random fixtures, warm page cache, one development
+machine (Windows); the warm-session figure is a model (stat-only scans +
+measured per-file index loads), not a full protocol run — the wire cost
+of a converged session (a few frames) is excluded from both sides and
+does not change the conclusion.

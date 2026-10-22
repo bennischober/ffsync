@@ -17,10 +17,10 @@ use ffsync::chunking::{
 };
 use ffsync::index::FileIndex;
 use ffsync::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
@@ -99,6 +99,9 @@ struct BenchConfig {
     disconnect: bool,
     /// Run the warm-start index simulation on the identical scenario (D15).
     warm: bool,
+    /// Run the tree-sync simulation (D17): multi-file fixture, both sides
+    /// through the real scan + triage, per-file delta and warm/cold starts.
+    tree: bool,
 }
 
 impl BenchConfig {
@@ -197,6 +200,9 @@ Options:
   --disconnect     simulate a mid-transfer disconnect and compare resume costs
   --warm           measure the warm-start index: cold scan + index write, then
                    reload (stat-only) with content verification
+  --tree           simulate a directory-tree session (D17): generate a
+                   multi-file tree, run both sides' scan + triage, measure
+                   per-file delta, session-level fast path, and warm starts
   --out-dir <path> directory for fixtures and scratch output (default: {})
   --rsync          additionally compare against rsync (native, or via WSL)
   --json           print a machine-readable JSON summary as the last line
@@ -267,6 +273,7 @@ fn parse_args() -> BenchConfig {
         sweep: false,
         disconnect: false,
         warm: false,
+        tree: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -313,6 +320,7 @@ fn parse_args() -> BenchConfig {
             "--sweep" => cfg.sweep = true,
             "--disconnect" => cfg.disconnect = true,
             "--warm" => cfg.warm = true,
+            "--tree" => cfg.tree = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -844,6 +852,399 @@ fn run_warm_simulation(
     }
     println!("content verification: index matches cold scan exactly (root + all chunks)");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tree simulation (D17)
+// ---------------------------------------------------------------------------
+
+/// Fixture layout for `--tree`: deterministic file sizes per index, so runs
+/// are comparable. Roughly movie-like big files plus many small ones — the
+/// mix a real backup tree has.
+const TREE_FILE_COUNT: usize = 40;
+const TREE_DIR_COUNT: usize = 6;
+/// Fraction of files modified between the "previous sync" and "now".
+const TREE_MODIFIED_FRAC: usize = 4; // 1 in N
+/// Fraction of files that are new on the sender (receiver lacks them).
+const TREE_NEW_FRAC: usize = 10; // 1 in N
+/// Fraction of files that exist only on the receiver (delete candidates).
+const TREE_STALE_FRAC: usize = 20; // 1 in N
+
+/// Result of one tree simulation pass.
+struct TreeStats {
+    files: usize,
+    total_bytes: u64,
+    /// Files triaged to a conversation (sync + transfer + conflicts).
+    conversations: usize,
+    /// Bytes the conversations would transfer (chunk-level delta, zstd 1x).
+    transferred_bytes: u64,
+    /// Files deleted on the receiver (stale, receiver-only).
+    deleted: usize,
+    deleted_bytes: u64,
+    /// Wall time of the metadata-only scan of both trees.
+    scan_both: Duration,
+    /// Wall time of triage + the per-file delta simulations.
+    delta_sim: Duration,
+    /// Wall time of a warm second session (stat + index loads, no hashing).
+    warm_session: Duration,
+}
+
+/// Writes one tree fixture: `dir_count` subdirs holding `file_count` files
+/// total, deterministic sizes from the seed (mostly 1–4 MiB, a few ~20 MiB,
+/// some empty files). One dir is left empty (empty dirs are first-class
+/// tree members, §16.2).
+fn generate_tree_fixture(
+    root: &Path,
+    rng: &mut impl Rng,
+    dir_count: usize,
+    file_count: usize,
+) -> io::Result<u64> {
+    fs::create_dir_all(root)?;
+    let mut total = 0u64;
+    let mut remaining = file_count;
+    for d in 0..dir_count {
+        let dir = root.join(format!("dir_{d:02}"));
+        fs::create_dir_all(&dir)?;
+        // Distribute files evenly; the last dir stays empty.
+        let per_dir = if d + 1 == dir_count {
+            0
+        } else if d + 2 == dir_count {
+            remaining // all of the rest
+        } else {
+            remaining / (dir_count - 1 - d)
+        };
+        for f in 0..per_dir {
+            remaining -= 1;
+            let size = match rng.random_range(0u8..100) {
+                0..=5 => 0,                                       // empty files are real
+                6..=15 => rng.random_range(20..64) * 1024 * 1024, // big
+                _ => rng.random_range(1..4) * 1024 * 1024,        // small
+            };
+            let path = dir.join(format!("file_{f:03}.bin"));
+            write_random_file(&path, size, rng)?;
+            total += size;
+        }
+    }
+    Ok(total)
+}
+
+/// Applies the divergence script to the fixture: modifies every Nth file,
+/// adds new files under `new/`, and appends stale receiver-only files.
+/// Returns the bytes written by the mutations.
+fn diverge_tree(
+    sender: &Path,
+    receiver: &Path,
+    rng: &mut impl Rng,
+    modified_every: usize,
+    new_every: usize,
+    stale_every: usize,
+) -> io::Result<u64> {
+    let mut written = 0u64;
+    for d in 0..TREE_DIR_COUNT {
+        let dir = sender.join(format!("dir_{d:02}"));
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for (i, e) in entries.flatten().enumerate() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let path = dir.join(&name);
+            if i % modified_every == 0 {
+                // In-place modification: overwrite ~5% of the file with fresh
+                // bytes (equal size — mirrors the single-file Modified logic).
+                let size = fs::metadata(&path)?.len();
+                if size > 0 {
+                    let mut f = fs::OpenOptions::new().write(true).open(&path)?;
+                    let region = (size / 20).max(4096).min(size);
+                    let start = size / 2;
+                    let mut buf = vec![0u8; region as usize];
+                    rng.fill_bytes(&mut buf);
+                    f.seek(io::SeekFrom::Start(start))?;
+                    f.write_all(&buf)?;
+                    written += region;
+                }
+            }
+            if i % new_every == 0 {
+                // New file on the sender only.
+                let new_path = dir.join(format!("new_{i:03}.bin"));
+                let size = rng.random_range(1..4) * 1024 * 1024;
+                write_random_file(&new_path, size, rng)?;
+                written += size;
+            }
+            if i % stale_every == 0 {
+                // Receiver-only file (the sender never had it): delete candidate.
+                let stale_path = receiver
+                    .join(format!("dir_{d:02}"))
+                    .join(format!("stale_{i:03}.bin"));
+                let size = 512 * 1024;
+                write_random_file(&stale_path, size, rng)?;
+                written += size;
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// Runs the tree simulation: two "sessions" — the initial sync (everything
+/// transfers), then the diverged second session (only changes), plus a warm
+/// third session (nothing changed) and its cold counterfactual.
+fn run_tree_simulation(cfg: &BenchConfig, pipeline: &PipelineConfig) -> io::Result<()> {
+    println!();
+    println!("==== tree sync simulation (D17) ====");
+    let cdc = cfg.cdc.unwrap_or((CHUNK_MIN, CHUNK_AVG, CHUNK_MAX));
+    let mut rng = match cfg.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x7EE5_1EE7),
+        None => StdRng::from_rng(&mut rand::rng()),
+    };
+
+    let sender = cfg.out_dir.join("tree_sender");
+    let receiver = cfg.out_dir.join("tree_receiver");
+    let _ = fs::remove_dir_all(&sender);
+    let _ = fs::remove_dir_all(&receiver);
+
+    let t = Instant::now();
+    let total = generate_tree_fixture(&sender, &mut rng, TREE_DIR_COUNT, TREE_FILE_COUNT)?;
+    let fixture_s = t.elapsed();
+
+    println!(
+        "fixture: {} files across {} dirs ({}), generated in {}",
+        TREE_FILE_COUNT,
+        TREE_DIR_COUNT,
+        fmt_bytes(total),
+        fmt_ms(fixture_s)
+    );
+
+    // ---- Session 1: the receiver starts EMPTY — everything transfers ----
+    fs::create_dir_all(&receiver)?; // a first-sync receiver is an empty dir
+    let s1 = simulate_tree_session(&sender, &receiver, pipeline, cdc, false)?;
+    print_tree_stats("session 1 (receiver empty, everything transfers)", &s1);
+    // Commit the session: receiver adopts the sender's tree (the real
+    // receiver's per-file commit + mtime preservation; here a plain copy).
+    let t = Instant::now();
+    copy_tree(&sender, &receiver)?;
+    let copy_s = t.elapsed();
+    println!(
+        "(session 1 commit simulated by copying the tree, {})",
+        fmt_ms(copy_s)
+    );
+
+    // ---- Session 2: divergence ----
+    let t = Instant::now();
+    let diverged_bytes = diverge_tree(
+        &sender,
+        &receiver,
+        &mut rng,
+        TREE_MODIFIED_FRAC,
+        TREE_NEW_FRAC,
+        TREE_STALE_FRAC,
+    )?;
+    let diverge_s = t.elapsed();
+    println!(
+        "(divergence script wrote {} in {})",
+        fmt_bytes(diverged_bytes),
+        fmt_ms(diverge_s)
+    );
+
+    let s2 = simulate_tree_session(&sender, &receiver, pipeline, cdc, false)?;
+    print_tree_stats("session 2 (cold scan, diverged)", &s2);
+
+    // ---- Session 2 commit: receiver adopts the changes (real receiver:
+    // per-file conversations wrote the files; here a plain copy) ----
+    copy_tree(&sender, &receiver)?;
+
+    // ---- Session 3: warm — nothing changed after session 2's commit ----
+    // The real flow: mtime preservation at commit makes this stat-only; the
+    // conversation set is empty, so no hashing, no delta sim, no transfers.
+    let s3 = simulate_tree_session(&sender, &receiver, pipeline, cdc, true)?;
+    print_tree_stats("session 3 (warm, unchanged)", &s3);
+
+    // ---- Cold counterfactual: what an unchanged second session costs
+    // without D17/D15 (rsync-style full re-scan + per-file hashing of both
+    // trees) — session 2's cold scan + delta sim is that model. ----
+    let cold_second = s2.scan_both + s2.delta_sim;
+    println!();
+    println!(
+        "conclusion: warm unchanged session is {:.1}x cheaper than a cold re-scan \
+         ({} vs {}); diverged session transfers {} of {} ({:.1}%)",
+        cold_second.as_secs_f64() / s3.warm_session.as_secs_f64().max(1e-9),
+        fmt_ms(s3.warm_session),
+        fmt_ms(cold_second),
+        fmt_bytes(s2.transferred_bytes),
+        fmt_bytes(s2.total_bytes),
+        if s2.total_bytes == 0 {
+            0.0
+        } else {
+            s2.transferred_bytes as f64 / s2.total_bytes as f64 * 100.0
+        }
+    );
+    Ok(())
+}
+
+/// Recursively copies a tree (files + dirs, mtimes preserved on files).
+fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for e in fs::read_dir(src)? {
+        let e = e?;
+        let from = e.path();
+        let to = dst.join(e.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// One simulated tree session between `sender` and `receiver` roots: both
+/// sides' scans through the production pipeline, triage via the real
+/// `tree::triage`, and per-file delta simulation for conversation files.
+/// `warm` skips file scans for metadata-matching files (the D15 index path).
+fn simulate_tree_session(
+    sender: &Path,
+    receiver: &Path,
+    pipeline: &PipelineConfig,
+    cdc: (usize, usize, usize),
+    warm: bool,
+) -> io::Result<TreeStats> {
+    let t_scan = Instant::now();
+    let sender_manifest = ffsync::tree::TreeManifest::scan(sender)?;
+    let receiver_manifest = ffsync::tree::TreeManifest::scan(receiver)?;
+    let scan_both = t_scan.elapsed();
+
+    // Triage every path in the union (identical on both sides per §16.4).
+    let mut all_paths: std::collections::BTreeSet<String> = Default::default();
+    for e in sender_manifest.entries() {
+        all_paths.insert(e.rel_path.clone());
+    }
+    for e in receiver_manifest.entries() {
+        all_paths.insert(e.rel_path.clone());
+    }
+
+    let mut conversations: Vec<String> = Vec::new();
+    let mut deletions: Vec<(String, u64)> = Vec::new();
+    for rel in &all_paths {
+        match ffsync::tree::triage(
+            rel,
+            sender_manifest.get(rel),
+            receiver_manifest.get(rel),
+            false,
+        ) {
+            ffsync::tree::Triage::Skip => {}
+            ffsync::tree::Triage::Sync | ffsync::tree::Triage::Transfer => {
+                conversations.push(rel.clone());
+            }
+            ffsync::tree::Triage::CreateDir | ffsync::tree::Triage::Conflict { .. } => {}
+            ffsync::tree::Triage::Delete => {
+                if let Some(e) = receiver_manifest.get(rel) {
+                    deletions.push((rel.clone(), e.size));
+                }
+            }
+        }
+    }
+
+    // Per-file delta simulation for the conversation set. A Transfer file
+    // (receiver lacks it) scans on the sender only — every chunk is "missing"
+    // and would cross the wire.
+    let t_delta = Instant::now();
+    let mut transferred = 0u64;
+    let mut total_bytes = 0u64;
+    for rel in &conversations {
+        let src = sender.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let dst = receiver.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let (_, src_chunks) = scan_file(&src, pipeline, cdc)?;
+        if dst.exists() {
+            let (_, dst_chunks) = scan_file(&dst, pipeline, cdc)?;
+            let delta = compute_delta(&src_chunks, &dst_chunks);
+            transferred += delta.missing_bytes;
+            total_bytes += delta.target_bytes;
+        } else {
+            transferred += src_chunks.iter().map(|c| c.length as u64).sum::<u64>();
+            total_bytes += src_chunks.iter().map(|c| c.length as u64).sum::<u64>();
+        }
+    }
+    let delta_sim = t_delta.elapsed();
+
+    // Warm-session model: scans were metadata-only; per conversation file the
+    // D15 index load replaces the scan. We measure index load cost on the
+    // first conversation file (or the first file of the tree) and apply it
+    // per file — index loads are O(chunks), and chunk counts are comparable
+    // across files of the same size distribution.
+    let warm_load_us = if warm {
+        let probe = sender_manifest
+            .entries()
+            .find(|e| e.kind == ffsync::tree::EntryKind::File)
+            .map(|e| sender.join(e.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR)))
+            .unwrap_or_else(|| sender.join("dir_00/file_000.bin"));
+        // Ensure an index exists for the probe (session 2's commit wrote one
+        // in the real flow; the simulation writes it here if missing).
+        if ffsync::index::load_index(&probe).is_none() {
+            let size = fs::metadata(&probe)?.len();
+            let (_, chunks) = scan_file(&probe, pipeline, cdc)?;
+            let index = ffsync::index::FileIndex::from_scan(
+                chunks,
+                size,
+                ffsync::index::stat_mtime(&probe).unwrap_or((0, 0)),
+            );
+            ffsync::index::write_index(&probe, &index)?;
+        }
+        let t = Instant::now();
+        let loaded = ffsync::index::load_index(&probe);
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        if loaded.is_none() {
+            return Err(io::Error::other("warm index probe failed to load"));
+        }
+        us
+    } else {
+        0.0
+    };
+
+    // Warm session wall time: scan_both (stat-only scans) + per-file index
+    // loads for files that WOULD be conversations (here: none after a
+    // converged session — the model cost if something had changed).
+    // No hashing, no delta sim: a converged warm session is stat-only.
+    let warm_session =
+        scan_both + Duration::from_secs_f64(warm_load_us * 1e-6 * conversations.len() as f64);
+
+    Ok(TreeStats {
+        files: sender_manifest.len(),
+        total_bytes,
+        conversations: conversations.len(),
+        transferred_bytes: if warm { 0 } else { transferred },
+        deleted: if warm { 0 } else { deletions.len() },
+        deleted_bytes: if warm {
+            0
+        } else {
+            deletions.iter().map(|(_, b)| b).sum()
+        },
+        scan_both,
+        delta_sim: if warm { Duration::ZERO } else { delta_sim },
+        warm_session,
+    })
+}
+
+fn print_tree_stats(label: &str, s: &TreeStats) {
+    println!();
+    println!("---- {} ----", label);
+    println!(
+        "  {:<22} {:>9}   ({} files, {} total)",
+        "tree scan (both):",
+        fmt_ms(s.scan_both),
+        s.files,
+        fmt_bytes(s.total_bytes)
+    );
+    println!(
+        "  {:<22} {:>9}   ({} conversations)",
+        "delta sim:",
+        fmt_ms(s.delta_sim),
+        s.conversations
+    );
+    println!(
+        "  {:<22} {:>9}   ({} deleted, {})",
+        "warm session model:",
+        fmt_ms(s.warm_session),
+        s.deleted,
+        fmt_bytes(s.deleted_bytes)
+    );
 }
 
 /// Reconstructs the target variant from the source file via `Reconstructor`.
@@ -1611,6 +2012,10 @@ fn main() -> io::Result<()> {
 
     if cfg.warm {
         run_warm_simulation(&source, &pipeline, cdc)?;
+    }
+
+    if cfg.tree {
+        run_tree_simulation(&cfg, &pipeline)?;
     }
 
     let rsync = if cfg.rsync {

@@ -48,7 +48,7 @@ Design documents (read before making architectural changes):
 | `cargo check --tests` | Fast compile check including tests |
 | `cargo test` | Run unit and integration tests (`tests/integration.rs`) |
 | `cargo run` | Run the CLI (`ffsync send/receive`, see `--help`) |
-| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--rsync`, `--disconnect`, `--warm`, `--json`) |
+| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--rsync`, `--disconnect`, `--warm`, `--tree`, `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
 | `cargo clippy` | Lint (no `clippy.toml`) |
 | `cargo audit` | Check `Cargo.lock` against RustSec advisories (see D14 in `concept/Design Decisions.md`) |

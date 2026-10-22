@@ -22,6 +22,9 @@ All notable changes to ffsync are documented here. The format follows
   exist only locally — the sender's tree is authoritative, like
   `rsync --delete`. The flag keeps them. Deletions always apply only
   after every transfer succeeded: a failed session never destroys data.
+- **`bench --tree`:** a tree-session simulation in the benchmark harness
+  (multi-file fixture, both sides through the production scan pipeline,
+  real triage, per-file delta measurement, warm vs cold session model).
 - **Wire protocol v3:** new frames TREE_BEGIN (0x0C), TREE_END (0x0D),
   FILE_SYNC (0x0E). v0.2 peers reject v3 loudly (strict framing + version
   check); single-file sync between v0.3 peers is unchanged apart from the
