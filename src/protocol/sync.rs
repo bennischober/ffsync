@@ -128,7 +128,35 @@ fn send_error_and_finish(out: &mut impl Write, code: ErrorCode, msg: &str) -> Sy
     let frame = message::encode_error(code, msg);
     let _ = frame.and_then(|f| f.encode(out));
     let _ = out.flush();
+    // Give the peer a moment to read the ERROR frame before the stream
+    // drops (drain_for_close only reads; the peer's ERROR read happens
+    // after we flushed). Returning immediately is fine here because ERROR
+    // paths are terminal failures anyway; the receiver-side read of ERROR
+    // happens before its own writes in every flow.
     SyncError::Peer(code, msg.to_string())
+}
+
+/// Drains the stream until the peer closes, with a byte bound as a safety
+/// net. Used before a clean exit so the peer can read our final frame
+/// without a TCP reset racing it. Returns when the peer closes its side or
+/// the bound is reached.
+fn drain_for_close(stream: &mut impl Read) -> io::Result<()> {
+    let mut sink = [0u8; 8192];
+    let mut total = 0usize;
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => return Ok(()), // peer closed: they got our frame
+            Ok(n) => {
+                total += n;
+                if total > 64 * 1024 * 1024 {
+                    // Peer keeps sending beyond any sane manifest; stop.
+                    return Ok(());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Validates the received HELLO against ours (§4). Returns the peer's HELLO
@@ -234,6 +262,12 @@ where
     if trust && hello_size == peer.file_size && hello_mtime != 0 && hello_mtime == peer.file_mtime {
         message::encode_empty(framing::T_NOT_MODIFIED)?.encode(stream)?;
         stream.flush()?;
+        // TCP note: exiting now would close the socket while the receiver
+        // may still be writing manifest frames, and the resulting RST can
+        // discard the receiver's buffered NOT_MODIFIED before it reads it
+        // (the classic TCP reset race). Draining until the peer closes (or
+        // a bound is hit) lets the receiver read the frame cleanly.
+        let _ = drain_for_close(stream);
         progress(Progress::NothingToDo);
         return Ok(SyncOutcome::InSync);
     }
@@ -653,6 +687,14 @@ fn scan_with_progress(
             Err(_) => break,
         }
     }
+    // CRITICAL: hash workers complete chunks concurrently, so arrival order
+    // is nondeterministic (worker-completion order, not file order). The
+    // chunk-tree root is order-sensitive; sort by offset — chunks partition
+    // the file, so offsets are unique and this restores canonical file
+    // order regardless of worker count. Without this, roots differ between
+    // scans of identical data and every verification fails (or worse, a
+    // root over a permuted list is "verified" against itself only by luck).
+    chunks.sort_by_key(|c| c.offset);
     Ok((hashed, chunks))
 }
 

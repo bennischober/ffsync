@@ -409,7 +409,9 @@ fn generate_fixtures(cfg: &BenchConfig) -> io::Result<(PathBuf, Vec<(Scenario, P
     Ok((source, variants))
 }
 
-/// Scans `path` with the production pipeline and collects all chunks.
+/// Scans `path` with the production pipeline and collects all chunks in
+/// canonical file order (sorted by offset — hash workers race, so arrival
+/// order is worker-completion order, not file order).
 fn scan_file(
     path: &Path,
     pipeline: &PipelineConfig,
@@ -440,6 +442,9 @@ fn scan_file(
             Err(_) => break, // all senders dropped: scan finished
         }
     }
+
+    // Canonical order: offsets are unique (chunks partition the file).
+    chunks.sort_by_key(|c| c.offset);
 
     let stats = ScanStats {
         total: start.elapsed(),

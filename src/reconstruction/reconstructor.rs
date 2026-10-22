@@ -114,6 +114,8 @@ impl Reconstructor {
                 chunks.push(c);
             }
         }
+        // Canonical order (offsets are unique; hash workers race).
+        chunks.sort_by_key(|c| c.offset);
         let actual_root = crate::chunking::chunk_root(&chunks);
 
         if actual_root != expected_root {

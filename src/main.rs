@@ -1,80 +1,258 @@
-use ffsync::chunking::*;
-use std::time::Instant;
+//! ffsync CLI: send and receive files over TCP with chunk-level delta sync.
+//!
+//! Usage:
+//!   ffsync send <file> <host:port>   [--checksum]
+//!   ffsync receive <file> <port>     [--checksum] [--from <old-file>]
+//!
+//! The sender connects to a receiver that is listening.
 
-fn create_large_file() -> std::io::Result<()> {
-    use rand::Rng;
-    use std::fs::OpenOptions;
-    use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-    let mut rng = rand::rng();
+use ffsync::chunking::PipelineConfig;
+use ffsync::protocol::sync::{
+    Progress, ReceiveRequest, SendRequest, SyncError, SyncOutcome, receive, send,
+};
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open("large_file.bin")?;
+fn die(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    eprintln!(
+        "usage: ffsync send <file> <host:port> [--checksum]\n       ffsync receive <file> <port> [--checksum] [--from <old-file>]"
+    );
+    std::process::exit(2);
+}
 
-    let file_size = 10 * 1024 * 1024;
-    let mut data = vec![0u8; file_size];
-    rng.fill_bytes(&mut data);
+struct ProgressDisplay {
+    last_phase: Option<Progress>,
+    start: Instant,
+    last_print: Instant,
+}
 
-    file.write_all(&data)?;
+impl ProgressDisplay {
+    fn new() -> Self {
+        Self {
+            last_phase: None,
+            start: Instant::now(),
+            last_print: Instant::now(),
+        }
+    }
 
-    let mut partial_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open("partial_file.bin")?;
+    fn update(&mut self, p: Progress) {
+        // Phase transition always prints; within a phase, throttle.
+        let phase_changed = match (&self.last_phase, &p) {
+            (None, _) => true,
+            (Some(a), b) => std::mem::discriminant(a) != std::mem::discriminant(b),
+        };
+        let now = Instant::now();
+        if !phase_changed && now - self.last_print < Duration::from_millis(200) {
+            return;
+        }
+        self.last_phase = Some(p);
+        self.last_print = now;
 
-    partial_file.write_all(&data[..5 * 1024 * 1024])?;
+        let elapsed = now - self.start;
+        let line = match p {
+            Progress::Scanning(hashed, total) => {
+                let pct = if total > 0 { hashed * 100 / total } else { 100 };
+                format!(
+                    "hashing   {:>6.1}%  ({}/{} bytes, {} elapsed)",
+                    pct as f64 / 10.0,
+                    fmt_bytes(hashed),
+                    fmt_bytes(total),
+                    fmt_secs(elapsed)
+                )
+            }
+            Progress::Diffing => "diffing   comparing chunk manifests".to_string(),
+            Progress::Transferring(sent, total) => {
+                let pct = if total > 0 { sent * 100 / total } else { 100 };
+                format!(
+                    "sending   {:>6.1}%  ({}/{} bytes, {} elapsed)",
+                    pct as f64 / 10.0,
+                    fmt_bytes(sent),
+                    fmt_bytes(total),
+                    fmt_secs(elapsed)
+                )
+            }
+            Progress::Receiving(received, total) => {
+                let pct = if total > 0 {
+                    received * 100 / total
+                } else {
+                    100
+                };
+                format!(
+                    "receiving {:>6.1}%  ({}/{} bytes, {} elapsed)",
+                    pct as f64 / 10.0,
+                    fmt_bytes(received),
+                    fmt_bytes(total),
+                    fmt_secs(elapsed)
+                )
+            }
+            Progress::Verifying => "verifying comparing final root hash".to_string(),
+            Progress::NothingToDo => "up to date".to_string(),
+        };
+        // Single-line update via carriage return; final states end with a
+        // newline via the caller printing the outcome.
+        eprint!("\r{}", line);
+    }
+
+    fn finish(&mut self) {
+        eprintln!();
+    }
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let f = n as f64;
+    if f >= GIB {
+        format!("{:.2} GiB", f / GIB)
+    } else if f >= MIB {
+        format!("{:.2} MiB", f / MIB)
+    } else if f >= KIB {
+        format!("{:.2} KiB", f / KIB)
+    } else {
+        format!("{} B", n)
+    }
+}
+
+fn fmt_secs(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    if s >= 60.0 {
+        format!("{:.0}m{:.0}s", s / 60.0, s % 60.0)
+    } else {
+        format!("{:.1}s", s)
+    }
+}
+
+fn parse_host_port(s: &str) -> (String, u16) {
+    let (host, port) = s
+        .rsplit_once(':')
+        .unwrap_or_else(|| die("address must be host:port"));
+    let port: u16 = port.parse().unwrap_or_else(|_| die("invalid port"));
+    (host.to_string(), port)
+}
+
+fn report_outcome(role: &str, outcome: SyncOutcome, display: &mut ProgressDisplay) {
+    display.finish();
+    match outcome {
+        SyncOutcome::InSync => println!("{}: already up to date", role),
+        SyncOutcome::Transferred { bytes, chunks } => {
+            println!(
+                "{}: transferred {} in {} chunks",
+                role,
+                fmt_bytes(bytes),
+                chunks
+            );
+        }
+    }
+}
+
+fn run_send(file: PathBuf, addr: String, force_checksum: bool) -> std::io::Result<()> {
+    let (host, port) = parse_host_port(&addr);
+    println!("connecting to {}:{} ...", host, port);
+    let mut stream = TcpStream::connect((host.as_str(), port))?;
+    stream.set_nodelay(true).ok();
+    let display = &mut ProgressDisplay::new();
+    let request = SendRequest {
+        path: file.clone(),
+        display_path: file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        mtime: None,
+        force_checksum,
+    };
+    let pipeline = PipelineConfig::default();
+    let outcome = match send(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
+        Ok(o) => o,
+        Err(e) => {
+            display.finish();
+            return Err(io_err(&e));
+        }
+    };
+    report_outcome("send", outcome, display);
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    // let result = create_large_file();
+fn io_err(e: &SyncError) -> std::io::Error {
+    std::io::Error::other(e.to_string())
+}
 
-    let path = std::path::Path::new("D:\\Video\\LORD OF WAR\\title_t00.mkv");
-    let config = PipelineConfig::default();
-
-    // // Test Fixed-size chunking
-    // {
-    //     let start = Instant::now();
-    //     let hasher = Blake3Hasher;
-    //     let rx = process_file(
-    //         path,
-    //         || FixedChunker::new(700 * 1024), // Factory closure
-    //         hasher,
-    //         &config
-    //     )?;
-    //
-    //     let mut count = 0;
-    //     while let Ok(event) = rx.recv() {
-    //         if matches!(event, ChunkEvent::Chunk(_)) {
-    //             count += 1;
-    //         }
-    //     }
-    //
-    //     println!("Fixed (700KB): {} chunks in {:?}", count, start.elapsed());
-    // }
-
-    // Test FastCDC chunking
-    {
-        let start = Instant::now();
-        let rx = process_file(
-            path,
-            || FastCDCChunker::new(64 * 1024, 256 * 1024, 1024 * 1024),
-            Blake3Hasher,
-            &config,
-        )?;
-
-        let mut count = 0;
-        while let Ok(event) = rx.recv() {
-            if matches!(event, ChunkEvent::Chunk(_)) {
-                count += 1;
-            }
+fn run_receive(
+    file: PathBuf,
+    port: u16,
+    force_checksum: bool,
+    from: Option<PathBuf>,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(("0.0.0.0", port))?;
+    println!("listening on 0.0.0.0:{} ...", port);
+    let (stream, peer) = listener.accept()?;
+    println!("peer connected: {}", peer);
+    let mut stream: TcpStream = stream;
+    stream.set_nodelay(true).ok();
+    let display = &mut ProgressDisplay::new();
+    let local_source = from.unwrap_or_else(|| file.clone());
+    let request = ReceiveRequest {
+        path: file.clone(),
+        local_source,
+        force_checksum,
+    };
+    let pipeline = PipelineConfig::default();
+    let outcome = match receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
+        Ok(o) => o,
+        Err(e) => {
+            display.finish();
+            return Err(io_err(&e));
         }
-
-        println!("FastCDC: {} chunks in {:?}", count, start.elapsed());
-    }
-
+    };
+    report_outcome("receive", outcome, display);
     Ok(())
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        die("no command given");
+    }
+    match args[0].as_str() {
+        "send" => {
+            if args.len() < 3 {
+                die("send requires <file> <host:port>");
+            }
+            let force_checksum = args.iter().skip(3).any(|a| a == "--checksum");
+            run_send(PathBuf::from(&args[1]), args[2].clone(), force_checksum).unwrap_or_else(
+                |e| {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                },
+            );
+        }
+        "receive" => {
+            if args.len() < 3 {
+                die("receive requires <file> <port>");
+            }
+            let port: u16 = args[2].parse().unwrap_or_else(|_| die("invalid port"));
+            let mut force_checksum = false;
+            let mut from = None;
+            let mut it = args.iter().skip(3);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--checksum" => force_checksum = true,
+                    "--from" => {
+                        let v = it.next().unwrap_or_else(|| die("--from requires a path"));
+                        from = Some(PathBuf::from(v));
+                    }
+                    other => die(&format!("unknown argument: {}", other)),
+                }
+            }
+            run_receive(PathBuf::from(&args[1]), port, force_checksum, from).unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
+        }
+        other => die(&format!("unknown command: {}", other)),
+    }
 }
