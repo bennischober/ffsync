@@ -208,6 +208,21 @@ adjacent-chunk coalescing) stands as future work. The `--latency`
 simulation (empty receiver) is unchanged by design: its conversations
 carry no Local entries, so the fixed path is not exercised there.
 
+**Amendment (2026-10-23, flaw 2 evaluated):** adjacent-chunk coalescing
+(assembly into bounded ≤8 MiB runs, one positional write per run) was
+implemented in the single-file receive loop and benchmarked on the
+Windows host (seeded fixtures, paired runs). Result: **rejected**. The
+seeded `--latency` simulation — the only harness path that exercises the
+real receive loop — showed no gain (K1 2.74 -> 3.00 s, K8 726 -> 855 ms,
+within the session's ±15-100% scan-column noise band), and the mechanism
+explains it: NTFS positional writes are already cheap (~µs), so the
+syscall saving (~30 ms per 3.4k chunks) is smaller than the added
+full-file memcpy through the run buffer (~0.2-0.3 s per GiB). The
+implementation was reverted; flaw 2 stays open with a data-backed
+barrier: a retry needs a mechanism whose cost is below the syscall
+saving (e.g. vectored/batched I/O) or parallelizes disjoint-offset
+writes across threads instead.
+
 ## D8 — The link speed is a protocol parameter
 
 **Decision:** the diff strategy must adapt to the link, not be fixed.
