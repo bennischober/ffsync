@@ -28,13 +28,16 @@ on:
         description: "comma list of --parallel values to receive, in order (e.g. 1,4,8,16)"
         required: true
         default: "1,4,8,16"
+      sender_fp:
+        description: "SHA-256 fingerprint of the local sender identity (pinned with --trust)"
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   receive:
-    name: wan receiver (cells: ${{ inputs.cells }})
+    name: wan receiver
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
