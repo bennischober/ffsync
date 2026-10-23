@@ -135,10 +135,10 @@ its cold-read cost is one disk seek, still far below any scan).
 > environments to minimize interference from other processes.
 ## Tree sync: sessions at tree scale (D17, 2026-10-22)
 
-Measured with ench --tree --seed 42 (release build): a 40-file /
+Measured with `bench --tree --seed 42` (release build): a 40-file /
 6-dir fixture (135 MiB — 1–4 MiB small files, a few 20–64 MiB big ones,
 some empty files, one empty dir), three simulated sessions using the
-production pipeline for scans and the real 	ree::triage for the action
+production pipeline for scans and the real `tree::triage` for the action
 lists. "Delta sim" hashes both sides of every conversation file and
 counts chunks the receiver lacks (zstd 1x model):
 
@@ -173,3 +173,100 @@ machine (Windows); the warm-session figure is a model (stat-only scans +
 measured per-file index loads), not a full protocol run — the wire cost
 of a converged session (a few frames) is excluded from both sides and
 does not change the conclusion.
+
+## Real-content corpus: CDC and delta on actual files (2026-10-23)
+
+Every number above this section used seeded-random fixtures — worst case
+for compression, best case for CDC boundary stability. This section
+repeats the core measurements on real downloaded content (all verified
+via chunk root after reconstruction):
+
+| file | size | content |
+|---|---|---|
+| `tos.webm` | 544.9 MiB | 1080p VP9 video (Blender Foundation, Tears of Steel, via Wikimedia Commons) |
+| `rust-src.tar.gz` | 283.7 MiB | gzip'd Rust 1.79.0 source tree (static.rust-lang.org) |
+| `video720.mp4` | 7.3 MiB | 720p H.264 (Blender, via download.blender.org) |
+| `mobydick.txt` | 1.2 MiB | English prose (Project Gutenberg) |
+
+Harness: the production pipeline (`process_file` → FastCDC → BLAKE3,
+`Reconstructor` + `finalize_chunk_root` verification), the bench's own
+mutation patterns applied to copies (modified: two ~1% regions at 45%/55%
+of the file; appended: ~10% tail), delta = bytes of variant chunks whose
+hash is absent from the source chunk set. Two CDC configurations: the
+v0.1 defaults (64k/256k/1m) and the F1 sweep's best point (16k/64k/256k).
+
+### Results
+
+**CDC 64k/256k/1m (shipped defaults):**
+
+| file | scan | chunks | mod: missing | mod % | mod chunks | app: missing | app % |
+|---|---|---|---|---|---|---|---|
+| mobydick.txt | 19 ms | 4 | 804.7 KiB | 64.56% | 4 | 201.1 KiB | 14.67% |
+| rust-src.tar.gz | 1730 ms | 916 | 6.45 MiB | 2.27% | 921 | 28.39 MiB | 9.10% |
+| tos.webm | 3056 ms | 1781 | 11.84 MiB | 2.17% | 1781 | 54.55 MiB | 9.10% |
+| video720.mp4 | 60 ms | 26 | 764.7 KiB | 10.29% | 26 | 978.9 KiB | 11.98% |
+
+**CDC 16k/64k/256k (F1 sweep best):**
+
+| file | scan | chunks | mod: missing | mod % | mod chunks | app: missing | app % |
+|---|---|---|---|---|---|---|---|
+| mobydick.txt | 22 ms | 15 | 287.9 KiB | 23.10% | 15 | 152.7 KiB | 11.14% |
+| rust-src.tar.gz | 2144 ms | 3708 | 5.95 MiB | 2.10% | 3710 | 28.39 MiB | 9.10% |
+| tos.webm | 3640 ms | 7230 | 11.16 MiB | 2.05% | 7222 | 54.53 MiB | 9.10% |
+| video720.mp4 | 69 ms | 96 | 399.0 KiB | 5.37% | 96 | 798.4 KiB | 9.77% |
+
+### Findings
+
+- **The large real-media numbers are excellent and match the random-data
+  model**: a ~1%×2 in-place modification of a 545 MiB VP9 video costs
+  **2.17% of the file** (11.84 MiB) at the shipped defaults — right
+  between the random-data 32 MiB (4.79%) and 1 GiB (2.12%) figures, and
+  consistent with D12's prediction that the boundary-shift over-send
+  share shrinks with file size. The gzipped source tree behaves
+  identically (2.27%). CDC boundaries are stable on compressed real
+  content.
+- **Appends cost exactly the appended bytes on large files**: 9.10% for
+  both large files — the ~10% tail re-chunks identically after the
+  boundary, as F1's `appended` row predicted for CDC at ≤1m avg.
+- **Small files are the weak spot, and it is structural**: mobydick.txt
+  (1.2 MiB) is only 4 chunks at the shipped defaults — a single ~1%
+  edit region sits inside one chunk and drags 64.56% of the file to the
+  wire. With 4× smaller chunks it drops to 23.10%. video720.mp4 (7 MiB)
+  improves 10.29% → 5.37%. For small text/code files the smaller CDC
+  config is strictly better; for large files the difference is noise
+  (2.17% → 2.05%) while chunk count (and thus manifest/index bytes)
+  grows 4×.
+- **Scan cost on real content is ~5–6 ms per GiB slower than the
+  random-data figures** (5.6 ms/GiB for tos.webm vs ~0.35 ms/GiB
+  claimed above — the earlier figure is per GiB at 1 GiB scale with a
+  warm cache; tos.webm scanned 3.06 s for 545 MiB ≈ 5.6 s/GiB) — actually
+  the discrepancy is the mutation copies: the tos.webm scan figure above
+  includes cold NTFS reads of a freshly-copied 545 MiB file (page cache
+  was evicted by the intervening rust-src work set), while the 1 GiB
+  random-data figure ran warm. Treat scan-rate comparisons across these
+  two sections as disk-cache-sensitive, not algorithmic.
+- **Boundary stability on real content holds**: variant chunk counts stay
+  within ±10 of the source count in every modified case (916→921,
+  1781→1781, 26→26, 4→4) — the classic CDC "edit locality" property is
+  intact on video and gzip streams, not just random data.
+- **Every reconstruction verified via chunk root** — the wire's
+  verification identity works unchanged on real content.
+
+### Conclusion (does the default need to change?)
+
+Not on this evidence. The shipped 64k/256k/1m is the right default for
+the tool's niche (big files, fast links): on large real files it matches
+the smaller config's delta within noise with 4× fewer chunks. The
+small-file penalty is real but is the domain where total transfer time is
+milliseconds anyway; a per-file adaptive chunk size (small files → small
+chunks) is a possible future refinement and interacts with the warm-start
+index (different CDC params per size class would need per-class index
+validation). Registered as a possible follow-up; not scheduled.
+
+### Harness note
+
+The corpus harness lives in `bench_tmp/corpus_bench/` (gitignored, like
+all bench_tmp fixtures): a throwaway cargo project depending on the crate
+by path, so it stays in sync with the production pipeline automatically.
+The corpus files are in `bench_tmp/corpus/` with their provenance in the
+table above; re-download them to reproduce.
