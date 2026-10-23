@@ -82,7 +82,7 @@ impl TreeEntry {
 #[cfg(unix)]
 fn metadata_mode(meta: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    (meta.permissions().mode() as u32) & 0o7777
+    meta.permissions().mode() & 0o7777
 }
 
 #[cfg(not(unix))]
