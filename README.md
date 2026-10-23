@@ -119,7 +119,7 @@ flowchart LR
    last, after every transfer succeeded (`--no-delete` keeps them).
 
 The wire protocol is specified in
-[`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md): 14 frame types,
+[`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md): 15 frame types,
 length-prefixed, no protobuf.
 
 ## Built on
@@ -443,9 +443,11 @@ The reasoning is the product; it is all recorded:
   HELLO's existing `cdc_min/avg/max` fields carry the values (wire
   layout unchanged); the chunk index records them (`FFSYIX02`) and warm
   starts require a parameter match.
-- **Later - permissions/xattrs/symlinks as first-class metadata** (D9):
-  the mode-bit slice of this landed; xattrs, hardlinks, and
-  symlink-as-entry remain out of scope with recorded reasoning.
+- **Closed (D9 amendment, 2026-10-23) - the metadata remainder:**
+  symlink-as-entry, hardlinks, and xattrs are explicitly out of scope with
+  recorded reasoning (see D9 in `concept/Design Decisions.md`); the
+  follow-or-warn symlink policy and POSIX mode bits are the shipped
+  metadata story. D9's deferred metadata list is now empty.
 
 ## License
 

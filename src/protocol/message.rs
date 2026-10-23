@@ -32,7 +32,7 @@ impl Role {
 
 /// HELLO flags (`concept/Protocol v0.1.md` §4).
 pub const FLAG_TRUST_TIMES: u16 = 1 << 0;
-pub const FLAG_EAGER: u16 = 1 << 1; // reserved, must be 0 in v0.1
+pub const FLAG_EAGER: u16 = 1 << 1; // §9.2 (designed, unimplemented): must be 0 on the wire; rejected loudly
 pub const FLAG_RESUMING: u16 = 1 << 2;
 
 /// Protocol errors carried by the ERROR frame.

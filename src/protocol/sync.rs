@@ -241,6 +241,16 @@ fn validate_hello(peer: &Hello, ours_role: Role) -> Result<Hello, SyncError> {
             ours_role
         )));
     }
+    if peer.flags & message::FLAG_EAGER != 0 {
+        // §9.2 is designed but unimplemented; a peer offering eager mode
+        // would disagree with us on DATA timing, which is a desync hazard.
+        // Classified as Peer(Version) so callers send ERROR(Version) on
+        // the wire (same treatment as a version mismatch).
+        return Err(SyncError::Peer(
+            ErrorCode::Version,
+            "peer offered eager diff (HELLO flag bit 1), which this build does not implement; omit it for lazy mode (spec §9.2)".into(),
+        ));
+    }
     Ok(peer.clone())
 }
 
@@ -1406,4 +1416,29 @@ fn scan_file_plain(
 ) -> Result<Vec<Chunk>, SyncError> {
     let (_, chunks) = scan_with_progress(path, pipeline, cdc, |_| {})?;
     Ok(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_rejects_eager_bit() {
+        // §9.2 is designed but unimplemented: a peer offering eager mode
+        // must be rejected loudly (ERROR Version), not silently ignored.
+        let peer = Hello {
+            version: super::super::VERSION,
+            flags: message::FLAG_EAGER,
+            role: Role::Receiver,
+            cdc_min: 16384,
+            cdc_avg: 65536,
+            cdc_max: 262144,
+            file_size: 1,
+            file_mtime: 0,
+            file_mtime_nanos: 0,
+            path: "x".into(),
+        };
+        let err = validate_hello(&peer, Role::Sender).unwrap_err();
+        assert!(matches!(err, SyncError::Peer(ErrorCode::Version, _)));
+    }
 }
