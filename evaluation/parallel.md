@@ -68,6 +68,52 @@ stable, which is the quantity this evaluation is about.
 - Sessions were re-run per K with a **fresh empty receiver** so every
   measurement is the full-transfer worst case and comparable across K.
 
+## Real WAN (GitHub runner → quick tunnel → home uplink, 2026-10-23)
+
+The shared-bottleneck test: a GitHub-hosted runner (Azure datacenter)
+sends the seed-42 fixture (100 files, 423 MiB) through a Cloudflare
+quick tunnel to a receiver on the home PC — the home **uplink** is the
+scarce direction. Plaintext on both ffsync ends by design: the tunnel
+is TLS end-to-end (D16 allows plaintext inside tunnels), and a one-shot
+measurement skips the ephemeral-identity pin dance. Every completed
+cell was hash-verified against the fixture on the receiver.
+
+| cell | wall time | effective rate |
+|---|---|---|
+| K=1 (run A) | 61.14 s | ~55–58 Mbit/s |
+| K=4 (run B) | 36.47 s | ~93 Mbit/s |
+| K=8 (run B) | 41.34 s | ~82 Mbit/s |
+| K=16 (run B) | 34.04 s | ~99 Mbit/s |
+
+Findings, with the honesty the setup demands:
+
+- **Parallel conversations help on the real path** — K=1 at 61 s vs
+  ~34–41 s for K≥4. Suggestive ratio ~1.7–1.8×, but **cross-run**: the
+  K=1 and K≥4 cells come from different runs with different tunnels
+  (run B's K=1 cell failed — quick tunnels drop idle connections, and
+  the runner's ~8 min build left the tunnel stale: `connection reset`
+  before TLS). A within-run baseline (tiny pre-warm transfer per cell
+  before the timed one) is needed before quoting a ratio.
+- **Within run B, the curve is flat**: K=4/8/16 = 36.5/41.3/34.0 s —
+  beyond 4 connections, more buy nothing on this path (the K=8 cell was
+  *slower* than K=4; tunnel noise dominates). So even on a
+  bottlenecked path, K=4 captures the available win.
+- **The predicted "shared pipe collapses the K-ratio" did not happen** —
+  parallel cells got *faster* than K=1. The likely reason: the path's
+  bottleneck is not one fair-shared pipe. The cloudflared tunnel is
+  partly per-connection-limited (single QUIC stream to the edge,
+  userspace relay), so K flows bypass per-connection limits instead of
+  sharing one fairly. On a clean, fair-bottleneck link (plain internet
+  path, no tunnel) the collapse remains plausible — this experiment
+  measures ffsync-over-tunnel, not ffsync-over-the-internet.
+- Operational lesson for quick tunnels: they expire without traffic
+  (~minutes), so any experiment must send *something* through each
+  tunnel shortly before measuring it.
+
+Not measured here: packet loss, jitter, a fair shared bottleneck (that
+remains the `tc netem` case), and absolute user-experience numbers (the
+uplink shape of one home connection is not a generalizable WAN).
+
 ## Real TCP check (toxiproxy, 2026-10-23)
 
 The model's known blind spots — congestion window, real ACK clocking,
