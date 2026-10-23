@@ -106,6 +106,10 @@ struct BenchConfig {
     /// duplex that delays every direction (§16.8 measurement) — sequential
     /// vs parallel conversation execution at a configurable RTT.
     latency: bool,
+    /// Only generate the 100-file tree fixture into `<out-dir>/lat_sender`
+    /// (same seed/shape as `--latency`) and exit — the WAN-measurement
+    /// harness packs it for a remote peer; no simulation runs.
+    gen_tree: bool,
     /// Simulated RTT in milliseconds for `--latency` (default 30).
     rtt_ms: u64,
     /// Parallel connection counts swept by `--latency` (default 1,4,8).
@@ -283,6 +287,7 @@ fn parse_args() -> BenchConfig {
         warm: false,
         tree: false,
         latency: false,
+        gen_tree: false,
         rtt_ms: 30,
         parallel_counts: Vec::new(),
     };
@@ -333,6 +338,7 @@ fn parse_args() -> BenchConfig {
             "--warm" => cfg.warm = true,
             "--tree" => cfg.tree = true,
             "--latency" => cfg.latency = true,
+            "--gen-tree" => cfg.gen_tree = true,
             "--rtt-ms" => {
                 let value = args
                     .next()
@@ -2227,6 +2233,25 @@ fn main() -> io::Result<()> {
         cfg.rsync,
         cfg.json
     );
+
+    // Fixture-only mode exits before ANY other fixture generation (the WAN
+    // harness wants exactly the --latency tree, nothing else).
+    if cfg.gen_tree {
+        let mut rng = match cfg.seed {
+            Some(seed) => StdRng::seed_from_u64(seed ^ 0x1CE_5EED),
+            None => StdRng::from_rng(&mut rand::rng()),
+        };
+        let sender = cfg.out_dir.join("lat_sender");
+        let _ = fs::remove_dir_all(&sender);
+        let total = generate_tree_fixture(&sender, &mut rng, 8, 100)?;
+        println!(
+            "fixture: 100 files ({}) in {} + empty dir, seed {}",
+            fmt_bytes(total),
+            sender.display(),
+            cfg.seed.unwrap_or(0)
+        );
+        return Ok(());
+    }
 
     let (source, variants) = generate_fixtures(&cfg)?;
     let pipeline = PipelineConfig::default();
