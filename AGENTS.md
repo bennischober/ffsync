@@ -109,12 +109,13 @@ pre-existing.
   - `hasher.rs` — `Hasher` trait; `Blake3Hasher` (in-memory and streaming).
   - `types.rs` — `Chunk` (offset, length, BLAKE3 hash) and `ChunkEvent`.
 - `src/index.rs` — the persistent per-file chunk index (D15, warm starts):
-  hand-rolled binary codec (magic `FFSYIX01`, 68-byte header, 44-byte chunk
-  entries), load-time self-verification (root re-derived from the chunk
-  list), size + nanosecond-mtime validation, atomic temp+rename writes, and
-  the `index_path_for` naming convention (suffix **appended**, never
-  `with_extension` — the orphan cleanup recovers target names by stripping
-  the literal suffix).
+  hand-rolled binary codec (magic `FFSYIX02` since D19, 80-byte header
+  carrying size + mtime + the CDC parameters that produced the chunk list,
+  44-byte chunk entries), load-time self-verification (root re-derived from
+  the chunk list), size + nanosecond-mtime + CDC-parameter validation, atomic
+  temp+rename writes, and the `index_path_for` naming convention (suffix
+  **appended**, never `with_extension` — the orphan cleanup recovers target
+  names by stripping the literal suffix).
 - `src/reconstruction/` — writes a new file out-of-place from chunk sources.
   - `reconstructor.rs` — `Reconstructor`: pre-allocates a temp file, writes
     each chunk at its target offset (local copy from the old file, or remote
@@ -236,6 +237,21 @@ pre-existing.
   read-only targets block rename/truncate (os error 5) —
   `clear_readonly_best_effort` runs before every commit write and
   `apply_commit_mode` re-asserts read-only after.
+- CDC parameters (D19, v0.8.0) are a pure function of the SENDER's file
+  size (`cdc_params_for_size`: < 16 MiB → 16k/64k/256k, else 64k/256k/1m)
+  and travel authoritative in HELLO's `cdc_min/avg/max` — the receiver
+  MUST chunk its manifest scan and the VERIFY re-scan with the peer's
+  values (different parameters produce different chunk layouts; roots
+  could never agree otherwise). Nonsense peer values fall back to the
+  local policy (hostile-peer guard). The receiver scans AFTER the
+  handshake for exactly this reason — do not "optimize" the scan back
+  before the HELLO exchange. The D15 index (FFSYIX02) records the
+  parameters and serves a warm start only on a parameter match; the
+  receiver-side `load_index` (without parameters) loads but the warm list
+  is gated on `validate(path, cdc)` after the handshake. Files ≥ 16 MiB
+  chunk byte-identically to the pre-D19 defaults (existing large-file
+  indexes stay valid) — keep that promise in any policy change, and run
+  bench fingerprints per config.
 - The tree scan never recurses into directory symlinks/junctions (an
   ancestor junction on Windows needs no privilege and was a plausible
   infinite loop); file symlinks are followed, dangling ones warn+skip.

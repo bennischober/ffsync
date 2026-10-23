@@ -4,6 +4,36 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-23
+
+### Added
+
+- **Small-file adaptive chunking (D19):** the CDC parameters are now a
+  pure function of the file size — below 16 MiB files chunk with
+  16 KiB/64 KiB/256 KiB (the F1-sweep best point), at or above with the
+  shipped 64 KiB/256 KiB/1 MiB. Localized edits to small files stop
+  dragging whole large chunks to the wire: the size-ladder sweep
+  (`evaluation/chunking.md`) measured 18.09% → 4.14% delta on an 8 MiB
+  source archive and 8.62% → 3.76% on 16 MiB compressed video, while
+  large files stay byte-identically chunked (existing large-file indexes
+  remain valid). The sender announces the actual parameters in HELLO's
+  existing `cdc_min/avg/max` fields (wire layout unchanged — they were
+  decorative until now, §4.3); the receiver scans its manifest and the
+  VERIFY re-scan with the sender's values (roots can only agree on
+  identical parameters). Nonsense peer values fall back to the local
+  policy. The D15 chunk index (now `FFSYIX02`, +12-byte header) records
+  the parameters that produced its chunk list and serves a warm start
+  only on a parameter match; older `FFSYIX01` indexes are treated as
+  missing state and rewritten at the next commit.
+
+### Fixed
+
+- **Resume commits wrote an empty index:** the resume commit path
+  re-scanned the temp file *after* renaming it away, so every successful
+  resumed sync persisted an empty chunk list and the next sync never
+  warm-started. The verified temp scan is now reused for the index
+  (regression test added).
+
 ## [0.7.1] - 2026-10-23
 
 ### Added

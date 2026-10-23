@@ -118,4 +118,7 @@ best roadmap for when we lift it.
   fields through the scan sites + records parameters in the D15 index
   (magic bump). Full scope and measurement plan in
   `evaluation/chunking.md`, "Scope: small-file adaptive chunking (F4)".
-  (Registered 2026-10-23; not scheduled.)
+  (Update 2026-10-23, same day: **F4 closed — shipped in 0.8.0.** The
+  size-ladder sweep placed the threshold at 16 MiB; D19 records the
+  decision. The sweep also confirmed the shipped defaults for large
+  files — no cliff anywhere in 8–64 MiB.)

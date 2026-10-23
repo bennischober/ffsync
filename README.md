@@ -12,7 +12,7 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
@@ -79,9 +79,11 @@ flowchart LR
 ```
 
 1. **Scan** — the file is memory-mapped and chunked with FastCDC
-   (content-defined boundaries, 64 KiB / 256 KiB / 1 MiB by default) on one
-   thread per core; every chunk is hashed with BLAKE3 on worker threads.
-   Chunks travel through bounded channels as `(offset, length)` — content is
+   (content-defined boundaries; 64 KiB / 256 KiB / 1 MiB for files at or
+   above 16 MiB, 16 KiB / 64 KiB / 256 KiB below — the small-file config
+   cuts localized-edit over-send ~4× on small files, D19) on one thread
+   per core; every chunk is hashed with BLAKE3 on worker threads. Chunks
+   travel through bounded channels as `(offset, length)` — content is
    never copied.
 2. **Exchange** — the receiver streams its manifest (chunk hashes); the sender
    diffs and produces a plan: chunks the receiver already has (by exact hash
@@ -95,15 +97,16 @@ flowchart LR
    must equal the sender's, and only then does a temp file atomically replace
    the target. A wrong byte anywhere fails loudly, never silently.
 5. **Warm start (after the first sync)** — each side persists a per-file
-   chunk index (`<file>.ffsync-index`) at commit time, holding the chunk list
-   and root it just verified. On the next sync, a peer whose file still
-   matches the index (size + mtime, compared at nanosecond granularity)
-   skips the scan entirely and serves its manifest/plan from the index —
-   repeated syncs of unchanged data become stat-only operations. rsync
-   rescans everything from scratch on every run; this is the memory rsync
-   does not have. Corrupt indexes are rejected at load (the decoder
-   re-derives the chunk root); a stale-but-validating index fails loudly and
-   is dropped, so a retry cold-scans — wrong content can cost an error,
+   chunk index (`<file>.ffsync-index`) at commit time, holding the chunk
+   list, root, and CDC parameters it just verified. On the next sync, a
+   peer whose file still matches the index (size + mtime at nanosecond
+   granularity, plus the same chunking parameters — D19) skips the scan
+   entirely and serves its manifest/plan from the index — repeated syncs
+   of unchanged data become stat-only operations. rsync rescans
+   everything from scratch on every run; this is the memory rsync does
+   not have. Corrupt indexes are rejected at load (the decoder re-derives
+   the chunk root); a stale-but-validating index fails loudly and is
+   dropped, so a retry cold-scans — wrong content can cost an error,
    never a silent mismatch.
 
 6. **Tree mode (v0.3)** — a directory path switches from one file to a
@@ -431,6 +434,15 @@ The reasoning is the product; it is all recorded:
   recurses into directory symlinks/junctions (the Windows junction
   recursion hazard). Xattrs/hardlinks/symlink-as-entry stay out of scope
   (D9/D18).
+- **Done (0.8.0) - small-file adaptive chunking (D19):** CDC parameters
+  are a pure function of file size — below 16 MiB the F1-sweep config
+  (16 KiB/64 KiB/256 KiB), otherwise the shipped defaults. Localized
+  edits to small files stop dragging whole large chunks to the wire
+  (size-ladder sweep: 18.09% → 4.14% delta on an 8 MiB source archive);
+  large files chunk byte-identically to before (indexes stay valid).
+  HELLO's existing `cdc_min/avg/max` fields carry the values (wire
+  layout unchanged); the chunk index records them (`FFSYIX02`) and warm
+  starts require a parameter match.
 - **Later - permissions/xattrs/symlinks as first-class metadata** (D9):
   the mode-bit slice of this landed; xattrs, hardlinks, and
   symlink-as-entry remain out of scope with recorded reasoning.

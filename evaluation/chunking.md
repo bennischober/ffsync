@@ -372,6 +372,49 @@ to dominate.
    re-run the bench fingerprint per config; full local gates; Docker
    Linux leg.
 
+### Results and threshold (2026-10-23, same day)
+
+The sweep ran (`bench_tmp/ladder_bench`, truncated real content —
+tos.webm and rust-src.tar.gz at 8/16/32/64 MiB — corpus mutation
+patterns, three configs: the shipped 64k/256k/1m, a middle
+32k/128k/512k gear, and the F1-sweep 16k/64k/256k). Modified-pattern
+delta (the discriminating scenario; `appended` is config-insensitive at
+~9–10% everywhere — the tail shifts one boundary, confirming D12's
+model):
+
+| size | shipped | 32k/128k/512k | 16k/64k/256k |
+|---|---|---|---|
+| 8 MiB (tos / rust) | 8.94 / 18.09% | 7.03 / 7.99% | 10.18 / **4.14%** |
+| 16 MiB (tos / rust) | 8.62 / 5.13% | 4.53 / 3.78% | **3.76 / 2.70%** |
+| 32 MiB (tos / rust) | 4.36 / 6.28% | 2.78 / 2.62% | 2.59 / 2.85% |
+| 64 MiB (tos / rust) | 2.81 / 2.75% | 2.52 / 2.42% | 2.35 / 2.48% |
+
+- **Threshold: 16 MiB.** Below it the 16k config wins on average (the
+  one regression — tos.webm 8 MiB, 8.94% → 10.18% — is compressed media
+  too dense in cut points even for the smaller config; rust-src's
+  18.09% → 4.14% carries the average). At 32 MiB the difference is
+  noise with mixed direction; at 64 MiB, noise.
+- **The middle gear is pointless:** 32k/128k/512k never wins clearly —
+  it trails 16k below 16 MiB and ties the shipped config above. Two
+  classes, no cliff worth paying for in between.
+- **Chunk counts at the boundary are trivial:** 206–209 chunks at
+  16 MiB ≈ 9 KiB of manifest/index per file.
+- **Scan cost is unchanged** (content-defined chunking throughput is
+  config-insensitive at these sizes — 26–67 ms per file across all
+  configs).
+- **The shipped default is validated for large files:** no cliff
+  anywhere in 8–64 MiB; delta share keeps shrinking with size exactly
+  as the 1 GiB scale validation predicted.
+
+Implementation landed as D19 (v0.8.0): parameters = pure function of
+the sender's file size (below 16 MiB → 16k/64k/256k, else the shipped
+defaults), authoritative in HELLO's existing `cdc_min/avg/max` fields;
+the receiver scans manifest + VERIFY re-scan with the peer's values;
+the D15 index records its parameters (magic `FFSYIX02`, +12 B header)
+and warm-starts only on a parameter match. Bench fingerprints
+confirmed: large-file chunk counts byte-identical to the pre-D19
+defaults (105/105/107 chunks on the 32 MiB fixtures — unchanged).
+
 ### Honest sizing of the win
 
 Small files are milliseconds on loopback; the delta improvement is
