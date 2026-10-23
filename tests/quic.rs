@@ -184,6 +184,7 @@ fn run_receive_over(
         local_source: path.clone(),
         force_checksum: true,
         tree: false,
+        apply_mode: None,
         apply_mtime: None,
     };
     let pipeline = PipelineConfig::default();

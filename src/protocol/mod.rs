@@ -23,4 +23,12 @@ pub const MAGIC: [u8; 4] = *b"FFSY";
 /// preservation on commit, empty-file convergence fix. v2 peers reject the
 /// unknown TREE_BEGIN frame loudly (strict framing, §3), and the HELLO
 /// version check rejects them before any tree state exists.
-pub const VERSION: u16 = 3;
+///
+/// v4 (v0.7): TREE_BEGIN gains flag bit 4 `metadata` (§16.9, D18) - each
+/// tree entry then carries a `mode u32` (POSIX mode low bits). The earlier
+/// additive extensions (§16.7 excludes, §16.8 parallel, §17 QUIC) shipped
+/// under v3 without a bump because they changed no existing layout; this
+/// one changes per-entry layout under a flag, so it takes the bump. v3
+/// peers fail loudly on the version check (and would reject the unknown
+/// flag bit anyway - both mechanisms agree).
+pub const VERSION: u16 = 4;

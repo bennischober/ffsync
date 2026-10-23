@@ -563,6 +563,7 @@ fn run_receive(
         local_source,
         force_checksum,
         tree: false,
+        apply_mode: None,
         apply_mtime: None,
     };
     let pipeline = PipelineConfig::default();

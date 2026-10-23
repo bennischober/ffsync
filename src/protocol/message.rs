@@ -503,6 +503,10 @@ pub struct TreeEntryWire {
     pub size: u64,
     pub mtime_secs: u64,
     pub mtime_nanos: u32,
+    /// POSIX mode low bits (§16.9). Only read when the TREE_BEGIN carries
+    /// TREE_FLAG_METADATA; 0 otherwise (and on platforms without POSIX
+    /// modes). Kept per-entry so the field survives manifest round trips.
+    pub mode: u32,
 }
 
 /// TREE_BEGIN payload: flags u16, then — only when the `parallel` flag
@@ -527,13 +531,17 @@ pub const TREE_FLAG_EXCLUDES: u16 = 1 << 2;
 /// (§16.8). Flag-gated fields are only safe when unknown flag bits are
 /// rejected — the decoder enforces that.
 pub const TREE_FLAG_PARALLEL: u16 = 1 << 3;
+/// TREE_BEGIN flag bit 4: each tree entry carries an additional `mode u32`
+/// field (§16.9, D18 — POSIX mode bits, 0 where the platform has none).
+pub const TREE_FLAG_METADATA: u16 = 1 << 4;
 /// Tree flags a decoder must reject as unknown (§16.8): everything beyond
 /// the bits this protocol version defines. CHECKSUM/NO_DELETE live in
 /// `crate::tree` next to the triage that consumes them.
 const TREE_FLAG_KNOWN: u16 = crate::tree::TREE_FLAG_CHECKSUM
     | crate::tree::TREE_FLAG_NO_DELETE
     | TREE_FLAG_EXCLUDES
-    | TREE_FLAG_PARALLEL;
+    | TREE_FLAG_PARALLEL
+    | TREE_FLAG_METADATA;
 
 impl TreeBegin {
     pub fn into_frame(self) -> io::Result<Frame> {
@@ -557,6 +565,7 @@ impl TreeBegin {
             }
         }
         payload.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
+        let metadata = self.flags & TREE_FLAG_METADATA != 0;
         for e in &self.entries {
             let path_bytes = e.rel_path.as_bytes();
             if path_bytes.len() > u16::MAX as usize {
@@ -571,6 +580,9 @@ impl TreeBegin {
             payload.extend_from_slice(&e.size.to_le_bytes());
             payload.extend_from_slice(&e.mtime_secs.to_le_bytes());
             payload.extend_from_slice(&e.mtime_nanos.to_le_bytes());
+            if metadata {
+                payload.extend_from_slice(&e.mode.to_le_bytes());
+            }
         }
         Ok(Frame::new(framing::T_TREE_BEGIN, payload))
     }
@@ -620,6 +632,13 @@ impl TreeBegin {
             return Err(MessageError::Malformed("tree entry count exceeds payload"));
         }
         let mut entries = Vec::with_capacity(count);
+        // §16.9: with the metadata flag, each entry carries 4 more bytes
+        // (mode u32); the entry-size bound below accounts for it.
+        let metadata = flags & TREE_FLAG_METADATA != 0;
+        let min_entry = if metadata { 28 } else { 24 };
+        if count > (p.len().saturating_sub(pos)) / min_entry + 1 {
+            return Err(MessageError::Malformed("tree entry count exceeds payload"));
+        }
         for _ in 0..count {
             let path_len = read_u16_le(p, &mut pos)? as usize;
             let path = read_bytes(p, &mut pos, path_len)?;
@@ -634,12 +653,18 @@ impl TreeBegin {
             let size = read_u64_le(p, &mut pos)?;
             let mtime_secs = read_u64_le(p, &mut pos)?;
             let mtime_nanos = read_u32_le(p, &mut pos)?;
+            let mode = if metadata {
+                read_u32_le(p, &mut pos)?
+            } else {
+                0
+            };
             entries.push(TreeEntryWire {
                 rel_path,
                 kind,
                 size,
                 mtime_secs,
                 mtime_nanos,
+                mode,
             });
         }
         if pos != p.len() {
@@ -890,5 +915,94 @@ mod tests {
         frame.encode(&mut buf).unwrap();
         let mut cursor = Cursor::new(buf);
         assert!(read_empty(&mut cursor, framing::T_MANIFEST_DONE).is_err());
+    }
+
+    #[test]
+    fn tree_begin_metadata_flag_round_trip() {
+        // §16.9: with the flag, each entry carries mode u32; without it,
+        // the layout is byte-identical to v3 (mode never encoded).
+        let entries = vec![TreeEntryWire {
+            rel_path: "a/b.sh".to_string(),
+            kind: 0,
+            size: 42,
+            mtime_secs: 1700000000,
+            mtime_nanos: 7,
+            mode: 0o755,
+        }];
+        let with = TreeBegin {
+            flags: TREE_FLAG_METADATA,
+            parallel: 1,
+            excludes: Vec::new(),
+            entries: entries.clone(),
+        }
+        .into_frame()
+        .unwrap();
+        let back = TreeBegin::from_frame(with).expect("round trip");
+        assert_eq!(back.entries, entries, "mode survives the wire");
+
+        // Without the flag: round trip must also succeed and yield mode 0
+        // on the wire form (the field is never read).
+        let without = TreeBegin {
+            flags: 0,
+            parallel: 1,
+            excludes: Vec::new(),
+            entries: entries.clone(),
+        }
+        .into_frame()
+        .unwrap();
+        let back = TreeBegin::from_frame(without).unwrap();
+        assert_eq!(back.entries[0].rel_path, "a/b.sh");
+        assert_eq!(back.entries[0].mode, 0);
+
+        // Payload-size discipline: the metadata flag adds exactly 4 bytes
+        // per entry.
+        let with_len = {
+            let mut b = Vec::new();
+            TreeBegin {
+                flags: TREE_FLAG_METADATA,
+                parallel: 1,
+                excludes: Vec::new(),
+                entries: entries.clone(),
+            }
+            .into_frame()
+            .unwrap()
+            .encode(&mut b)
+            .unwrap();
+            b.len()
+        };
+        let without_len = {
+            let mut b = Vec::new();
+            TreeBegin {
+                flags: 0,
+                parallel: 1,
+                excludes: Vec::new(),
+                entries,
+            }
+            .into_frame()
+            .unwrap()
+            .encode(&mut b)
+            .unwrap();
+            b.len()
+        };
+        assert_eq!(with_len - without_len, 4);
+    }
+
+    #[test]
+    fn tree_begin_unknown_flag_bit_rejected() {
+        // The §16.7/§16.8/§16.9 extension mechanism's foundation: unknown
+        // bits fail loudly so flag-gated fields can never silently change
+        // what a peer parses.
+        let frame = TreeBegin {
+            flags: 1 << 15, // undefined bit
+            parallel: 1,
+            excludes: Vec::new(),
+            entries: Vec::new(),
+        }
+        .into_frame()
+        .unwrap();
+        assert!(matches!(
+            TreeBegin::from_frame(frame),
+            Err(MessageError::Malformed("TREE_BEGIN has unknown flag bits"))
+        ));
     }
 }

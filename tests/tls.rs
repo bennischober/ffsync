@@ -116,6 +116,7 @@ mod tests {
                     local_source: path.clone(),
                     force_checksum: true,
                     tree: false,
+                    apply_mode: None,
                     apply_mtime: None,
                 };
                 let pipeline = ffsync::chunking::PipelineConfig::default();

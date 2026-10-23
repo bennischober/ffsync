@@ -158,6 +158,7 @@ fn hundred_sessions_do_not_accumulate_memory() {
             local_source: target.clone(),
             force_checksum: false,
             tree: false,
+            apply_mode: None,
             apply_mtime: None,
         };
         run_session(send_req, recv_req);
@@ -244,6 +245,7 @@ fn hundred_sessions_alternating_deltas_and_full_transfers() {
             local_source: target.clone(),
             force_checksum: false,
             tree: false,
+            apply_mode: None,
             apply_mtime: None,
         };
         run_session(send_req, recv_req);

@@ -211,6 +211,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: true,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -251,6 +252,7 @@ mod tests {
             local_source: target.clone(),
             force_checksum: false,
             tree: false,
+            apply_mode: None,
             apply_mtime: None,
         };
 
@@ -364,6 +366,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: false,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -391,6 +394,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: false,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -428,6 +432,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: true,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -461,6 +466,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: true,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -501,6 +507,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: false,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -538,6 +545,7 @@ mod tests {
                 local_source: target.clone(), // does not exist yet
                 force_checksum: true,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -652,6 +660,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: true,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
             64 * 1024,
@@ -677,6 +686,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: true,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -713,6 +723,7 @@ mod tests {
                 local_source: target.clone(),
                 force_checksum: false,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );
@@ -793,6 +804,7 @@ mod tests {
             local_source: target.clone(),
             force_checksum: false,
             tree: false,
+            apply_mode: None,
             apply_mtime: None,
         };
         let pipeline = PipelineConfig::default();
@@ -841,6 +853,7 @@ mod tests {
                 local_source: from_file.clone(),
                 force_checksum: true,
                 tree: false,
+                apply_mode: None,
                 apply_mtime: None,
             },
         );

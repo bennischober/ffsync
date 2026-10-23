@@ -9,6 +9,7 @@ use ffsync::chunking::PipelineConfig;
 use ffsync::protocol::tree_sync::{
     TreeOutcome, TreeReceiveRequest, TreeSendRequest, tree_receive, tree_send,
 };
+use ffsync::tree::{EntryKind, TreeManifest};
 
 /// A temporary tree with a guard that removes it on drop.
 struct TempTree(PathBuf);
@@ -371,6 +372,7 @@ fn tree_v2_flow_rejects_tree_frames() {
             local_source: recv_root.join("a.bin"),
             force_checksum: false,
             tree: false,
+            apply_mode: None,
             apply_mtime: None,
         };
         ffsync::protocol::sync::receive(&mut &tcp, &req, &PipelineConfig::default(), &mut |_p| {})
@@ -419,6 +421,7 @@ fn tree_paths_reject_traversal() {
             size: 1,
             mtime_secs: 0,
             mtime_nanos: 0,
+            mode: 0,
         }],
     }
     .into_frame()
@@ -792,4 +795,191 @@ fn tree_parallel_fail_closed_on_worker_error() {
         }
         (Ok(_), Err(e)) => panic!("sender ok but receiver failed: {e}"),
     }
+}
+
+#[test]
+fn tree_converges_posix_mode_bits() {
+    // §16.9: the sender's mode converges to the receiver (unix: exact bits,
+    // including the exec bit; Windows: no-write bits → read-only attribute).
+    let sender = TempTree::new("mode_sender");
+    let receiver = TempTree::new("mode_receiver");
+    sender.write("script.sh", b"#!/bin/sh\necho hi\n");
+    sender.write("data.bin", &vec![5u8; 64 * 1024]);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = sender.path().join("script.sh");
+        std::fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        let p = sender.path().join("data.bin");
+        std::fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        // Sender: data.bin read-only (the no-write → read-only direction).
+        let p = sender.path().join("data.bin");
+        let mut perms = fs::metadata(&p).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&p, perms).unwrap();
+    }
+
+    let (s, r) = run_tree_session(sender.path(), receiver.path(), false, false);
+    s.expect("sender ok");
+    r.expect("receiver ok");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let got = fs::metadata(receiver.path().join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(got, 0o755, "exec bits must converge");
+        let got = fs::metadata(receiver.path().join("data.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(got, 0o640, "group-read/no-other must converge");
+    }
+    #[cfg(windows)]
+    {
+        // A Windows sender emits no metadata section (its entries would
+        // carry mode 0 — synthesized modes would corrupt unix exec bits in
+        // mixed syncs), so the receiver applies nothing: the converged
+        // file's attribute is unset even though the sender's copy is
+        // read-only. Documented asymmetry of §16.9.
+        let got = fs::metadata(receiver.path().join("data.bin"))
+            .unwrap()
+            .permissions()
+            .readonly();
+        assert!(
+            !got,
+            "windows sender sends no mode section; receiver attribute untouched"
+        );
+    }
+
+    // Second session still skips everything (mode apply did not disturb the
+    // mtime order; the metadata fast path holds).
+    let (s2, r2) = run_tree_session(sender.path(), receiver.path(), false, false);
+    let s2 = s2.expect("sender2 ok");
+    assert_eq!(s2.files, 0, "mode apply must not break the fast path");
+    let _r2 = r2.expect("receiver2 ok");
+}
+
+#[cfg(windows)]
+#[test]
+fn tree_windows_readonly_receiver_roundtrip() {
+    // Receiver-side read-only file: a changed sender file must still
+    // converge (the read-only attribute must not block the rename/apply).
+    let sender = TempTree::new("ro_sender");
+    let receiver = TempTree::new("ro_receiver");
+    sender.write("doc.bin", &vec![1u8; 64 * 1024]);
+    let (s, r) = run_tree_session(sender.path(), receiver.path(), false, false);
+    s.expect("sender ok");
+    r.expect("receiver ok");
+
+    // Make the receiver's copy read-only, then change the sender's copy.
+    let rp = receiver.path().join("doc.bin");
+    let mut perms = fs::metadata(&rp).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&rp, perms).unwrap();
+    sender.write("doc.bin", &vec![2u8; 64 * 1024]);
+
+    let (s2, r2) = run_tree_session(sender.path(), receiver.path(), false, false);
+    let s2 = s2.expect("sender2 ok");
+    let _r2 = r2.expect("receiver2 ok");
+    assert_eq!(s2.files, 1);
+    assert_eq!(receiver.read("doc.bin"), sender.read("doc.bin"));
+}
+
+#[test]
+fn scan_skips_dir_symlinks_and_dangling_links() {
+    // D18: directory symlinks/junctions are never recursed into; dangling
+    // links are skipped with a warning. The scan must terminate (the old
+    // code recursed on metadata().is_dir(), so an ancestor junction was a
+    // plausible infinite loop on Windows) and must not contain the linked
+    // paths.
+    let tree = TempTree::new("scan_sym");
+    tree.write("real.txt", b"content");
+    fs::create_dir_all(tree.path().join("sub")).unwrap();
+    tree.write("sub/inner.txt", b"inner");
+
+    // Directory junction pointing at the tree root itself (ancestor — the
+    // recursion hazard). Windows: junction via mklink /J (no privilege);
+    // unix: a real dir symlink.
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(tree.path().join("loop"))
+            .arg(tree.path())
+            .output()
+            .expect("mklink /J");
+        assert!(out.status.success(), "mklink /J failed: {:?}", out.stderr);
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(tree.path(), tree.path().join("loop")).unwrap();
+
+    // Dangling file symlink.
+    #[cfg(windows)]
+    {
+        // Creating a file symlink needs developer mode or privilege; a
+        // junction to a nonexistent path is the privilege-free dangling case.
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(tree.path().join("dangling"))
+            .arg(tree.path().join("nope"))
+            .output()
+            .expect("mklink /J dangling");
+        assert!(out.status.success());
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(tree.path().join("nope"), tree.path().join("dangling")).unwrap();
+
+    let manifest = TreeManifest::scan(tree.path()).expect("scan must terminate");
+    assert!(manifest.get("real.txt").is_some());
+    assert!(manifest.get("sub/inner.txt").is_some());
+    assert!(
+        manifest.get("loop").is_none(),
+        "dir symlink/junction must not be recursed or listed"
+    );
+    assert!(
+        manifest.get("dangling").is_none(),
+        "dangling link must be skipped"
+    );
+}
+
+#[test]
+fn scan_follows_file_symlinks() {
+    // D18: a symlink to a regular file is followed and synced as the
+    // target's content (documented behavior since v0.3, now exercised).
+    let tree = TempTree::new("scan_follow");
+    tree.write("target.bin", &vec![9u8; 128 * 1024]);
+    #[cfg(windows)]
+    {
+        // File symlinks need privilege/developer mode on Windows; use a
+        // hardlink as the "resolves to a file" proxy only if symlink fails.
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink"])
+            .arg(tree.path().join("link.bin"))
+            .arg(tree.path().join("target.bin"))
+            .output()
+            .expect("mklink");
+        if !out.status.success() {
+            // No symlink privilege: fall back to a hardlink (not a symlink,
+            // but it still exercises the "file that resolves to a file" path).
+            fs::hard_link(tree.path().join("target.bin"), tree.path().join("link.bin"))
+                .expect("hard_link fallback");
+        }
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(tree.path().join("target.bin"), tree.path().join("link.bin"))
+        .unwrap();
+
+    let manifest = TreeManifest::scan(tree.path()).expect("scan ok");
+    let e = manifest.get("link.bin").expect("file link must be listed");
+    assert_eq!(e.size, 128 * 1024);
+    assert_eq!(e.kind, EntryKind::File);
 }

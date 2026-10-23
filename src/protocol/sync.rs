@@ -154,6 +154,12 @@ pub struct ReceiveRequest {
     /// Tree mode only: the sender's mtime to apply at commit (from the
     /// per-file HELLO). `None` in single-file mode (mtime is left alone).
     pub apply_mtime: Option<(u64, u32)>,
+    /// Tree mode only (v4, §16.9): the sender's POSIX mode bits (low 12
+    /// bits) to apply at commit, BEFORE the mtime write (the D15 index
+    /// records the post-metadata mtime). `None`/`Some(0)` applies nothing:
+    /// the sender had no metadata section or no mode concept on its
+    /// platform (the 0 = absent convention, same as mtime (0, 0)).
+    pub apply_mode: Option<u32>,
 }
 
 /// Outcome of a completed sync.
@@ -1029,8 +1035,11 @@ where
             ));
         }
         // Hash verified; commit. Reconstruct the Reconstructor state: the
-        // temp file exists and is verified — rename atomically.
+        // temp file exists and is verified — rename atomically. Order is
+        // load-bearing (§16.9): rename → mode → mtime → stat → index.
+        clear_readonly_best_effort(&request.path);
         std::fs::rename(&temp_path, &request.path)?;
+        apply_commit_mode(&request.path, request.apply_mode)?;
         apply_commit_mtime(&request)?;
         // Persist the verified state for the next warm start (D15): the
         // verified temp scan is exactly the index content. The index
@@ -1085,7 +1094,9 @@ where
         }
         // Truncate the target to empty (create if absent), carry the
         // sender's mtime, and persist the empty index (D15).
+        clear_readonly_best_effort(&request.path);
         std::fs::File::create(&request.path)?.set_len(0)?;
+        apply_commit_mode(&request.path, request.apply_mode)?;
         apply_commit_mtime(&request)?;
         let _ = crate::index::write_index(
             &request.path,
@@ -1113,7 +1124,9 @@ where
         Some(root) if root == verify_root => {
             if resuming {
                 // The previous attempt actually completed the data; commit it.
+                clear_readonly_best_effort(&request.path);
                 std::fs::rename(&temp_path, &request.path)?;
+                apply_commit_mode(&request.path, request.apply_mode)?;
                 apply_commit_mtime(&request)?;
                 // Persist the committed state (D15). The temp scan above is
                 // the verified chunk list; reuse it instead of re-scanning.
@@ -1134,6 +1147,7 @@ where
                 // would claim the target's identity from another file's
                 // content (size/mtime of `local_source` keyed to `path`),
                 // and the next warm start would serve the wrong chunk list.
+                apply_commit_mode(&request.path, request.apply_mode)?;
                 apply_commit_mtime(&request)?;
                 let _ = crate::index::write_index(
                     &request.path,
@@ -1171,7 +1185,9 @@ where
                     std::fs::remove_file(&temp_path).ok();
                 }
                 // Truncate the target to empty (or create it).
+                clear_readonly_best_effort(&request.path);
                 std::fs::File::create(&request.path)?.set_len(0)?;
+                apply_commit_mode(&request.path, request.apply_mode)?;
                 apply_commit_mtime(&request)?;
                 let _ = crate::index::write_index(
                     &request.path,
@@ -1197,6 +1213,71 @@ where
                 "empty plan without a local file",
             ))
         }
+    }
+}
+
+/// Windows: a read-only target cannot be replaced by rename nor truncated
+/// by create(write) (os error 5). Clear the attribute best-effort before
+/// the commit write — the write-enable-wins direction of §16.9: a verified
+/// sync must not fail because a stale attribute blocks the commit, and
+/// apply_commit_mode re-asserts read-only afterwards when the sender's
+/// mode says so. No-op elsewhere (unix rename ignores the file's own mode).
+#[cfg(windows)]
+fn clear_readonly_best_effort(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.is_file()
+    {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            // Windows-only helper: clearing the attribute here is the
+            // write-enable direction of §16.9 (clippy's Unix warning about
+            // `set_readonly(false)` does not apply — this code never runs
+            // on unix).
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn clear_readonly_best_effort(_path: &Path) {}
+
+/// Applies the sender's POSIX mode bits to the committed target (§16.9,
+/// tree mode only, BEFORE the mtime write — the D15 index must record the
+/// post-metadata mtime). Best-effort like mtime: a failure must not fail a
+/// verified sync, but it will cause the file's mode to diverge until the
+/// next sync of that file applies it again.
+///
+/// Unix: fchmod-equivalent with the masked `0o7777` bits (exact).
+/// Windows: the no-write bits (`0o200`/`0o020`/`0o002`) map to setting the
+/// read-only attribute; any write-enabled bit clears it. This is lossy by
+/// design — an NTFS attribute cannot express read-denial per class, and
+/// write-enable winning is the safe direction (a read-only file that should
+/// be writable would otherwise break every later sync's writes).
+fn apply_commit_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
+    let Some(bits) = mode.filter(|m| *m != 0) else {
+        return Ok(()); // no metadata section, or sender has no mode concept
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let f = std::fs::OpenOptions::new().write(true).open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(bits))?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let write_denied = bits & 0o222 != 0;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_readonly(write_denied);
+        std::fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, bits);
+        Ok(())
     }
 }
 

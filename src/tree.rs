@@ -44,6 +44,10 @@ pub struct TreeEntry {
     /// Unix seconds (0 if absent) — same convention as the per-file HELLO.
     pub mtime_secs: u64,
     pub mtime_nanos: u32,
+    /// POSIX mode low bits (`0o7777` mask: rwxrwxrwx + setuid/setgid/sticky,
+    /// §16.9 / D18). 0 where the platform has no such concept. Never a
+    /// triage input — mode rides conversations, it does not trigger them.
+    pub mode: u32,
 }
 
 impl TreeEntry {
@@ -65,8 +69,25 @@ impl TreeEntry {
             },
             mtime_secs,
             mtime_nanos,
+            mode: metadata_mode(meta),
         }
     }
+}
+
+/// The POSIX mode low bits of a metadata value (§16.9): the raw st_mode
+/// masked to `0o7777` on unix; 0 on platforms without the concept (Windows
+/// has no POSIX mode bits — the receiver maps the no-write bits to the
+/// read-only attribute instead, the only direction an NTFS attribute can
+/// express).
+#[cfg(unix)]
+fn metadata_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    (meta.permissions().mode() as u32) & 0o7777
+}
+
+#[cfg(not(unix))]
+fn metadata_mode(_meta: &std::fs::Metadata) -> u32 {
+    0
 }
 
 /// A whole-tree manifest, sorted by rel_path (byte order — the wire format's
@@ -145,9 +166,13 @@ impl TreeManifest {
         excludes: &ExcludeSet,
         out: &mut TreeManifest,
     ) -> io::Result<()> {
-        let mut entries: Vec<(String, PathBuf, std::fs::Metadata)> = Vec::new();
+        let mut entries: Vec<(String, PathBuf, std::fs::Metadata, bool)> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
+            // Symlink-aware metadata (D18): the classification below must see
+            // the LINK, not the target — a directory symlink/junction would
+            // otherwise be recursed into (on Windows a junction needs no
+            // privileges and may point at an ancestor: infinite recursion).
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 // A file deleted between read_dir and metadata: skip, the
@@ -155,19 +180,56 @@ impl TreeManifest {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
+            // `entry.metadata()` on a symlink already returns link metadata
+            // (std does not follow), but be explicit: re-read through
+            // symlink_metadata so the is_symlink flag is authoritative.
+            let is_symlink = std::fs::symlink_metadata(entry.path())
+                .map(|m| m.is_symlink())
+                .unwrap_or(false);
             let name = entry.file_name().to_string_lossy().into_owned();
             let rel = if prefix.is_empty() {
                 name
             } else {
                 format!("{prefix}/{name}")
             };
-            entries.push((rel, entry.path(), meta));
+            entries.push((rel, entry.path(), meta, is_symlink));
         }
         // Deterministic order regardless of filesystem enumeration order.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for (rel, path, meta) in entries {
-            if meta.is_dir() {
+        for (rel, path, meta, is_symlink) in entries {
+            if is_symlink {
+                // D18 symlink policy (§16.9): file links are followed and
+                // synced as their target's content (the metadata() call
+                // above already resolved the target — a broken link errors
+                // there and is skipped below); directory links/junctions are
+                // NEVER recursed into. Sync-as-entry is out of scope (D9):
+                // Windows link creation needs privilege, and link targets
+                // would add a traversal surface.
+                let target_meta = match std::fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        // Dangling link: recorded, not silent.
+                        eprintln!("warning: skipping dangling symlink: {}", path.display());
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if target_meta.is_file() {
+                    if rel.ends_with(".ffsync-index") || rel.ends_with(".ffsync-tmp") {
+                        continue;
+                    }
+                    if excludes.matches(&rel, EntryKind::File) {
+                        continue;
+                    }
+                    out.insert(TreeEntry::from_metadata(rel, EntryKind::File, &target_meta));
+                } else {
+                    eprintln!(
+                        "warning: skipping directory symlink (not recursed): {}",
+                        path.display()
+                    );
+                }
+            } else if meta.is_dir() {
                 // Excluded directory: prune the whole subtree (§16.7).
                 if excludes.matches(&rel, EntryKind::Dir) {
                     continue;
@@ -662,6 +724,7 @@ mod tests {
             size,
             mtime_secs: secs,
             mtime_nanos: nanos,
+            mode: 0,
         }
     }
 

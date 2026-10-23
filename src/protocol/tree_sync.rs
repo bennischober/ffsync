@@ -157,6 +157,7 @@ fn manifest_to_wire(m: &TreeManifest) -> Vec<TreeEntryWire> {
             size: e.size,
             mtime_secs: e.mtime_secs,
             mtime_nanos: e.mtime_nanos,
+            mode: e.mode,
         })
         .collect()
 }
@@ -182,6 +183,7 @@ pub fn manifest_from_wire(wire: &[TreeEntryWire]) -> Result<TreeManifest, SyncEr
             size: e.size,
             mtime_secs: e.mtime_secs,
             mtime_nanos: e.mtime_nanos,
+            mode: e.mode,
         });
     }
     Ok(m)
@@ -192,6 +194,32 @@ fn read_tree_begin(stream: &mut impl Read) -> Result<(TreeBegin, TreeManifest), 
     let begin = TreeBegin::from_frame(frame)?;
     let manifest = manifest_from_wire(&begin.entries)?;
     Ok((begin, manifest))
+}
+
+/// The sender's mode for one conversation (§16.9): `Some(mode)` only when
+/// the session carries the metadata section AND the sender's manifest has
+/// the entry with a nonzero mode (the 0 = absent convention — applying 0
+/// would mean "everything denied" on unix, so it is skipped).
+fn sender_mode_of(peer_manifest: &TreeManifest, rel: &str, metadata: bool) -> Option<u32> {
+    if !metadata {
+        return None;
+    }
+    peer_manifest.get(rel).map(|e| e.mode).filter(|m| *m != 0)
+}
+
+/// The sender's per-path modes for the parallel service loop (§16.9).
+fn sender_modes_of(
+    peer_manifest: &TreeManifest,
+    metadata: bool,
+) -> std::collections::HashMap<String, u32> {
+    if !metadata {
+        return std::collections::HashMap::new();
+    }
+    peer_manifest
+        .entries()
+        .map(|e| (e.rel_path.clone(), e.mode))
+        .filter(|(_, m)| *m != 0)
+        .collect()
 }
 
 fn send_tree_begin(
@@ -259,6 +287,9 @@ where
         force_checksum: checksum,
         tree: true,
     };
+    // The sender's mode needs no wire field of its own: the receiver reads
+    // it from the TREE_BEGIN manifest entry for this rel_path (§16.9) —
+    // the manifest is the per-session source of truth for metadata.
     let outcome = match sync::send(stream, &send_req, pipeline, progress) {
         Ok(o) => o,
         Err(e) => {
@@ -296,6 +327,13 @@ where
     // §16.8: a parallel session announces its connection count in
     // TREE_BEGIN (flag bit 3 + parallel u16). Sequential sessions keep the
     // exact v3 wire layout (flag absent, no field).
+    // §16.9: the metadata section rides whenever the sender's platform
+    // produces mode values. A Windows sender (modes are always 0) sends no
+    // section — its entries would carry no information — while a unix
+    // sender always does, so a unix→Windows sync transfers exec bits (which
+    // map to the read-only attribute) and Windows→unix syncs mode 0 (apply
+    // nothing). The flag is sender-authoritative; the receiver mirrors it.
+    let metadata = cfg!(unix);
     let parallel = request.parallel;
     let flags = if request.force_checksum {
         TREE_FLAG_CHECKSUM
@@ -311,6 +349,10 @@ where
         0
     } | if parallel > 1 {
         message::TREE_FLAG_PARALLEL
+    } else {
+        0
+    } | if metadata {
+        message::TREE_FLAG_METADATA
     } else {
         0
     };
@@ -608,6 +650,9 @@ where
     // the field; the value is sender-authoritative). K=1 keeps the exact
     // v3 layout.
     let parallel = peer_begin.parallel;
+    // §16.9: mirror the sender's metadata flag — triage inputs must be
+    // identical on both peers, so the mode section is all-or-nothing.
+    let metadata = (peer_begin.flags & message::TREE_FLAG_METADATA) != 0;
     let flags = if request.force_checksum {
         TREE_FLAG_CHECKSUM
     } else {
@@ -618,6 +663,10 @@ where
         0
     } | if parallel > 1 {
         message::TREE_FLAG_PARALLEL
+    } else {
+        0
+    } | if metadata {
+        message::TREE_FLAG_METADATA
     } else {
         0
     };
@@ -743,6 +792,7 @@ where
         rel: &str,
         idx: usize,
         total: usize,
+        sender_mode: Option<u32>,
         progress: &mut dyn FnMut(TreeProgress),
     ) -> Result<(SyncOutcome, String), SyncError> {
         let ConvCtx {
@@ -768,6 +818,10 @@ where
             force_checksum: checksum,
             tree: true,
             apply_mtime: None, // filled by sync::receive from the sender's HELLO
+            // §16.9: the sender's mode from the TREE_BEGIN manifest entry.
+            // None (apply nothing) when the session has no metadata section
+            // or the entry is absent — the lookup is by rel_path.
+            apply_mode: sender_mode,
         };
         let rel_c = rel.to_string();
         let outcome = match sync::receive(stream, &recv_req, pipeline, &mut |p| {
@@ -796,7 +850,8 @@ where
             pipeline,
         };
         for (idx, rel) in conversation_paths.iter().enumerate() {
-            let (outcome, _) = run_one(&ctx, stream, rel, idx, total, progress)?;
+            let sender_mode = sender_mode_of(&peer_manifest, rel, metadata);
+            let (outcome, _) = run_one(&ctx, stream, rel, idx, total, sender_mode, progress)?;
             match outcome {
                 SyncOutcome::InSync => in_sync += 1,
                 SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
@@ -880,6 +935,9 @@ where
             first_error: std::sync::Arc<std::sync::Mutex<Option<SyncError>>>,
             root: PathBuf,
             checksum: bool,
+            /// §16.9: the sender's per-entry modes (empty when the session
+            /// has no metadata section).
+            sender_modes: std::collections::HashMap<String, u32>,
             pipeline: crate::chunking::PipelineConfig,
         }
         impl Shared {
@@ -898,6 +956,7 @@ where
             first_error: std::sync::Arc::clone(&first_error),
             root: request.root.clone(),
             checksum,
+            sender_modes: sender_modes_of(&peer_manifest, metadata),
             pipeline: pipeline_clone(pipeline),
         });
         let serve_connection = {
@@ -945,6 +1004,7 @@ where
                     }
                     let rel = named.rel_path.clone();
                     let _ = event_tx.send(ConvEvent::Start(rel.clone()));
+                    let sender_mode = shared.sender_modes.get(&rel).copied();
                     let outcome = run_one(
                         &ConvCtx {
                             root: &shared.root,
@@ -955,6 +1015,7 @@ where
                         &rel,
                         0,
                         0,
+                        sender_mode,
                         &mut |p| {
                             if let TreeProgress::FileProgress { rel_path, progress } = p {
                                 let _ = event_tx.send(ConvEvent::Progress(rel_path, progress));
@@ -1057,6 +1118,7 @@ where
                         break;
                     }
                     let rel = named.rel_path.clone();
+                    let sender_mode = peer_manifest.get(&rel).filter(|_| metadata).map(|e| e.mode);
                     let outcome = run_one(
                         &ConvCtx {
                             root: &request.root,
@@ -1067,6 +1129,7 @@ where
                         &rel,
                         idx,
                         total,
+                        sender_mode,
                         &mut |tp| progress(tp),
                     );
                     idx += 1;
