@@ -366,6 +366,17 @@ the decoded chunk list and refuses on mismatch, so corruption in the root or
 any entry is caught at load time (O(chunk count) in-memory hashing, no I/O).
 Corrupt/truncated index ⇒ treat as missing.
 
+**Index format v2 (`FFSYIX02`, v0.8.0/D19):** 12 bytes appended to the
+header: the CDC parameters (min u32, avg u32, max u32) that produced the
+chunk list. A warm start serves the stored chunk list only when the stored
+parameters equal the session's (the sender's size-derived values); a
+mismatch falls back to a cold scan — correct (chunk hashes are content
+hashes regardless of layout) but wasteful, so the index prefers honesty
+over stale service. A v1 index (no parameters stored) never validates
+against a v2 reader — the magic differs, so old indexes are simply
+missing state and are rewritten at the next commit. The self-verification
+re-derives the root from the chunk list unchanged.
+
 **Reasoning:** the positioning doc calls the persistent index the core product
 insight — cold starts repeat, and rsync is amnesiac. The measured scan cost
 (~350–390 ms/GiB, `evaluation/chunking.md`) bounds what the index saves: on
@@ -741,4 +752,90 @@ chmod'd file converges; setuid bit round-trips; Windows: read-only
 attribute maps both ways); scan tests for junction/dir-symlink
 non-recursion and dangling-symlink warning; v3-peer-rejects-v5-HELLO
 test; the full §16.6-style mtime-preservation regression suite re-run.
+
+## D19 — Small-file adaptive chunking: sender-derived CDC parameters from file size, HELLO-authoritative, index records its parameters
+
+**Decision (v0.8.0):** the CDC parameters stop being compile-time
+constants and become a pure function of the sender's file size:
+
+| file size | CDC (min/avg/max) | source |
+|---|---|---|
+| ≥ 16 MiB | 64 KiB / 256 KiB / 1 MiB | shipped defaults (unchanged) |
+| < 16 MiB | 16 KiB / 64 KiB / 256 KiB | F1-sweep best point |
+
+The sender derives the parameters before scanning and sends the *actual
+values* in HELLO (`cdc_min/cdc_avg/cdc_max` — the fields have been on the
+wire since v0.1, but until now both sides sent the constants and neither
+read the peer's; §4.3's "sender's are authoritative" was aspirational).
+The receiver uses the peer's values for the VERIFY re-scan (§8.2 —
+mandatory: different parameters produce different chunk layouts and the
+roots could never agree) and for its own manifest scan (maximizes hash
+matches). No new frames, no flag bits, no VERSION bump: the layout is
+unchanged; only the semantics of already-present fields sharpen, and the
+policy is a pure function both peers could re-derive (the wire values
+still govern — no "same policy version" invariant needed).
+
+**Threshold evidence** (`evaluation/chunking.md`, size-ladder sweep,
+2026-10-23; truncated real content, corpus mutation patterns, delta =
+missing-chunk share): below 16 MiB the smaller config wins on average —
+rust-src 8 MiB: 18.09% → 4.14% (4.4×), 16 MiB: 5.13% → 2.70%; tos.webm
+16 MiB: 8.62% → 3.76%; the one regression (tos.webm 8 MiB, 8.94% →
+10.18%) is compressed media too dense in cut points even for the smaller
+config at that scale. At 32 MiB the difference is noise (2.6–2.9% both,
+mixed direction); at 64 MiB noise (2.4–2.8%). 16 MiB is the last rung
+where the win is unambiguous and the cost — chunk count 4× (206–209
+chunks at the boundary, ~9 KiB manifest, ~9 KiB index per file) — is
+still trivial. The `appended` pattern is config-insensitive (~9–10%
+everywhere; the tail shifts one boundary), confirming the effect is an
+edit-locality property, not a generic "smaller is better".
+
+**Alternatives considered:**
+- *Continuous scaling* (`avg = clamp(size/16, 16 KiB, 256 KiB)`) —
+  rejected: unbounded parameter variety makes every D15 index a potential
+  layout mismatch and the policy unauditable; two classes bound the cliff
+  to one crossing per file lifetime.
+- *More classes* (32k/128k/512k as a middle gear) — rejected: the sweep
+  shows 32k/128k/512k never wins clearly (it trails 16k below 16 MiB and
+  ties the shipped config above) — it adds a cliff without a rung where
+  it is the best choice.
+- *Derive the policy independently on both peers from file size* —
+  rejected in favor of sending the values: the sender's layout defines
+  plan and VERIFY; making the receiver consume the wire values (which it
+  already receives) removes any requirement that both binaries share a
+  policy version. The policy then only decides what the *sender* sends.
+- *Chunker swap for small files (MinCDC's uniform distribution)* —
+  already closed by F2: the mobydick effect is chunk-size, not
+  distribution; the 16k config achieves the same improvement within the
+  existing chunker.
+
+**Accepted costs:**
+- *The class-boundary cliff:* a file that crosses 16 MiB between syncs
+  re-chunks entirely; the diff sees nothing familiar and the file
+  re-transfers once. Self-healing at the next commit (index rewrites with
+  the new layout). One crossing per file lifetime in practice.
+- *Index codec bump* (`FFSYIX01` → `FFSYIX02`, +12 B header: min/avg/max
+  u32 each): a warm start serves its chunk list only when the stored
+  parameters equal the session's; otherwise cold scan (correct but
+  wasteful — the honest choice over serving a foreign layout). Existing
+  v1 indexes are treated as missing state and rewritten at the next
+  commit; no migration machinery (same rule as every codec change so
+  far).
+- *Large-file fingerprints must not move:* files ≥ 16 MiB chunk
+  byte-identically to the shipped defaults, so every existing large-file
+  index stays valid. The bench fingerprint discipline runs per-config
+  from now on.
+
+**Wire mapping:** none. HELLO's `cdc_min/cdc_avg/cdc_max` become
+authoritative (§4.3 amended: SHOULD → MUST for the VERIFY re-scan, SHOULD
+for the manifest scan); §8.2 notes that the root identity is
+parameter-bound. The worked example (§15) already says "both use
+identical CDC params" — now they are the sender's, announced.
+
+**Validation plan:** unit tests for the policy function (boundary at
+16 MiB inclusive/exclusive); loopback: small-file session converges with
+non-default parameters (assert the HELLO carried 16k/64k/256k), warm
+start serves a matching-parameter index and cold-scans a mismatched one
+(v1 index treated as missing); bench fingerprint per config (large-file
+chunk counts unchanged vs the shipped defaults); full gates on Windows +
+Docker Linux.
 

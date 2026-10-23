@@ -119,8 +119,18 @@ connection after flushing; the peer must treat the transfer as failed.
 2. Validate: magic, version equality (else ERROR 1), role conflict
    (both 1 or both 2 → ERROR 2).
 3. CDC parameters: the **sender's** (min, avg, max) are authoritative; the
-   receiver SHOULD use the same values when chunking its own file. This is a
-   bandwidth optimization, not a correctness requirement — see §8.2.
+   receiver **MUST** use them for the temp-file re-scan (§8.2 — different
+   parameters produce different chunk layouts and the roots could never
+   agree) and **SHOULD** use them for its own manifest scan (same-boundary
+   scans maximize hash matches; a mismatch degrades to over-send, never
+   corruption — the offsets in a manifest are descriptive, §3). The sender
+   picks the parameters as a pure function of its file size (small-file
+   adaptive chunking, D19: below 16 MiB the F1-sweep config
+   16k/64k/256k, otherwise the shipped 64k/256k/1m — both peers can
+   re-derive the policy, but the values on the wire are what governs). A
+   receiver may keep scanning with its own parameters for its manifest
+   when its file differs wildly in size; VERIFY correctness is unaffected
+   as long as the *re-scan* uses the sender's parameters.
 4. Fast path: if `flags.trust_times` is set (default on, D14) **and**
    `file_size`, `file_mtime` **and `file_mtime_nanos`** are equal on both
    sides, the sender sends NOT_MODIFIED and closes. Both peers are done
@@ -218,6 +228,14 @@ and (c) VERIFY has arrived. It must not finalize before (a)–(c) all hold.
    peers are done.
 4. Mismatch → delete the temp file, send ERROR 4. The original file is
    untouched. Retry is the sender's decision (fresh connection).
+
+**CDC parameters in verification (v4, D19):** the root is computed over the
+chunk list produced by *one* parameter set — the sender's. The receiver's
+temp re-scan therefore uses the sender's HELLO parameters
+(`cdc_min/cdc_avg/cdc_max`), not its own defaults; two differently-cut
+chunkings of identical content yield different roots, so a receiver that
+ignores the sender's parameters can never verify. (Before D19 both peers
+hardcoded the shipped constants, which is why this was invisible.)
 
 **Already-in-sync edge case:** if the sender's plan is empty (no chunks at
 all) the sender still sends VERIFY. The receiver then hashes its *current*
