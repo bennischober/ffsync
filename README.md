@@ -370,7 +370,9 @@ The reasoning is the product; it is all recorded:
   [`evaluation/comparison.md`](evaluation/comparison.md) and
   [`evaluation/memory.md`](evaluation/memory.md) — the measurements
   behind the defaults (comparison.md: ffsync vs rsync/croc/sendme
-  head-to-head on loopback, every cell hash-verified)
+  head-to-head on loopback, every cell hash-verified; chunking.md also
+  holds the real-content corpus results and the F2 chunker A/B test
+  that closed without an adoption)
 
 ## Roadmap
 
@@ -406,8 +408,16 @@ The reasoning is the product; it is all recorded:
   addresses. Same identity/pinning model; the state machines stay
   sync (tokio at the transport edge only, D3). TCP/TLS-over-TCP stay
   the default.
-- **Later - SeqCDC and other chunkers** as they mature; the `Chunker` trait
-  makes swapping cheap (registered as F2).
+- **Evaluated, not adopted (F2, 2026-10-23) - alternative chunkers:**
+  SeqCDC / MinCDC / MothCDC benchmarked on the real-content corpus with
+  ffsync's own metrics ([`evaluation/chunking.md`](evaluation/chunking.md)):
+  MinCDC is 3.6× faster than FastCDC at equal delta quality, but the scan
+  is disk-bound cold and a few percent of sync wall time, so the win never
+  reaches the user end-to-end; SeqCDC fails edit locality on media (its
+  cut rule is chunk-start-relative, so in-place edits re-anchor every
+  later boundary); MothCDC is byte-identical to MinCDC on our data. The
+  `Chunker` trait keeps swapping cheap; MinCDC is the tracked candidate
+  if fast/warm rescans ever become the bottleneck.
 - **Later - permissions/xattrs/symlinks as first-class metadata** (D9).
 
 ## License
