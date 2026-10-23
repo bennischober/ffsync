@@ -36,6 +36,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
+pub mod quic;
+
 /// This peer's long-lived identity: a self-signed certificate and its key,
 /// both kept as DER (no PEM parsing anywhere).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,6 +4,24 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **QUIC transport (`--quic`; §17, D13 step 2):** an opt-in transport beside
+  TCP. One QUIC connection carries the whole session — in tree mode the
+  §16.8 worker conversations ride QUIC streams instead of separate TCP
+  connections (K connections become K streams; one TLS 1.3 handshake
+  instead of K). The same D16 identity and pins file are used for both
+  transports (a pinned peer may connect over either); QUIC has no
+  plaintext mode, so `--plaintext` + `--quic` is rejected loudly. TCP
+  stays the default; QUIC targets WAN-shaped paths (stream-level loss
+  recovery instead of TCP head-of-line blocking, connection migration for
+  changing addresses). QUIC requires UDP; a blocked path fails with a
+  bounded handshake timeout naming the fallback. The sync state machines
+  stay synchronous (tokio lives at the transport edge only, D3); the wire
+  bytes are unchanged, so no protocol VERSION bump.
+
 ## [0.5.0] - 2026-10-22
 
 ### Added

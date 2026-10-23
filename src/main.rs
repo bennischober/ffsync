@@ -34,10 +34,10 @@ ffsync: fast chunk-level file sync for big files and fast links
 Usage:
   ffsync send <file|dir> <host:port> [--checksum] [--no-delete]
               [--exclude <pat>]... [--exclude-from <file>]
-              [--plaintext] [--trust <fp>]
+              [--plaintext] [--quic] [--trust <fp>]
   ffsync receive <file|dir> <port> [--checksum] [--from <old-file>]
               [--no-delete] [--exclude <pat>]... [--exclude-from <file>]
-              [--plaintext] [--trust <fp>]
+              [--plaintext] [--quic] [--trust <fp>]
   ffsync trust <fingerprint>       pin a peer fingerprint (TOFU first contact)
   ffsync untrust <fingerprint>     remove a pinned fingerprint
   ffsync fingerprints              show this peer's identity + all pins
@@ -65,6 +65,10 @@ Options:
   --exclude-from <f> tree mode: read one exclude pattern per line from <f>
                      ('#' comments and blank lines are ignored)
   --plaintext        disable TLS (LAN use or inside an SSH tunnel); D16
+                     (TCP only — QUIC is always encrypted, §17.2)
+  --quic             use the QUIC transport (quinn, TLS 1.3 inside the
+                     transport, D13 step 2 / §17). Receiver listens on UDP;
+                     sender connects over UDP. Same pinning model as TCP.
   --trust <fp>       non-interactive first contact: pin <fp> instead of
                      prompting; also overrides which pinned peer to expect
   -h, --help         print this help
@@ -298,6 +302,10 @@ fn set_stream_timeouts(stream: &TcpStream, secs: u64) {
 struct CliOptions {
     force_checksum: bool,
     plaintext: bool,
+    /// QUIC transport instead of TCP (D13 step 2, §17). Mutually exclusive
+    /// with --plaintext (QUIC has no plaintext mode; TLS 1.3 is
+    /// transport-mandated).
+    quic: bool,
     trust_flag: Option<String>,
     no_delete: bool,
     excludes: Vec<String>,
@@ -306,29 +314,39 @@ struct CliOptions {
 }
 
 fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()> {
+    let CliOptions {
+        force_checksum,
+        plaintext,
+        quic,
+        trust_flag,
+        no_delete,
+        excludes,
+        parallel,
+    } = opts;
     let tree = file.is_dir();
     if tree {
-        if opts.no_delete {
+        if no_delete {
             return Err(std::io::Error::other(
                 "--no-delete applies to receive only (the sender never deletes)",
             ));
         }
-        return run_tree_send(
-            file,
+        return run_tree_send(TreeSendOpts {
+            root: file,
             addr,
-            opts.force_checksum,
-            opts.plaintext,
-            opts.trust_flag,
-            opts.excludes,
-            opts.parallel,
-        );
+            force_checksum,
+            plaintext,
+            quic,
+            trust_flag,
+            excludes,
+            parallel,
+        });
     }
-    if !opts.excludes.is_empty() {
+    if !excludes.is_empty() {
         return Err(std::io::Error::other(
             "--exclude/--exclude-from apply to tree mode only (pass a directory)",
         ));
     }
-    if opts.parallel > 1 {
+    if parallel > 1 {
         return Err(std::io::Error::other(
             "--parallel applies to tree mode only (pass a directory)",
         ));
@@ -340,34 +358,56 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
         )));
     }
     let (host, port) = parse_host_port(&addr);
-    println!("connecting to {host}:{port} ...");
-    let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
-        std::io::Error::other(format!(
-            "cannot connect to {host}:{port}: {e} (is the receiver running?)"
-        ))
-    })?;
-    tcp.set_nodelay(true).ok();
-    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-
-    // Transport security (D16): TLS by default; --plaintext for LAN/SSH
-    // tunnels. Handshake first, then the sync protocol over the TLS stream.
-    let mut stream: Box<dyn ReadWrite> = if opts.plaintext {
-        Box::new(tcp)
-    } else {
+    let mut stream: Box<dyn ReadWrite> = if quic {
+        println!("connecting to {host}:{port} (QUIC) ...");
+        let server_addr: std::net::SocketAddr = format!("{host}:{port}")
+            .parse()
+            .map_err(|e| std::io::Error::other(format!("cannot resolve {host}:{port}: {e}")))?;
         let (identity, created) = ffsync::transport::Identity::load_or_create()?;
         if created {
             println!("identity created: {}", identity.fingerprint());
             println!("(share this fingerprint out-of-band so peers can pin it)");
         }
-        let policy = resolve_pin_policy(opts.trust_flag.as_deref(), &host)?;
-        let (tls, presented) = ffsync::transport::client_session(
-            tcp,
-            &identity,
-            &policy,
-            rustls_pki_types_server_name(&host)?,
-        )?;
+        let policy = resolve_pin_policy(trust_flag.as_deref(), &host)?;
+        let name = rustls_pki_types_server_name(&host)?;
+        let (_session, quic_stream, presented) =
+            ffsync::transport::quic::client_session(&identity, &policy, server_addr, name)?;
         enforce_first_use(&policy, &presented, format!("{host}:{port}"))?;
-        Box::new(tls)
+        println!(
+            "peer identity: {}",
+            ffsync::transport::format_fingerprint(&presented)
+        );
+        Box::new(quic_stream)
+    } else {
+        println!("connecting to {host}:{port} ...");
+        let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
+            std::io::Error::other(format!(
+                "cannot connect to {host}:{port}: {e} (is the receiver running?)"
+            ))
+        })?;
+        tcp.set_nodelay(true).ok();
+        set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+
+        // Transport security (D16): TLS by default; --plaintext for LAN/SSH
+        // tunnels. Handshake first, then the sync protocol over the TLS stream.
+        if plaintext {
+            Box::new(tcp)
+        } else {
+            let (identity, created) = ffsync::transport::Identity::load_or_create()?;
+            if created {
+                println!("identity created: {}", identity.fingerprint());
+                println!("(share this fingerprint out-of-band so peers can pin it)");
+            }
+            let policy = resolve_pin_policy(trust_flag.as_deref(), &host)?;
+            let (tls, presented) = ffsync::transport::client_session(
+                tcp,
+                &identity,
+                &policy,
+                rustls_pki_types_server_name(&host)?,
+            )?;
+            enforce_first_use(&policy, &presented, format!("{host}:{port}"))?;
+            Box::new(tls)
+        }
     };
 
     let display = &mut ProgressDisplay::new();
@@ -406,13 +446,32 @@ fn run_receive(
     let CliOptions {
         force_checksum,
         plaintext,
+        quic,
         trust_flag,
         no_delete,
         excludes,
         parallel: _parallel, // single-file receive has no parallel sessions
     } = opts;
-    let listener = TcpListener::bind(("0.0.0.0", port))?;
-    let bound = listener.local_addr()?.port();
+    let listener = if quic {
+        let (identity, created) = ffsync::transport::Identity::load_or_create()?;
+        if created {
+            println!("identity created: {}", identity.fingerprint());
+            println!("(share this fingerprint out-of-band so peers can pin it)");
+        }
+        // The peer label is unknown before accept; the policy is
+        // label-independent (a fingerprint set).
+        let policy = resolve_pin_policy(trust_flag.as_deref(), "peer")?;
+        let bind: std::net::SocketAddr =
+            format!("0.0.0.0:{port}").parse().expect("valid bind addr");
+        let endpoint = ffsync::transport::quic::listen(bind, &identity, &policy)?;
+        Listener::Quic(endpoint)
+    } else {
+        Listener::Tcp(TcpListener::bind(("0.0.0.0", port))?)
+    };
+    let bound = match &listener {
+        Listener::Tcp(l) => l.local_addr()?.port(),
+        Listener::Quic(e) => e.local_addr()?.port(),
+    };
     if file.is_dir() {
         if from.is_some() {
             return Err(std::io::Error::other(
@@ -447,30 +506,55 @@ fn run_receive(
     } else {
         println!("listening on 0.0.0.0:{bound} ...");
     }
-    let (tcp, peer) = listener.accept()?;
-    println!("peer connected: {peer}");
-    tcp.set_nodelay(true).ok();
-    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+    let mut quic_receive_session: Option<ffsync::transport::quic::QuicSession> = None;
+    let mut stream: Box<dyn ReadWrite> = match listener {
+        Listener::Tcp(listener) => {
+            let (tcp, peer) = listener.accept()?;
+            println!("peer connected: {peer}");
+            tcp.set_nodelay(true).ok();
+            set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
 
-    // Transport security (D16): TLS by default; --plaintext for LAN/SSH
-    // tunnels. Handshake before any sync data (the receiver is the
-    // FirstUse-decision point: nothing is written before the pin is settled).
-    let mut stream: Box<dyn ReadWrite> = if plaintext {
-        Box::new(tcp)
-    } else {
-        let (identity, created) = ffsync::transport::Identity::load_or_create()?;
-        if created {
-            println!("identity created: {}", identity.fingerprint());
-            println!("(share this fingerprint out-of-band so peers can pin it)");
+            // Transport security (D16): TLS by default; --plaintext for
+            // LAN/SSH tunnels. Handshake before any sync data (the receiver
+            // is the FirstUse-decision point: nothing is written before the
+            // pin is settled).
+            if plaintext {
+                Box::new(tcp)
+            } else {
+                let (identity, created) = ffsync::transport::Identity::load_or_create()?;
+                if created {
+                    println!("identity created: {}", identity.fingerprint());
+                    println!("(share this fingerprint out-of-band so peers can pin it)");
+                }
+                let policy = resolve_pin_policy(trust_flag.as_deref(), &peer.to_string())?;
+                let (tls, presented) = ffsync::transport::server_session(tcp, &identity, &policy)?;
+                enforce_first_use(&policy, &presented, peer.to_string())?;
+                println!(
+                    "peer identity: {}",
+                    ffsync::transport::format_fingerprint(&presented)
+                );
+                Box::new(tls)
+            }
         }
-        let policy = resolve_pin_policy(trust_flag.as_deref(), &peer.to_string())?;
-        let (tls, presented) = ffsync::transport::server_session(tcp, &identity, &policy)?;
-        enforce_first_use(&policy, &presented, peer.to_string())?;
-        println!(
-            "peer identity: {}",
-            ffsync::transport::format_fingerprint(&presented)
-        );
-        Box::new(tls)
+        Listener::Quic(endpoint) => {
+            // Identity/policy were resolved pre-accept (endpoint config);
+            // FirstUse enforcement happens now, after the handshake.
+            let policy = resolve_pin_policy(trust_flag.as_deref(), "peer")?;
+            let (session, quic_stream, presented) =
+                ffsync::transport::quic::server_session(endpoint)?;
+            let peer_label = session.remote_address().to_string();
+            println!("peer connected: {peer_label} (QUIC)");
+            enforce_first_use(&policy, &presented, peer_label)?;
+            println!(
+                "peer identity: {}",
+                ffsync::transport::format_fingerprint(&presented)
+            );
+            // §17.6: our COMMIT_ACK / NOT_MODIFIED replies to the sender's
+            // final frames are only provably delivered when the sender
+            // closes; hold the connection until then (bounded).
+            quic_receive_session = Some(session);
+            Box::new(quic_stream)
+        }
     };
 
     let display = &mut ProgressDisplay::new();
@@ -490,41 +574,102 @@ fn run_receive(
         }
     };
     report_outcome("receive", outcome, display);
+    // §17.6 (QUIC): the sender waits for our close after its drain; hold
+    // until its close proves our final replies were delivered (bounded).
+    if let Some(session) = quic_receive_session {
+        session.wait_for_peer_close(Duration::from_secs(10));
+    }
     Ok(())
 }
 
-/// Tree mode (v0.3): send a directory's contents. TLS setup is shared with
-/// the single-file path via [`connect_authenticated`].
-fn run_tree_send(
+/// Options bundle for [`run_tree_send`] (8 params exceeded clippy's
+/// limit; these are one logical unit — the sender's setup).
+struct TreeSendOpts {
     root: PathBuf,
     addr: String,
     force_checksum: bool,
     plaintext: bool,
+    quic: bool,
     trust_flag: Option<String>,
     excludes: Vec<String>,
     parallel: u16,
-) -> std::io::Result<()> {
+}
+
+/// Tree mode (v0.3): send a directory's contents. TLS setup is shared with
+/// the single-file path via [`connect_authenticated`].
+fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
+    let TreeSendOpts {
+        root,
+        addr,
+        force_checksum,
+        plaintext,
+        quic,
+        trust_flag,
+        excludes,
+        parallel,
+    } = opts;
     let (host, port) = parse_host_port(&addr);
-    println!("connecting to {host}:{port} ...");
-    let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
-        std::io::Error::other(format!(
-            "cannot connect to {host}:{port}: {e} (is the receiver running?)"
-        ))
-    })?;
-    tcp.set_nodelay(true).ok();
-    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-    let mut stream = connect_authenticated(tcp, &host, true, plaintext, trust_flag.clone())?;
 
     let display = &mut TreeDisplay::new();
-    // Worker connections (§16.8): same host/port, same TLS setup, one per
-    // worker index. Opened by the state machine after TREE_BEGIN.
-    let connect_worker = move |index: u16| -> std::io::Result<Box<dyn ReadWrite>> {
-        let tcp = TcpStream::connect((host.as_str(), port))
-            .map_err(|e| std::io::Error::other(format!("cannot connect worker {index}: {e}")))?;
+    let mut quic_wait: Option<ffsync::transport::quic::QuicSession> = None;
+    let (stream, connect_worker) = if quic {
+        // QUIC (§17): one connection, K streams. The control stream comes
+        // from client_session; workers clone the session handle and open
+        // their own stream (the QUIC equivalent of a fresh TCP connect).
+        println!("connecting to {host}:{port} (QUIC) ...");
+        let server_addr: std::net::SocketAddr = format!("{host}:{port}")
+            .parse()
+            .map_err(|e| std::io::Error::other(format!("cannot resolve {host}:{port}: {e}")))?;
+        let (identity, created) = ffsync::transport::Identity::load_or_create()?;
+        if created {
+            println!("identity created: {}", identity.fingerprint());
+            println!("(share this fingerprint out-of-band so peers can pin it)");
+        }
+        let policy = resolve_pin_policy(trust_flag.as_deref(), &host)?;
+        let name = rustls_pki_types_server_name(&host)?;
+        let (session, control, presented) =
+            ffsync::transport::quic::client_session(&identity, &policy, server_addr, name)?;
+        enforce_first_use(&policy, &presented, format!("{host}:{port}"))?;
+        println!(
+            "peer identity: {}",
+            ffsync::transport::format_fingerprint(&presented)
+        );
+        let session_for_wait = session.clone();
+        let connect_worker: Box<dyn Fn(u16) -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
+            Box::new(move |index: u16| -> std::io::Result<Box<dyn ReadWrite>> {
+                let s = session.open_stream().map_err(|e| {
+                    std::io::Error::other(format!("cannot open worker {index}: {e}"))
+                })?;
+                Ok(Box::new(s))
+            });
+        quic_wait = Some(session_for_wait);
+        (Box::new(control) as Box<dyn ReadWrite>, connect_worker)
+    } else {
+        println!("connecting to {host}:{port} ...");
+        let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
+            std::io::Error::other(format!(
+                "cannot connect to {host}:{port}: {e} (is the receiver running?)"
+            ))
+        })?;
         tcp.set_nodelay(true).ok();
         set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-        connect_authenticated(tcp, &host, true, plaintext, trust_flag.clone())
+        let stream = connect_authenticated(tcp, &host, true, plaintext, trust_flag.clone())?;
+
+        // Worker connections (§16.8): same host/port, same TLS setup, one per
+        // worker index. Opened by the state machine after TREE_BEGIN.
+        let connect_worker = move |index: u16| -> std::io::Result<Box<dyn ReadWrite>> {
+            let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
+                std::io::Error::other(format!("cannot connect worker {index}: {e}"))
+            })?;
+            tcp.set_nodelay(true).ok();
+            set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+            connect_authenticated(tcp, &host, true, plaintext, trust_flag.clone())
+        };
+        let connect_worker: Box<dyn Fn(u16) -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
+            Box::new(connect_worker);
+        (stream, connect_worker)
     };
+    let mut stream = stream;
     let request = TreeSendRequest {
         root,
         force_checksum,
@@ -542,6 +687,13 @@ fn run_tree_send(
         }
     };
     report_tree_outcome("send", &outcome, display);
+    // §17.6 (QUIC): the receiver replies to our TREE_END (the delete
+    // report) and then waits for OUR close. Hold the connection until the
+    // receiver's close arrives so the report is ACKed, not discarded —
+    // QUIC close discards unACKed stream data, TCP close flushes.
+    if let Some(session) = quic_wait {
+        session.wait_for_peer_close(Duration::from_secs(10));
+    }
     Ok(())
 }
 
@@ -554,8 +706,15 @@ struct TreeReceiveOpts {
     trust_flag: Option<String>,
     no_delete: bool,
     excludes: Vec<String>,
-    listener: TcpListener,
+    listener: Listener,
     bound: u16,
+}
+
+/// The receiver's listening socket: TCP (default) or a QUIC endpoint
+/// (`--quic`, UDP).
+enum Listener {
+    Tcp(TcpListener),
+    Quic(ffsync::transport::quic::QuicEndpoint),
 }
 
 /// Tree mode (v0.3): receive a directory's contents. The target directory is
@@ -575,31 +734,84 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
     if !root.exists() {
         std::fs::create_dir_all(&root)?;
     }
-    println!("listening on 0.0.0.0:{bound} (tree mode) ...");
-    let (tcp, peer) = listener.accept()?;
-    println!("peer connected: {peer}");
-    tcp.set_nodelay(true).ok();
-    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-    let peer_label = peer.to_string();
-    let mut stream = connect_authenticated(tcp, &peer_label, false, plaintext, trust_flag.clone())?;
-
     let display = &mut TreeDisplay::new();
-    // Worker connections (§16.8): accept from the same listener (the sender
-    // connects them to the same port), same TLS setup.
-    let accept_worker = move || -> std::io::Result<Box<dyn ReadWrite>> {
-        let (tcp, wpeer) = listener
-            .accept()
-            .map_err(|e| std::io::Error::other(format!("cannot accept worker: {e}")))?;
-        tcp.set_nodelay(true).ok();
-        set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-        connect_authenticated(
-            tcp,
-            &wpeer.to_string(),
-            false,
-            plaintext,
-            trust_flag.clone(),
-        )
+    let (stream, accept_worker, _peer_label, session) = match listener {
+        Listener::Tcp(listener) => {
+            println!("listening on 0.0.0.0:{bound} (tree mode) ...");
+            let (tcp, peer) = listener.accept()?;
+            println!("peer connected: {peer}");
+            tcp.set_nodelay(true).ok();
+            set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+            let peer_label = peer.to_string();
+            let stream =
+                connect_authenticated(tcp, &peer_label, false, plaintext, trust_flag.clone())?;
+            // Worker connections (§16.8): accept from the same listener (the
+            // sender connects them to the same port), same TLS setup.
+            let accept_worker: Box<dyn Fn() -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
+                Box::new(move || -> std::io::Result<Box<dyn ReadWrite>> {
+                    let (tcp, wpeer) = listener
+                        .accept()
+                        .map_err(|e| std::io::Error::other(format!("cannot accept worker: {e}")))?;
+                    tcp.set_nodelay(true).ok();
+                    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+                    connect_authenticated(
+                        tcp,
+                        &wpeer.to_string(),
+                        false,
+                        plaintext,
+                        trust_flag.clone(),
+                    )
+                });
+            (
+                stream,
+                accept_worker,
+                peer_label,
+                None::<ffsync::transport::quic::QuicSession>,
+            )
+        }
+        Listener::Quic(endpoint) => {
+            println!("listening on 0.0.0.0:{bound} (tree mode, QUIC) ...");
+            // Identity + policy are needed BEFORE accept (they configure the
+            // endpoint's TLS); FirstUse enforcement happens after the
+            // handshake, exactly like TCP.
+            let (identity, created) = ffsync::transport::Identity::load_or_create()?;
+            if created {
+                println!("identity created: {}", identity.fingerprint());
+                println!("(share this fingerprint out-of-band so peers can pin it)");
+            }
+            // The policy needs a peer label, which exists only after accept;
+            // resolve with a placeholder label — the fingerprint check is
+            // label-independent (pins are a fingerprint set).
+            let policy = resolve_pin_policy(trust_flag.as_deref(), "peer")?;
+            let (session, control, presented) = ffsync::transport::quic::server_session(endpoint)?;
+            let peer_label = session.remote_address().to_string();
+            enforce_first_use(&policy, &presented, peer_label.clone())?;
+            println!(
+                "peer identity: {}",
+                ffsync::transport::format_fingerprint(&presented)
+            );
+            // Worker streams (§16.8): accept more streams on the same
+            // connection (the QUIC equivalent of accepting more TCP
+            // connections).
+            let accept_worker: Box<dyn Fn() -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
+                Box::new({
+                    let session = session.clone();
+                    move || -> std::io::Result<Box<dyn ReadWrite>> {
+                        let s = session.accept_stream().map_err(|e| {
+                            std::io::Error::other(format!("cannot accept worker: {e}"))
+                        })?;
+                        Ok(Box::new(s))
+                    }
+                });
+            (
+                Box::new(control) as Box<dyn ReadWrite>,
+                accept_worker,
+                peer_label,
+                Some(session),
+            )
+        }
     };
+    let mut stream = stream;
     let request = TreeReceiveRequest {
         root,
         force_checksum,
@@ -616,6 +828,12 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
         }
     };
     report_tree_outcome("receive", &outcome, display);
+    // §17.6: the sender's last frames (TREE_END report path) are only
+    // provably delivered when the sender closes; hold the connection
+    // briefly so its close lands.
+    if let Some(session) = session {
+        session.wait_for_peer_close(Duration::from_secs(10));
+    }
     Ok(())
 }
 
@@ -854,6 +1072,7 @@ fn main() {
             let mut positional: Vec<String> = Vec::new();
             let mut force_checksum = false;
             let mut plaintext = false;
+            let mut quic = false;
             let mut trust_flag = None;
             let mut no_delete = false;
             let mut excludes: Vec<String> = Vec::new();
@@ -863,6 +1082,7 @@ fn main() {
                 match a.as_str() {
                     "--checksum" => force_checksum = true,
                     "--plaintext" => plaintext = true,
+                    "--quic" => quic = true,
                     "--trust" => {
                         let v = it
                             .next()
@@ -907,6 +1127,11 @@ fn main() {
             if positional.len() != 2 {
                 die("send requires <file|dir> <host:port>");
             }
+            if plaintext && quic {
+                die(
+                    "--plaintext and --quic are mutually exclusive (QUIC is always encrypted, §17.2)",
+                );
+            }
             let file = PathBuf::from(&positional[0]);
             let addr = positional[1].clone();
             run_send(
@@ -915,6 +1140,7 @@ fn main() {
                 CliOptions {
                     force_checksum,
                     plaintext,
+                    quic,
                     trust_flag,
                     no_delete,
                     excludes,
@@ -930,6 +1156,7 @@ fn main() {
             let mut positional: Vec<String> = Vec::new();
             let mut force_checksum = false;
             let mut plaintext = false;
+            let mut quic = false;
             let mut trust_flag = None;
             let mut from = None;
             let mut no_delete = false;
@@ -940,6 +1167,7 @@ fn main() {
                 match a.as_str() {
                     "--checksum" => force_checksum = true,
                     "--plaintext" => plaintext = true,
+                    "--quic" => quic = true,
                     "--trust" => {
                         let v = it
                             .next()
@@ -988,6 +1216,11 @@ fn main() {
             if positional.len() != 2 {
                 die("receive requires <file|dir> <port>");
             }
+            if plaintext && quic {
+                die(
+                    "--plaintext and --quic are mutually exclusive (QUIC is always encrypted, §17.2)",
+                );
+            }
             let file = PathBuf::from(&positional[0]);
             let port: u16 = positional[1]
                 .parse()
@@ -999,6 +1232,7 @@ fn main() {
                 CliOptions {
                     force_checksum,
                     plaintext,
+                    quic,
                     trust_flag,
                     no_delete,
                     excludes,

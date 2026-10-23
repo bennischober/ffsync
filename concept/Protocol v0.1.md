@@ -8,6 +8,8 @@ gained `file_mtime_nanos`, see §3/§4; v0.3 adds the tree envelope, see
 §16; v0.4/v0.5 work extends TREE_BEGIN additively under flag bits —
 §16.7 excludes, §16.8 parallel sessions — without a VERSION bump, since
 unknown flag bits are rejected and the default layouts are unchanged).
+§17 specifies the QUIC transport (D13 step 2): a carrier change under
+the same wire bytes, no VERSION bump.
 
 ## 1. Scope and non-goals
 
@@ -659,9 +661,135 @@ conversations succeeded — a failed session never destroys data. Tree
 flags, excludes, resume, warm indexes, and mtime preservation are
 per-conversation concerns and work unchanged on any connection.
 
-**Not async.** This is native threads + blocking I/O per connection —
+**Not async.** This is native threads + blocking I/O per connection - 
 no async runtime enters the tree (the D13 amendment's constraint). QUIC
 (D13 step 2) can later substitute the transport: a QUIC stream is
 `Read + Write`, so worker connections map onto streams without touching
-this layer again.
+this layer again. That substitution is specified in §17.
+
+## 17. QUIC transport (D13 step 2, v0.6 work)
+
+QUIC substitutes the transport underneath the existing session shapes —
+it changes **how bytes move**, not **which bytes move**. Every frame,
+every handshake, every state machine in §4–§16 is unchanged: a QUIC
+stream is an ordered, reliable byte stream, exactly the §2 assumption
+framing and TLS-over-TCP already make. This section specifies the
+mapping, the security model, and what actually differs.
+
+### 17.1 Relationship to the session shapes
+
+- **Single-file sessions (§4–§8) and sequential tree sessions (§16.1–
+  16.6):** one QUIC *connection*, one bidirectional *stream* per
+  conversation (single-file: exactly one stream). The stream plays the
+  role the TLS-over-TCP stream plays today.
+- **Parallel sessions (§16.8):** one QUIC connection; conversation
+  *i*'s stream plays the role of connection *i*. K=1 is the sequential
+  shape. The TREE_WORKER/TREE_FILE membership protocol is UNCHANGED —
+  the sender still announces every conversation, the receiver still
+  validates each announced path exactly once; what was "the worker
+  connects" becomes "the worker opens a stream." A v4 peer over QUIC
+  interoperates with a v4 TCP peer (the wire bytes are identical; only
+  the carrier differs), so no VERSION bump and no new flag bits.
+- **Streams are cheap** (no handshake, no kernel socket): the §16.8
+  cap K=2..=16 remains the wire-protocol cap, but implementations MAY
+  run more conversations than they have streams in flight; this spec
+  keeps one stream per conversation partition (deterministic, matches
+  the TCP shape 1:1).
+
+### 17.2 Security model (D16 mapping)
+
+QUIC in Rust (quinn) mandates TLS 1.3 **inside the transport** — there
+is no plaintext QUIC. The D16 model maps directly, replacing the
+TLS-over-TCP layer rather than stacking on it:
+
+- **Identity:** the same self-signed certificate (raw-DER
+  `identity.bin`, rcgen) is the QUIC endpoint's certificate. One
+  identity per peer, same file, same codec.
+- **Mutual TOFU pinning:** the QUIC client verifies the server cert's
+  SHA-256 fingerprint against the pins set (Pinned or FirstUse), and
+  the QUIC *server* requires client certificates and pins them the
+  same way. The presented fingerprint is surfaced to the CLI after the
+  handshake completes, exactly like `transport::client_session` /
+  `server_session` do today — the verifier never makes trust
+  decisions by itself.
+- **`--plaintext` semantics:** QUIC has no plaintext mode. `--plaintext`
+  on a QUIC invocation is an error ("QUIC is always encrypted; use TCP
+  for plaintext") — plaintext remains a TCP-only concern (LAN/SSH).
+- **Fingerprint format, pins file, `trust`/`untrust`/`fingerprints`
+  commands: unchanged.** Pins are a set, not per-transport entries; a
+  pinned fingerprint may connect over TCP or QUIC in either role.
+
+### 17.3 Runtime boundary (D3 amendment)
+
+tokio enters the tree at the edges only: quinn is an async library,
+so `transport::quic` owns a small multi-thread runtime that drives
+endpoint machinery (connection state, retransmit timers, keep-alives).
+The public seam stays synchronous — a `QuicStream` adapter implements
+`Read + Write + Send` by driving quinn futures to completion
+(`block_on` at the adapter boundary), so `protocol::sync` and
+`protocol::tree_sync` remain 100% sync, and the data plane (mmap,
+chunker/hash worker threads, crossbeam channels, reconstructor)
+remains native-thread and runtime-free. `ffsync::protocol` MUST NOT
+depend on tokio; only `transport` and the CLI edge do. The §16.8
+worker model is unchanged: one native thread per conversation, each
+driving its stream through the sync adapter.
+
+### 17.4 What QUIC actually buys (and what it does not)
+
+- **One handshake instead of K.** A parallel session over TCP pays K
+  full rustls handshakes (§16.8 measured this as part of the K>8
+  flattening); QUIC pays one connection handshake, streams are nearly
+  free.
+- **Stream-level loss recovery.** A lost packet delays only its own
+  stream's data, not every conversation behind a TCP head-of-line
+  block. The netem blind spot from `evaluation/parallel.md` (shared
+  bottleneck + loss) is *solved by the transport* here.
+- **Connection migration.** A peer whose address changes (Wi-Fi →
+  hotspot, NAT rebinding) keeps the connection alive — the "friend
+  over the internet" case, impossible over TCP. This is the headline
+  feature; it requires both peers on QUIC.
+- **What it does not buy:** no throughput magic on clean paths (TCP at
+  100 Mbit/s+ is rarely the bottleneck for ffsync's chunk sizes), and
+  no LAN benefit (RTT is already ~0; §16.8's LAN caveat applies).
+  QUIC is a WAN-shape transport; over TCP and QUIC both being
+  available, the peers negotiate nothing — the CLI flags decide
+  (`--quic` sender-side; a QUIC receiver listens on UDP and speaks
+  QUIC to any peer that connects).
+
+### 17.5 Interoperability and rollout
+
+- **Discovery:** a QUIC receiver binds UDP port N and a TCP receiver
+  binds TCP port N — the sender's flag picks the transport, there is
+  no wire negotiation step (a QUIC sender connecting to a TCP-only
+  peer fails at the UDP level, loudly: no QUIC handshake response).
+- **v0.4/v0.5 peers:** no interaction — QUIC peers cannot talk to
+  TCP-only peers (different transport), but the *protocol version*
+  over QUIC is the current one; a future TCP peer of the same version
+  interchanges identical bytes.
+- **UDP blocked networks:** common in corporate/captive networks. The
+  sender reports the handshake timeout with a hint ("QUIC needs UDP;
+  try TCP (default) if the path blocks UDP"). ffsync always keeps the
+  TCP transport; QUIC is opt-in per invocation, not a default.
+
+### 17.6 Connection teardown (the one real behavioral difference)
+
+TCP's `close()` flushes buffered data before FIN; QUIC's connection
+close is **abrupt with respect to buffered stream data**: when a peer
+closes the connection (or it is dropped), data accepted by
+`SendStream::write` but not yet ACKed by the peer MAY be discarded
+(RFC 9000 §10.2.2). Every protocol-level stream end is explicit here
+(per-conversation FIN, ERROR frames), so the frame flows themselves
+are unaffected — but a final frame that is *answered* (TREE_END
+report, COMMIT_ACK) is only safely delivered if the writer holds the
+connection until the reader's reply or close is observed. The
+implementation therefore:
+
+- keeps the session's `quinn::Connection` handle alive until after the
+  last reply is read (senders: TREE_END report; receivers: the
+  post-commit drain),
+- receivers wait (bounded) for the peer to close before exiting, so a
+  sender's final frames are ACKed rather than lost to a fast process
+  exit, and
+- treats stream FIN (`finish()` + drop, like TCP close) as the
+  per-conversation end — the receiver's Eof path needs nothing extra.
 

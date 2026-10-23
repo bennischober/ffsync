@@ -18,8 +18,10 @@ session end, `--no-delete` opt-out) and tree-mode excludes (§16.7:
 `--exclude`/`--exclude-from`, sender's patterns rule the session,
 receiver's patterns guard the delete pass), and parallel per-file
 conversations (§16.8, D13 step 1: `--parallel K` over K connections,
-measured 3.4×–6.1× at 30 ms RTT). Not implemented yet: QUIC transport
-(D13 step 2), permissions/xattrs/symlink policy (D9).
+measured 3.4×–6.1× at 30 ms RTT), and the QUIC transport (`--quic`, §17,
+D13 step 2: one QUIC connection per session, tree conversations ride
+streams, same identity/pinning). Not implemented yet:
+permissions/xattrs/symlink policy (D9).
 
 Design documents (read before making architectural changes):
 
@@ -137,16 +139,21 @@ pre-existing.
   (`ExcludeSet`/`ExcludePattern`), the `triage` pure function
   (skip/sync/transfer/create-dir/delete/kind-conflict), and the tree
   manifest type. Pure computation — no protocol frames here.
-- `src/transport.rs` — transport security (D16): rustls TLS 1.3 as a thin
-  wrapper. `Identity` (self-signed cert + PKCS#8 key, raw-DER codec in
-  `identity.bin`, created on first run), SHA-256 fingerprint codec
-  (`AA:BB:…`), `PinPolicy` (`Pinned(set)` vs `FirstUse`), and
-  `client_session`/`server_session` — each completes the TLS handshake
-  eagerly and returns the presented fingerprint; the CLI applies the TOFU
-  decision (prompt or `--trust`) *after* the handshake, before any sync
-  data. The verifier never makes trust decisions by itself. Pins live in
-  `<state-dir>/pins.conf` (one fingerprint per line, atomic rewrite).
-  `--plaintext` bypasses TLS entirely.
+- `src/transport/` — the transport layer. `mod.rs` is transport security
+  (D16): rustls TLS 1.3 as a thin wrapper. `Identity` (self-signed cert +
+  PKCS#8 key, raw-DER codec in `identity.bin`, created on first run),
+  SHA-256 fingerprint codec (`AA:BB:…`), `PinPolicy` (`Pinned(set)` vs
+  `FirstUse`), and `client_session`/`server_session` — each completes the
+  TLS handshake eagerly and returns the presented fingerprint; the CLI
+  applies the TOFU decision (prompt or `--trust`) *after* the handshake,
+  before any sync data. The verifier never makes trust decisions by
+  itself. Pins live in `<state-dir>/pins.conf` (one fingerprint per line,
+  atomic rewrite). `--plaintext` bypasses TLS entirely (TCP only).
+  `quic.rs` is the QUIC carrier (D13 step 2, §17): quinn + the same
+  identity/pins, `QuicStream` adapts quinn streams to sync
+  `Read + Write + Send` (block_on at the boundary), `QuicSession` owns the
+  connection (worker conversations = extra streams); tokio lives here and
+  nowhere else (D3 edge exception).
 - `tests/loopback.rs` — two-peer integration tests over in-memory duplex
   streams: identical/modified/fresh/fast-path/disconnect-resume plus the
   warm-start, stale-index, and orphan-cleanup scenarios.
@@ -157,6 +164,11 @@ pre-existing.
   converges, third-party cert rejected by the client, unpinned client
   rejected by the pinned receiver (error names the attacker's
   fingerprint), FirstUse handshake + sync, pins-file codec round trip.
+- `tests/quic.rs` — QUIC transport tests over real UDP loopback (§17):
+  single-file sync converges, pin-match + MITM rejected by the client,
+  unpinned client rejected by the pinned receiver, tree convergence,
+  parallel sessions over K streams (§16.8 on one connection), deletes
+  after success.
 - `tests/tree.rs` — tree-session tests over real TCP loopback: converge a
   mixed tree (nested dirs, empty files/dirs), second session skips
   everything (mtime preservation fast path), modified/new-only deltas,
@@ -178,11 +190,14 @@ pre-existing.
 - Keep submodules private and re-export the intended public API explicitly in
   each `mod.rs`.
 - Prefer native threads + `crossbeam` channels over async/tokio for the data
-  plane — there is no tokio in the tree anymore (removed in v0.1; the
-  measurement in `evaluation/chunking.md` showed async reads ~5x slower than
-  the mmap + native-thread pipeline). Keep it that way unless a transport
-  (QUIC) genuinely requires an async runtime at the edges; re-evaluate the
-  D13 decision when that comes up.
+  plane. The one registered exception (D3 amendment, 2026-10-23) is the
+  QUIC transport edge: `src/transport/quic.rs` owns a small tokio runtime
+  because quinn is an async library; everything it returns is sync
+  (`QuicStream: Read + Write + Send` via block_on at the boundary), and
+  `ffsync::protocol` MUST NOT depend on tokio — new transport code keeps
+  that split (async at the edge, sync at the seam). The async-file-I/O
+  measurement (`evaluation/chunking.md`, ~5× slower) still rules out any
+  async in the chunking/reconstruction paths.
 
 ## Gotchas (non-obvious invariants)
 
@@ -241,8 +256,21 @@ pre-existing.
 - Worker connections authenticate with the SAME pin policy as the control
   connection; the CLI's connect/accept closures handle that, and the
   state machines stay transport-agnostic (the closures are injected).
-  A QUIC transport can later substitute streams for connections without
-  touching tree_sync's logic.
+  Over QUIC (§17) the same closures open/accept extra streams on the one
+  session connection — the membership protocol is unchanged.
+- QUIC teardown is NOT TCP teardown (§17.6): closing a QUIC connection
+  discards unACKed *stream* data (RFC 9000 §10.2.2), while TCP `close()`
+  flushes. A final frame that is ANSWERED (TREE_END report, COMMIT_ACK)
+  is only safe when the writer holds the connection until the reply/close
+  is observed — the CLI's `wait_for_peer_close` guards both receive paths
+  and the tree sender. Dropping a `QuicStream` auto-finishes (FIN), which
+  is what the receiver's Eof path expects; a dropped `RecvStream` sends
+  STOP_SENDING, so never rely on reading a stream after its `QuicStream`
+  was dropped. quinn's `Endpoint::connect`/`Incoming::accept` and
+  `Endpoint::new` all require a tokio runtime context (they spawn the
+  driver) — route them through the module's `block_on`, and give
+  `client_session` its bounded handshake timeout (quinn retransmits
+  Initials forever; a dead peer must fail loudly, §17.5).
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
 - The identity file (`identity.bin`) holds the private key: `0600` on unix,
@@ -264,8 +292,9 @@ rustls TLS 1.3, mutual TOFU fingerprint pinning), directory-tree sync
 mtime preservation, deferred deletes), tree-mode excludes (§16.7), and
 parallel per-file conversations (§16.8, D13 step 1: `--parallel K` over
 K connections — measured 3.4×–6.1× on a 100-file full transfer at
-30 ms RTT; QUIC remains D13 step 2). Not yet implemented: QUIC transport
-and permissions/xattrs/symlinks as first-class metadata (D9). See
+30 ms RTT), and the QUIC transport (§17, D13 step 2: `--quic`, one
+connection per session, conversations ride streams). Not yet implemented:
+permissions/xattrs/symlinks as first-class metadata (D9). See
 `concept/Design Decisions.md` D5 (checksum-based change detection) and
 D8 (link-adaptive diff strategy) for the design questions the pipelining
 step must answer.

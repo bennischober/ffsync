@@ -26,6 +26,11 @@ zstd = "0.14.3"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = "0.14.10"
 ring = "0.17.14"
+# QUIC transport (D13 step 2, §17): quinn is async (tokio), so tokio
+# enters at the transport edges only — the sync seam lives in
+# transport::quic, the data plane stays native threads (D3).
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "ring"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
 
 [[test]]
 name = "integration"

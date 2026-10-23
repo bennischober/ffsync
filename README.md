@@ -25,7 +25,8 @@ commands.
 > apply after every transfer succeeded, opt-out with `--no-delete`.
 > Exclude patterns filter tree sessions (§16.7). Parallel per-file
 > conversations (`--parallel K`, §16.8) cut WAN sync time by the connection
-> count; QUIC transport remains future work. See [roadmap](#roadmap) below.
+> count; QUIC transport (`--quic`, §17) puts K conversations on one
+> connection with stream-level loss recovery. See [roadmap](#roadmap) below.
 
 ## Why
 
@@ -219,6 +220,22 @@ nothing. On a WAN the wall-clock saving is roughly the connection count
 (measured: 3.4× at K=4, 6.1× at K=8 on a 100-file transfer at 30 ms RTT);
 on a LAN it changes little (the metadata scan already dominates there).
 
+**QUIC transport** (`--quic`, opt-in; TCP stays the default) puts the
+whole session on one QUIC connection: in tree mode the parallel
+conversations ride QUIC streams instead of separate TCP connections, so
+K connections collapse into one TLS 1.3 handshake, a lost packet delays
+only its own stream (no TCP head-of-line blocking between conversations),
+and the connection survives a changing peer address (Wi-Fi → hotspot).
+The same identity and pins are used — a pinned peer may connect over
+either transport. QUIC has no plaintext mode; `--plaintext` + `--quic`
+is rejected. QUIC needs UDP; on UDP-blocked paths the handshake times
+out with a hint to use TCP.
+
+```powershell
+# Sender over QUIC; the receiver listens on UDP with the same port syntax.
+ffsync send ./project 192.168.1.20:7788 --quic --parallel 4
+```
+
 **Transport security is on by default** (D16): both peers generate a
 self-signed certificate on first run and authenticate each other by
 fingerprint. On first contact each side prints the peer's fingerprint and
@@ -327,7 +344,8 @@ src/
   protocol/       wire protocol: framing, messages, state machines, tree sessions
   tree.rs         tree scan, path validation, triage (D17)
   index.rs        persistent chunk index (warm starts): codec, validate, atomic write
-  transport.rs    TLS + fingerprint pinning (D16)
+  transport.rs    TLS + fingerprint pinning (D16), QUIC carrier (D13 step 2)
+                (transport/quic.rs: quinn streams as sync Read + Write)
   main.rs         the CLI
   bin/bench.rs    the benchmark harness
 concept/          design docs (positioning, decisions, protocol spec, research)
@@ -377,11 +395,14 @@ The reasoning is the product; it is all recorded:
   100-file full transfer at 30 ms simulated RTT
   (`evaluation/parallel.md`). QUIC (one connection,
   K streams + connection migration) can now slot in as a transport swap.
-- **Next - QUIC transport (D13 step 2)**: connection migration for the
-  "friend over the internet" case; the parallel-session layer is
-  transport-agnostic, so QUIC streams substitute worker connections
-  without touching the session logic. Plain TCP and TLS-over-TCP stay
-  available.
+- **Done (unreleased) - QUIC transport (D13 step 2, §17):** `--quic`
+  puts a whole session on one QUIC connection — tree conversations ride
+  QUIC streams instead of separate TCP connections (one handshake
+  instead of K), stream-level loss recovery replaces the TCP
+  head-of-line block, and connection migration covers changing peer
+  addresses. Same identity/pinning model; the state machines stay
+  sync (tokio at the transport edge only, D3). TCP/TLS-over-TCP stay
+  the default.
 - **Later - SeqCDC and other chunkers** as they mature; the `Chunker` trait
   makes swapping cheap (registered as F2).
 - **Later - permissions/xattrs/symlinks as first-class metadata** (D9).

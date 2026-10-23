@@ -141,6 +141,26 @@ network layer lands (a hidden-file convention may be preferable).
 > transport-agnostic (worker connections are injected closures), so a
 > quinn stream substitutes a connection without touching tree_sync's
 > logic. The tokio-at-the-edges question moves with it.
+>
+> **Third amendment (2026-10-23, v0.6 work):** step 2 lands — QUIC
+> (quinn) as an opt-in transport beside TCP, spec §17. The evidence
+> ladder from `evaluation/parallel.md` settled what step 1 left open:
+> parallel conversations are worth their carrier (real-TCP and real-WAN
+> cells), K=4 is the practical sweet spot, and the remaining transport
+> wins are exactly QUIC's: K handshakes collapse to one, stream-level
+> loss recovery replaces the TCP head-of-line block, connection
+> migration covers the mobile-peer case. **Tokio enters the tree at the
+> edges only** — the D3 re-evaluation this decision pre-registered:
+> quinn is async, so `transport::quic` owns a small runtime driving
+> endpoint machinery; the public seam stays synchronous (a
+> `QuicStream: Read + Write + Send` adapter, block_on at the boundary);
+> `ffsync::protocol` must not depend on tokio; the data plane (mmap,
+> native threads, crossbeam) is untouched — the async-file-I/O
+> regression of v0.1 (`evaluation/chunking.md`, ~5×) is NOT repeated.
+> QUIC has no plaintext mode (TLS 1.3 is transport-mandated), so
+> `--plaintext` stays TCP-only; the D16 TOFU pinning model maps 1:1
+> onto quinn's TLS stack (same identity, same pins set, both
+> transports). TCP remains the default; `--quic` is per-invocation.
 
 **Decision:** v0.1 runs over one plain TCP stream (plaintext, LAN or inside an
 SSH tunnel). QUIC — not raw TCP hardening — is the default v0.2 transport plan.
