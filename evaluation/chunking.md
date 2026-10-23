@@ -261,7 +261,128 @@ small-file penalty is real but is the domain where total transfer time is
 milliseconds anyway; a per-file adaptive chunk size (small files → small
 chunks) is a possible future refinement and interacts with the warm-start
 index (different CDC params per size class would need per-class index
-validation). Registered as a possible follow-up; not scheduled.
+validation). Registered as F4 — full scope and measurement plan in
+"Scope: small-file adaptive chunking (F4)" below.
+
+## Scope: small-file adaptive chunking (F4, 2026-10-23)
+
+The corpus data (above) shows the last known sync-efficiency gap: chunk
+count scales with file size, so small files have few, large chunks — and
+one localized edit lands inside a single chunk and drags it whole to the
+wire. Mobydick (1.2 MiB, 4 chunks at the shipped defaults): 64.56% delta
+for a ~1% edit; at the F1-sweep config (16k/64k/256k) it is 23.10%.
+video720.mp4 (7.3 MiB): 10.29% → 5.37%. Large files: noise (tos.webm
+2.17% → 2.05%). The F2 experiment sharpened the diagnosis: this is a
+**chunk-size effect, not a chunker effect** (MinCDC's mobydick win came
+from its smaller measured average, 103 KiB vs 311 KiB). So the fix is
+not a chunker swap (F2 closed) — it is choosing CDC parameters from the
+file size.
+
+### What the codebase already gives us (checked 2026-10-23)
+
+- **The wire negotiation exists and is unused.** HELLO carries
+  `cdc_min/cdc_avg/cdc_max` (§4), and the spec already says "the
+  sender's (min, avg, max) are authoritative; the receiver SHOULD use
+  the same values" (§4.3). But the implementation sends the shipped
+  constants on both sides (`sync.rs` HELLO construction) and hardcodes
+  the constants in every `scan_with_progress` call site — neither peer
+  ever reads the peer's values. The fields are decorative today.
+- **Per-file HELLO**: each conversation (single-file mode, and each
+  per-file conversation in tree mode) opens with a fresh HELLO, so
+  parameters can vary per file without any tree-layer change.
+- **The metadata fast path is chunk-free** (size + ns-mtime only), so
+  adaptive parameters cannot touch the skip logic.
+- **D15 index**: stores the chunk list + root + (size, mtime) but *not*
+  the CDC parameters that produced the list (68-byte header, magic
+  `FFSYIX01`, no version field).
+
+### Design shape (proposed)
+
+**Parameters are a pure function of the sender's file size.** The sender
+derives `(min, avg, max) = f(file_size)` before scanning, puts the real
+values in its HELLO (they already ride the wire), and scans with them.
+The receiver uses the peer's HELLO values everywhere it scans:
+
+1. its own manifest scan (better hash-match rate — boundary agreement),
+2. the temp-file re-scan for VERIFY (§8.2) — **mandatory** to match, or
+   the roots can never agree,
+3. the resume re-scan (D10) — same reasoning.
+
+No new frames, no flag bits, no version bump: the fields already exist;
+their meaning sharpens from decorative to authoritative. This is the
+protocol keeping a promise it already made on paper (§4.3's SHOULD).
+
+**The policy (draft, to be fixed by measurement):** size ≥ 8 MiB → the
+shipped defaults (64k/256k/1m); below → the F1-sweep config
+(16k/64k/256k). Two classes only — the corpus has no data between 7 MiB
+and 284 MiB to justify more, and each class boundary is a one-time
+re-chunk cost for files crossing it (see below). The threshold needs a
+sweep before it is fixed: synthetic sizes at 8/16/32/64 MiB through the
+corpus harness, both configs, pick the crossover where the smaller
+config's advantage disappears and its chunk-count/manifest cost starts
+to dominate.
+
+### Costs and open questions
+
+1. **The class-boundary cliff.** A file that grows or shrinks across the
+   threshold between syncs changes chunking entirely: every chunk hash
+   changes, the diff sees nothing, the file re-transfers fully once.
+   Self-healing at the next commit (the index re-writes with the new
+   layout). Bounded and one-time per crossing; acceptable, but must be
+   documented (rsync's `--whole-file` boundary behaves similarly).
+2. **D15 index must record the parameters.** The warm start serves the
+   stored chunk list; if the session's parameters differ from the ones
+   that produced the stored list, hash-match rates degrade (correct but
+   wasteful) — and worse, the sender's root and the served root can
+   diverge for identical content, so the NOT_MODIFIED-adjacent root
+   comparison must never mix layouts. Cleanest: extend the header with
+   the three parameters (12 bytes) and bump the magic to `FFSYIX02`;
+   a warm start serves only when the stored parameters equal the
+   session's (else cold scan — correct, simple, and the orphan-cleanup
+   naming convention is untouched). This is the same discipline as the
+   chunker-swap rule (boundaries are wire-protocol-relevant).
+3. **Which size drives the receiver's parameters?** The *sender's*
+   file size (from HELLO), not the receiver's own — the sender's chunk
+   layout defines the plan and VERIFY. Both peers then scan identical
+   content with identical parameters. (Deriving the function on both
+   sides from the size would also work, but sending the values is more
+   robust — no "both sides must run the same policy version" invariant.)
+4. **The fast-path/warm interaction stays intact**: the fast path
+   (metadata-only) fires before any chunking; a warm index whose
+   parameters match the session's is layout-identical to a fresh scan.
+5. **Boundary-fingerprint discipline**: after the change, files above
+   the threshold must chunk *byte-identically* to the shipped defaults
+   (existing large-file indexes stay valid); files below move to the
+   smaller config — the bench fingerprint runs must therefore be
+   per-config, not global.
+
+### Measurement plan (before implementation)
+
+1. Corpus harness at intermediate sizes: 8/16/32/64 MiB (synthetic,
+   both mutation patterns) × both configs → pick the threshold where
+   small-chunk advantage vanishes. Expect the crossover between 8 and
+   64 MiB (video720 still wins 1.9× at 7.3 MiB; tos.webm is noise at
+   545 MiB; nothing between is measured).
+2. Manifest/index-bytes accounting per config at the candidate
+   threshold (44 B/chunk on the wire and in the index): confirm the
+   small-file classes do not inflate tree-mode manifests meaningfully
+   (a 1000-file tree of ~100 KiB files at 16/64k/256k ≈ 44 B × 7
+   chunks × 1000 ≈ 300 KiB total — fine).
+3. Implement behind the existing HELLO fields + index magic bump;
+   re-run the bench fingerprint per config; full local gates; Docker
+   Linux leg.
+
+### Honest sizing of the win
+
+Small files are milliseconds on loopback; the delta improvement is
+visible only on slow links or many-file trees with per-file round trips
+already dominating. This closes the *last known delta-efficiency gap*
+(the corpus conclusion's registered follow-up) — it is a 0.8.0-scale
+polish, not a game changer: mobydick 64.6% → 23.1% wire bytes (2.8×),
+video720 10.3% → 5.4% (1.9×), large files unchanged. The implementation
+is small (thread HELLO params through the scan sites, index header
+bump, policy function); the measurement to place the threshold is most
+of the work.
 
 ### Harness note
 

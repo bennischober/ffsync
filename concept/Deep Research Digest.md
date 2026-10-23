@@ -104,4 +104,18 @@ best roadmap for when we lift it.
   rescans ever become the bottleneck.)
 - **F3 — v0.2 transport evaluation:** QUIC via quinn/iroh/ant-quic against
   the criteria in D13 (loss resilience, migration, relay fallback, BLAKE3
-  synergy, maintenance health).
+  synergy, maintenance health). (Update 2026-10-23: **F3 closed — QUIC
+  shipped** in 0.6.0, §17 of the protocol spec; quinn won on maintenance
+  health and BLAKE3 synergy. One connection per session, conversations ride
+  streams, same identity/pinning as TLS.)
+- **F4 — Small-file adaptive chunking:** choose CDC parameters from the
+  file size (small files → smaller chunks; the corpus shows mobydick
+  64.6% → 23.1% delta, video720 10.3% → 5.4%, large files noise — a
+  chunk-size effect, not a chunker effect, per F2). The wire already
+  carries per-file CDC parameters in HELLO (§4.3 makes the sender's
+  authoritative); the implementation hardcodes constants on both sides
+  and never reads the peer's values, so the change threads the existing
+  fields through the scan sites + records parameters in the D15 index
+  (magic bump). Full scope and measurement plan in
+  `evaluation/chunking.md`, "Scope: small-file adaptive chunking (F4)".
+  (Registered 2026-10-23; not scheduled.)
