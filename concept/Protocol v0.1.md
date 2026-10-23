@@ -94,7 +94,7 @@ not by tolerating unknown frames).
 
 | Type  | Name           | Dir     | Payload |
 |-------|----------------|---------|---------|
-| 0x01  | HELLO          | both    | magic `FFSY` (4B), version u16 (=3), flags u16 (§4), role u8 (1=sender, 2=receiver), cdc_min u32, cdc_avg u32, cdc_max u32, file_size u64, file_mtime u64 (unix secs, 0 if absent), file_mtime_nanos u32 (sub-second part, 0 if absent; v0.2), path (u16 len + UTF-8) |
+| 0x01  | HELLO          | both    | magic `FFSY` (4B), version u16 (=4), flags u16 (§4), role u8 (1=sender, 2=receiver), cdc_min u32, cdc_avg u32, cdc_max u32, file_size u64, file_mtime u64 (unix secs, 0 if absent), file_mtime_nanos u32 (sub-second part, 0 if absent; v0.2), path (u16 len + UTF-8) |
 | 0x02  | MANIFEST_CHUNK | recv→send | hash 32B + offset u64 + length u32 (44 B) |
 | 0x03  | MANIFEST_DONE  | recv→send | empty |
 | 0x04  | PLAN_LOCAL     | send→recv | target_offset u64 + length u32 + source_offset u64 + hash 32B (52 B) |
@@ -105,9 +105,11 @@ not by tolerating unknown frames).
 | 0x09  | COMMIT_ACK     | recv→send | empty |
 | 0x0A  | NOT_MODIFIED   | both    | empty |
 | 0x0B  | ERROR          | both    | code u16 + message (u16 len + UTF-8) |
-| 0x0C  | TREE_BEGIN     | send→recv | entry_count u64, then entry_count × tree entry (§16.2); v0.3 |
+| 0x0C  | TREE_BEGIN     | send→recv | flags u16 (§16.2), [parallel u16 when bit 3], [pattern section when bit 2], entry_count u64, then entry_count × tree entry (§16.2; per-entry `mode u32` when bit 4) |
 | 0x0D  | TREE_END       | both    | deleted_count u32 + deleted_bytes u64 (recv→send, after deletes; send→recv variant is empty); v0.3 |
 | 0x0E  | FILE_SYNC      | send→recv | empty; tree sessions only: "this file needs a conversation" (§16.4) — its absence is NOT_MODIFIED |
+| 0x0F  | TREE_WORKER    | both    | sender→recv: worker_index u16 (1..K-1); recv→sender: ACK (empty) (§16.8) |
+| 0x10  | TREE_FILE      | send→recv | rel path (u16 len + UTF-8) (§16.8) |
 
 Error codes: 1=version, 2=role conflict, 3=bad frame, 4=hash mismatch,
 5=io, 6=aborted. Any ERROR frame is terminal: the sender of ERROR closes the
@@ -143,8 +145,9 @@ connection after flushing; the peer must treat the transfer as failed.
    sub-second mtimes for the same reason). `--checksum` mode clears this
    flag and forces full verification.
 
-Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2, reserved, must be 0
-in v0.1), bit 2 `resuming` (informational, §10).
+Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2 — designed below;
+still must be 0 on the wire until §9.2 is implemented, and a peer MUST
+reject a HELLO that sets it), bit 2 `resuming` (informational, §10).
 
 ## 5. Scan and manifest exchange (cold start)
 
@@ -267,14 +270,50 @@ Receiver finishes its scan before the sender sends anything. Zero wasted
 bytes, one scan-length of latency before the first data byte. Right for slow
 links, where over-sending is fatal.
 
-### 9.2 Eager (reserved, flag bit 1)
+### 9.2 Eager (designed, not yet implemented — flag bit 1)
 
 Sender diffs against the *partial* manifest set and streams DATA for hashes
 confirmed missing so far. Bytes start moving during the scan. A late manifest
 entry may match an already-sent chunk → bounded over-send. Requires the
-receiver to buffer DATA by hash until its PLAN_REMOTE arrives (the §7
-no-buffering guarantee is a lazy-mode property). Buffer memory cap is an open
-question (§13). Do not implement in v0.1.
+receiver to buffer pre-plan DATA by hash (the §7 no-buffering guarantee is a
+lazy-mode property).
+
+**The knob is a HELLO handshake, not a configuration guess.** The sender
+sets flag bit 1 (`eager`) as an OFFER (`--eager` CLI flag, default off);
+the receiver mirrors the bit in its HELLO iff it implements eager mode.
+Eager is active iff both peers set the bit.
+
+**Compatibility (loud-failure doctrine).** A peer that receives a HELLO
+with `eager` set must reject it with ERROR(Version) while it does not
+implement §9.2 — the two peers would otherwise disagree on DATA timing,
+which is a desync hazard. An old receiver never sees early DATA (nothing
+is sent at HELLO time), so the fallback to lazy is silent and free; only
+the offer itself is rejected loudly. Once both peers implement the mode,
+the bit is active.
+
+**Over-send is bounded by position, not by hope.** The sender declares a
+chunk missing only when its manifest consumption has advanced past
+`chunk.offset + 2×cdc_avg` without seeing the chunk's hash — or the
+manifest is done. This is exactly the §6.2 boundary-shift condition;
+elsewhere a late manifest match still rescues the chunk. Eager's extra
+cost over lazy is therefore bounded by ~2×cdc_avg per chunk inside
+modified regions (same constant as the boundary-shift fallback).
+
+**Receiver buffering, bounded.** Pre-plan DATA is buffered by hash (the
+sender dedups by hash before offering; duplicate DATA hashes are ignored
+as today) under a fixed 64 MiB cap (§12 spirit). Overflow is a loud ERROR
+and a lazy retry with a clean temp — never a spill file, never a silent
+degradation. (This resolves §13 question 2.)
+
+**Ordering and resume.** Writes happen in arrival order under eager —
+D10's locals-first ordering is a lazy-mode property (§7), and resume is
+unaffected because the temp re-scan is content-addressed (§10).
+
+**Status.** Not implemented in v0.8.x. Implementation is deliberately
+deferred until the bench harness grows an eager-mode simulation cell
+measuring over-send and wall time vs lazy at 0/30 ms RTT — D8's doctrine
+is "decided on data". Until then flag bit 1 must be 0 on the wire and the
+CLI flag `--eager` stays reserved (rejected as not-yet-implemented).
 
 ## 10. Resume (D10, decided and implemented)
 
@@ -336,7 +375,9 @@ origin, D5):
 
 1. **Index staleness policy** (§14.1): exact trust rules for cross-run
    manifests; relationship to mtime granularity problems.
-2. **Eager-mode buffer cap** (§9.2): memory bound for by-hash buffering.
+2. **Eager-mode buffer cap** (§9.2): resolved by design — fixed 64 MiB cap,
+   overflow = loud ERROR + lazy retry (§9.2). Implementation of eager mode
+   itself remains open, gated on the eager-mode bench cell.
 3. **Resume write-journal** vs. temp re-scan: at what file sizes does the
    re-scan cost matter?
 4. **zstd batching:** per-chunk frames waste some compression ratio at ~1 MiB

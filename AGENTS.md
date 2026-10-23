@@ -25,9 +25,10 @@ D13 step 2: one QUIC connection per session, tree conversations ride
 streams, same identity/pinning), and POSIX mode-bit preservation on commit
 (§16.9, v4/D18 — chmod-only changes are deliberately NOT synced; mode rides
 the size+mtime fast path, is sender-authoritative, and Windows senders send
-no section). Not implemented yet: xattrs, hardlinks, and symlinks as
-first-class synced entries (rest of D9; the directory-symlink scan-safety
-part is done).
+no section). The metadata remainder is closed by decision (D9 amendment,
+2026-10-23): symlink-as-entry, hardlinks, and xattrs stay out of scope with
+recorded reasoning — see `concept/Design Decisions.md` D9 and
+`evaluation/ship-readiness.md`.
 
 Per-directory knowledge bases: `src/chunking/AGENTS.md`,
 `src/protocol/AGENTS.md`, and `src/transport/AGENTS.md` hold
@@ -69,6 +70,8 @@ Design documents (read before making architectural changes):
   the threat-model table
 - `evaluation/rsync.md` — the chunk-size sweep (F1) that picked the
   64k/256k/1m defaults, and rsync delta comparison
+- `evaluation/ship-readiness.md` — the feature-gap and readiness
+  assessment (2026-10-23): verdict, pre-ship blockers, and the order to 1.0
 
 ## Commands
 
@@ -372,8 +375,9 @@ parallel per-file conversations (§16.8, D13 step 1: `--parallel K` over
 K connections — measured 3.4×–6.1× on a 100-file full transfer at
 30 ms RTT), and the QUIC transport (§17, D13 step 2: `--quic`, one
 connection per session, conversations ride streams), and POSIX mode-bit
-preservation (§16.9, v4/D18). Not yet implemented: xattrs, hardlinks, and
-symlinks as first-class synced metadata (rest of D9). See
+preservation (§16.9, v4/D18). The D9 metadata remainder (symlink-as-entry,
+hardlinks, xattrs) is closed by decision with recorded reasoning (D9
+amendment, 2026-10-23). See
 `concept/Design Decisions.md` D5 (checksum-based change detection) and
 D8 (link-adaptive diff strategy) for the design questions the pipelining
 step must answer.

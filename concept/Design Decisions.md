@@ -240,6 +240,25 @@ On a slow link, over-sending 10% of 72 GiB is fatal → lazy. On a fat pipe,
 redundant bytes are nearly free → eager. The protocol design (open) must expose
 this as a knob, not pick one globally.
 
+**Amendment (2026-10-23): design recorded, implementation pending.** The knob
+is a HELLO handshake, not a configuration guess: the sender sets flag bit 1
+(`eager`) as an OFFER (`--eager`); the receiver mirrors the bit in its HELLO
+iff it implements eager mode. Eager is active iff both peers set the bit —
+an old receiver never sees early DATA (its manifest loop would reject a DATA
+frame loudly), so the fallback to lazy is silent and free: nothing has been
+sent at HELLO time. Over-send is bounded by a position gate, not by hope: the
+sender declares a chunk missing only when the receiver's manifest stream has
+advanced past `chunk.offset + 2×cdc_avg` without containing its hash (or the
+manifest is done) — exactly the §6.2 boundary-shift regions. The receiver
+buffers pre-plan DATA by hash (sender dedups by hash; duplicates ignored as
+today) under a fixed 64 MiB cap; overflow is a loud ERROR and a lazy retry,
+not a spill file. Writes happen in arrival order under eager (D10's
+locals-first ordering is a lazy-mode property; resume is unaffected because
+the temp re-scan is content-addressed). Full design: `Protocol v0.1.md`
+§9.2. Implementation is deliberately deferred until the bench harness grows
+an eager-mode simulation cell — D8's own doctrine: decided on data, and the
+cell will measure over-send and wall-time against lazy at 0/30 ms RTT.
+
 ## D9 — Scope discipline: what ffsync deliberately does not build
 
 **Decision:** v0.1 target is a single file pair between two peers over TCP with
@@ -253,6 +272,32 @@ zstd compression. Explicitly out of scope until the core is proven:
 **Reasoning:** `Positioning.md`; the scary surface of "building your own
 rsync" is entirely in the deferred list. The core loop (scan → diff → transfer
 → reconstruct → verify) is a few hundred lines on top of the existing pipeline.
+
+**Amendment (2026-10-23): the metadata remainder is ruled, not vague.** What
+shipped since this decision: directory recursion (D17), POSIX mode bits
+(D18), the symlink scan-safety policy (follow file links, never recurse into
+directory links/junctions, dangling = warn+skip). The remaining axes are
+explicitly closed with reasoning, in priority order:
+
+- **Symlink-as-entry (link + target on the wire): closed.** Windows symlink
+  creation needs privilege or developer mode; target validation would add a
+  traversal surface for zero value in ffsync's niche (big-file sync). The
+  current follow-or-warn policy is the shipped answer (§16.9).
+- **Hardlinks: closed.** One path would need two chunk-list identities
+  (or a shared-list alias), breaking the one-path-one-chunk-list model that
+  D15 indexes and per-file verification are built on; the use case (space
+  saving on repeated content) is out of ffsync's niche. If a synced tree
+  contains hardlinks, the two paths sync as independent files (identical
+  content hashes converge them anyway — just without link identity).
+- **Xattrs: closed.** Platform-fragmented semantics (Linux
+  user.* namespaces, macOS, none on Windows), no size+mtime-style cheap
+  change signal, and the niche's files (media, archives, VM images) carry
+  no meaningful xattrs.
+
+These are scope REAFFIRMATIONS, not "todo" items: D9's deferred list for the
+metadata axis is now empty. Remaining genuinely-open D9-adjacent work: none
+on metadata; the roadmap's open items are performance (D7 flaw 2 barrier,
+D8 eager), not scope.
 
 ## D10 — Resume state: receiver-authoritative, locals-first write order
 
