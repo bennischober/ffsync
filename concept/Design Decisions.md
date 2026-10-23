@@ -716,7 +716,7 @@ rest stays out:
 - **Wire:** TREE_BEGIN flag bit 4 `metadata`; when set, each entry gains
   `mode u32` (st_mode low bits masked `0o7777`, 0 where the platform has
   no POSIX modes — Windows maps no-write bits to the read-only attribute,
-  write-enable always wins, lossy direction documented). Protocol v3 → v5
+  write-enable always wins, lossy direction documented). Protocol v3 → v4
   (the flag-gated field changes per-entry layout; unknown flags were
   already rejected, so old peers fail loudly — the migration path the
   protocol prefers). The D15 index codec is unchanged (nothing in it

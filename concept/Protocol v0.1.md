@@ -3,7 +3,7 @@
 Specification for the ffsync wire protocol. Written for v0.1 (protocol
 version 1: **one file pair, two peers, one TCP connection**); it tracks the
 protocol across versions — changes ship with a `VERSION` bump and are
-recorded in the relevant sections. Current version: **5** (v0.2: HELLO
+recorded in the relevant sections. Current version: **4** (v0.2: HELLO
 gained `file_mtime_nanos`, see §3/§4; v0.3 adds the tree envelope, see
 §16; v0.4/v0.5 work extends TREE_BEGIN additively under flag bits —
 §16.7 excludes, §16.8 parallel sessions — without a VERSION bump, since
@@ -672,7 +672,7 @@ no async runtime enters the tree (the D13 amendment's constraint). QUIC
 `Read + Write`, so worker connections map onto streams without touching
 this layer again. That substitution is specified in §17.
 
-### 16.9 File metadata: POSIX mode bits (v5, D9 amendment)
+### 16.9 File metadata: POSIX mode bits (v4, D9 amendment)
 
 **Scope decision (D9 amendment, 2026-10-23).** Tree sync gains one metadata
 axis: the POSIX mode bits (permissions + setuid/setgid/sticky). Xattrs and
@@ -754,11 +754,12 @@ wire) remains out of scope: Windows symlink creation needs privilege or
 developer mode, and target validation would add a traversal surface for
 a feature ffsync's niche (big-file sync) does not need.
 
-**Version:** protocol v3 → **v5** (two flag-gated additive extensions
-shipped under v3/v4 without bumping — excludes and parallel — but this
-one changes per-entry layout under a flag *and* the D15 index codec, so
-it takes the bump; old/unknown flag bits were already rejected, making
-the migration path the loud-failure one the protocol prefers).
+**Version:** protocol v3 → **v4** (this flag-gated field changes the
+per-entry layout, so it takes the bump; the earlier additive extensions
+— §16.7 excludes, §16.8 parallel, §17 QUIC — shipped without one because
+they changed no existing layout. Unknown flag bits were already
+rejected, making the migration path the loud-failure one the protocol
+prefers).
 
 ## 17. QUIC transport (D13 step 2, v0.6 work)
 
