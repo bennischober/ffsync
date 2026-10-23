@@ -13,7 +13,8 @@
 
 use blake3::Hash;
 use ffsync::chunking::{
-    Blake3Hasher, Chunk, ChunkEvent, FastCDCChunker, Hasher, PipelineConfig, process_file,
+    Blake3Hasher, Chunk, ChunkEvent, FastCDCChunker, Hasher, PipelineConfig, cdc_params_for_size,
+    process_file,
 };
 use ffsync::index::FileIndex;
 use ffsync::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
@@ -25,12 +26,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
-/// FastCDC lower bound used for every scan (default).
-const CHUNK_MIN: usize = 64 * 1024;
-/// FastCDC average target used for every scan (default).
-const CHUNK_AVG: usize = 256 * 1024;
-/// FastCDC upper bound used for every scan (default).
-const CHUNK_MAX: usize = 1024 * 1024;
+// The bench's default CDC config comes from the crate's size policy
+// (`cdc_params_for_size`) — mirroring what real syncs do since D19. The
+// old local constants (64k/256k/1m) are superseded by that import.
 
 /// Fixture files are written in blocks of this size.
 const WRITE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -1031,7 +1029,9 @@ fn diverge_tree(
 fn run_tree_simulation(cfg: &BenchConfig, pipeline: &PipelineConfig) -> io::Result<()> {
     println!();
     println!("==== tree sync simulation (D17) ====");
-    let cdc = cfg.cdc.unwrap_or((CHUNK_MIN, CHUNK_AVG, CHUNK_MAX));
+    let cdc = cfg
+        .cdc
+        .unwrap_or_else(|| cdc_params_for_size(cfg.size_mib * 1024 * 1024));
     let mut rng = match cfg.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x7EE5_1EE7),
         None => StdRng::from_rng(&mut rand::rng()),
@@ -2258,7 +2258,9 @@ fn main() -> io::Result<()> {
     let (source, variants) = generate_fixtures(&cfg)?;
     let pipeline = PipelineConfig::default();
 
-    let cdc = cfg.cdc.unwrap_or((CHUNK_MIN, CHUNK_AVG, CHUNK_MAX));
+    let cdc = cfg
+        .cdc
+        .unwrap_or_else(|| cdc_params_for_size(cfg.size_mib * 1024 * 1024));
 
     if cfg.sweep {
         let mut all_results: Vec<Vec<ScenarioResult>> = Vec::new();
