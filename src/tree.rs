@@ -304,29 +304,49 @@ enum ClassItem {
 }
 
 /// One exclude pattern (§16.7 grammar): anchored vs basename, `*`/`?`/`[]`
-/// classes, `**` segments, optional dir-only trailing `/`.
+/// classes, `**` segments, optional dir-only trailing `/`, and (v0.7.1)
+/// the negation prefix `!` — a negated pattern *re-includes* the paths it
+/// matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExcludePattern {
     raw: String,
     anchored: bool,
     dir_only: bool,
+    /// `!` prefix (stripped from `raw`'s interpretation): first-match-wins
+    /// evaluation turns this pattern from an exclusion into a re-inclusion.
+    negated: bool,
     segs: Vec<PatternSeg>,
 }
 
 impl ExcludePattern {
     /// Parses and validates one pattern. A `\` anywhere is a parse error
-    /// (§16.7: no backslash escapes; wire paths are `/`-separated).
+    /// (§16.7: no backslash escapes; wire paths are `/`-separated). A
+    /// leading `!` negates (re-includes); `!!foo` is the literal `!foo`.
     pub fn new(raw: &str) -> Result<Self, String> {
         if raw.is_empty() {
             return Err("empty exclude pattern".to_string());
         }
-        if raw.contains('\\') {
+        // Negation prefix (§16.7, v0.7.1): one '!' re-includes; a leading
+        // '!!' is the literal-'!' escape (strip exactly one '!' — the
+        // remaining one is pattern text, and the pattern is NOT a
+        // negation). A deeper '!' is ordinary pattern text.
+        let (negated, rest) = if raw.starts_with("!!") {
+            (false, &raw[1..])
+        } else if let Some(r) = raw.strip_prefix('!') {
+            (true, r)
+        } else {
+            (false, raw)
+        };
+        if rest.is_empty() {
+            return Err("exclude pattern is only a negation: {raw:?}".to_string());
+        }
+        if rest.contains('\\') {
             return Err(format!(
                 "backslash in exclude pattern (no escapes, paths are /-separated): {raw:?}"
             ));
         }
-        let dir_only = raw.ends_with('/');
-        let core = raw.trim_end_matches('/');
+        let dir_only = rest.ends_with('/');
+        let core = rest.trim_end_matches('/');
         if core.is_empty() {
             return Err(format!("exclude pattern is only a slash: {raw:?}"));
         }
@@ -346,6 +366,7 @@ impl ExcludePattern {
             raw: raw.to_string(),
             anchored,
             dir_only,
+            negated,
             segs,
         })
     }
@@ -353,6 +374,11 @@ impl ExcludePattern {
     /// The pattern as given (wire form).
     pub fn raw(&self) -> &str {
         &self.raw
+    }
+
+    /// Whether this pattern re-includes (leading `!`, §16.7 v0.7.1).
+    pub fn is_negated(&self) -> bool {
+        self.negated
     }
 
     /// Does this pattern match one tree entry?
@@ -576,21 +602,44 @@ impl ExcludeSet {
         self.patterns.len()
     }
 
-    /// The raw pattern strings (wire form, §16.7).
+    /// The raw pattern strings (wire form, §16.7, order preserved —
+    /// first-match-wins evaluation (v0.7.1) is order-sensitive).
     pub fn raws(&self) -> Vec<String> {
         self.patterns.iter().map(|p| p.raw().to_string()).collect()
     }
 
-    /// Does any pattern match this entry?
-    pub fn matches(&self, rel_path: &str, kind: EntryKind) -> bool {
-        self.patterns.iter().any(|p| p.matches(rel_path, kind))
+    /// Whether any pattern in the set negates (v0.7.1): the sender sets the
+    /// TREE_BEGIN `negation` flag iff this is true, so peers that cannot
+    /// evaluate negations reject the session instead of misreading `!foo`
+    /// as a literal pattern.
+    pub fn has_negations(&self) -> bool {
+        self.patterns.iter().any(|p| p.is_negated())
     }
 
-    /// Delete-pass protection (§16.7): the path itself matches, or any of
-    /// its ancestor directories matches (an excluded directory protects its
-    /// whole subtree from deletion).
+    /// First-match-wins verdict (§16.7 v0.7.1): the first pattern that
+    /// matches decides — exclude, or (negated) re-include. No match ⇒
+    /// included. For negation-free sets this is exactly the old any-match
+    /// behavior (every pattern excludes, so the first match excludes).
+    fn excluded(&self, rel_path: &str, kind: EntryKind) -> bool {
+        for p in &self.patterns {
+            if p.matches(rel_path, kind) {
+                return !p.is_negated();
+            }
+        }
+        false
+    }
+
+    /// Is this path excluded? (the scan filter's question)
+    pub fn matches(&self, rel_path: &str, kind: EntryKind) -> bool {
+        self.excluded(rel_path, kind)
+    }
+
+    /// Delete-pass protection (§16.7): the path is protected when its own
+    /// first-match verdict is *excluded*, or when any ancestor directory's
+    /// verdict is *excluded* (an excluded directory protects its whole
+    /// subtree; a negated (re-included) ancestor protects nothing).
     pub fn matches_path_or_ancestor(&self, rel_path: &str, kind: EntryKind) -> bool {
-        if self.matches(rel_path, kind) {
+        if self.excluded(rel_path, kind) {
             return true;
         }
         let mut prefix = String::new();
@@ -599,7 +648,7 @@ impl ExcludeSet {
                 prefix.push('/');
             }
             prefix.push_str(seg);
-            if self.matches(&prefix, EntryKind::Dir) {
+            if self.excluded(&prefix, EntryKind::Dir) {
                 return true;
             }
         }
@@ -975,5 +1024,130 @@ mod tests {
         // Re-parsing the raws yields the same matching behavior.
         let set2 = ExcludeSet::from_patterns(set.raws()).unwrap();
         assert_eq!(set, set2);
+    }
+
+    #[test]
+    fn negation_reincludes_in_first_match_wins_order() {
+        // §16.7 v0.7.1: the first matching pattern decides. The negation
+        // must come BEFORE the wildcard it exempts (rsync's rule).
+        let set = ExcludeSet::from_patterns(["!keep.log", "*.log"]).unwrap();
+        assert!(set.has_negations());
+        assert!(
+            !set.matches("keep.log", EntryKind::File),
+            "the earlier negation re-includes"
+        );
+        assert!(
+            !set.matches("sub/keep.log", EntryKind::File),
+            "basename patterns match at any depth, so the negation does too"
+        );
+        assert!(set.matches("delete.log", EntryKind::File));
+
+        // Order matters: reversed, the wildcard matches first and the
+        // negation is never consulted.
+        let set = ExcludeSet::from_patterns(["*.log", "!keep.log"]).unwrap();
+        assert!(set.matches("keep.log", EntryKind::File));
+
+        // No match at all ⇒ included.
+        let set = ExcludeSet::from_patterns(["!a", "b"]).unwrap();
+        assert!(!set.matches("c", EntryKind::File));
+
+        // Negation-free sets behave exactly as before (any-match ≡
+        // first-match when every pattern excludes).
+        let set = ExcludeSet::from_patterns(["a", "b"]).unwrap();
+        assert!(!set.has_negations());
+        assert!(set.matches("a", EntryKind::File));
+        assert!(set.matches("b", EntryKind::File));
+        assert!(!set.matches("c", EntryKind::File));
+    }
+
+    #[test]
+    fn negation_literal_bang_escape() {
+        // `!!foo` is the literal `!foo` (strip one '!' — verified: not a
+        // negation). The class spelling for a literal '!' member is
+        // `[]!]` (POSIX: ']' first in the class is literal, so `[]!]` =
+        // {']', '!'}). A lone '!' is a parse error. NOTE `[!]x` is NOT
+        // valid for this: POSIX-wise the ']' after '!' is a literal member
+        // and the class never closes (unterminated '[' → literal '[').
+        let set = ExcludeSet::from_patterns(["!!weird!name"]).unwrap();
+        assert!(set.matches("!weird!name", EntryKind::File));
+        assert!(!set.matches("weird!name", EntryKind::File));
+        let set = ExcludeSet::from_patterns(["[]!]x"]).unwrap();
+        assert!(set.matches("!x", EntryKind::File));
+        assert!(set.matches("]x", EntryKind::File));
+        assert!(!set.matches("x", EntryKind::File));
+        assert!(ExcludeSet::from_patterns(["!"]).is_err());
+    }
+
+    #[test]
+    fn negation_delete_pass_semantics() {
+        // The delete guard asks "is this path or an ancestor excluded?" —
+        // a negated verdict is NOT an exclusion, so it protects nothing.
+        // keep/ excludes (first match) ⇒ protects the whole subtree; the
+        // negation under it changes nothing (the dir verdict is what the
+        // ancestor check reads).
+        let set = ExcludeSet::from_patterns(["keep", "!keep/temp"]).unwrap();
+        assert!(set.matches_path_or_ancestor("keep/temp", EntryKind::File));
+        // The negation first: keep/temp is re-included ⇒ NOT protected by
+        // its own verdict, and keep (the ancestor) is... not excluded
+        // either (it matches no pattern except via temp? no — the ancestor
+        // check evaluates "keep" itself against the set: `keep` matches
+        // nothing (no bare `keep` pattern here), so not protected.
+        let set = ExcludeSet::from_patterns(["!keep/temp", "keep/*"]).unwrap();
+        assert!(!set.matches_path_or_ancestor("keep/temp", EntryKind::File));
+        assert!(set.matches_path_or_ancestor("keep/other", EntryKind::File));
+        // A plain exclude set still protects as before. NOTE the negation
+        // is dead here (the wildcard matches first) — keep.log IS excluded;
+        // first-match-wins means this pattern order cannot re-include it.
+        let set = ExcludeSet::from_patterns(["*.log", "!keep.log"]).unwrap();
+        assert!(set.matches_path_or_ancestor("keep.log", EntryKind::File));
+        assert!(set.matches_path_or_ancestor("other.log", EntryKind::File));
+        // The live order: negation first, wildcard after — keep.log is
+        // re-included, other.log excluded.
+        let set = ExcludeSet::from_patterns(["!keep.log", "*.log"]).unwrap();
+        assert!(!set.matches_path_or_ancestor("keep.log", EntryKind::File));
+        assert!(set.matches_path_or_ancestor("other.log", EntryKind::File));
+    }
+
+    #[test]
+    fn negation_under_pruned_dir_cannot_reinclude() {
+        // The documented caveat: a pruned directory never enters the scan,
+        // so a negation under it is unreachable (the scan-sidecar filter
+        // has the same shape). Pattern order: `target/` excludes the dir;
+        // `!target/keep` never gets evaluated against anything under it —
+        // the scan never descends.
+        let dir = std::env::temp_dir().join(format!(
+            "ffsync_neg_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("target/keep")).unwrap();
+        std::fs::write(dir.join("target/keep/x.txt"), b"x").unwrap();
+        std::fs::write(dir.join("target/y.txt"), b"y").unwrap();
+
+        let ex = ExcludeSet::from_patterns(["target/", "!target/keep"]).unwrap();
+        let manifest = TreeManifest::scan_with_excludes(&dir, &ex).unwrap();
+        assert!(
+            manifest.get("target/keep/x.txt").is_none(),
+            "pruned subtree: negation cannot re-include (documented)"
+        );
+
+        // The workaround from the spec: exclude the children, not the dir —
+        // and the negation must come BEFORE the wildcard it exempts
+        // (first-match-wins; I had the order backwards in the draft test).
+        let ex = ExcludeSet::from_patterns(["!target/keep", "target/*"]).unwrap();
+        let manifest = TreeManifest::scan_with_excludes(&dir, &ex).unwrap();
+        let paths: Vec<&str> = manifest.entries().map(|e| e.rel_path.as_str()).collect();
+        assert!(
+            paths.contains(&"target/keep/x.txt"),
+            "negation-first re-includes the kept subtree: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"target/y.txt"),
+            "the sibling file stays excluded: {paths:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

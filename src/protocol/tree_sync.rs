@@ -333,7 +333,10 @@ where
     // sender always does, so a unix→Windows sync transfers exec bits (which
     // map to the read-only attribute) and Windows→unix syncs mode 0 (apply
     // nothing). The flag is sender-authoritative; the receiver mirrors it.
+    // §16.7 v0.7.1: the negation bit rides iff any pattern re-includes —
+    // peers that cannot evaluate negations reject the session loudly.
     let metadata = cfg!(unix);
+    let negation = excludes.has_negations();
     let parallel = request.parallel;
     let flags = if request.force_checksum {
         TREE_FLAG_CHECKSUM
@@ -353,6 +356,10 @@ where
         0
     } | if metadata {
         message::TREE_FLAG_METADATA
+    } else {
+        0
+    } | if negation {
+        message::TREE_FLAG_NEGATION
     } else {
         0
     };
@@ -652,7 +659,11 @@ where
     let parallel = peer_begin.parallel;
     // §16.9: mirror the sender's metadata flag — triage inputs must be
     // identical on both peers, so the mode section is all-or-nothing.
+    // §16.7 v0.7.1: mirror the negation bit — the sender's patterns govern
+    // both scans, so the evaluation model (first-match-wins) must be
+    // announced and agreed, not inferred.
     let metadata = (peer_begin.flags & message::TREE_FLAG_METADATA) != 0;
+    let negation = (peer_begin.flags & message::TREE_FLAG_NEGATION) != 0;
     let flags = if request.force_checksum {
         TREE_FLAG_CHECKSUM
     } else {
@@ -667,6 +678,10 @@ where
         0
     } | if metadata {
         message::TREE_FLAG_METADATA
+    } else {
+        0
+    } | if negation {
+        message::TREE_FLAG_NEGATION
     } else {
         0
     };

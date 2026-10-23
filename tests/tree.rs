@@ -983,3 +983,85 @@ fn scan_follows_file_symlinks() {
     assert_eq!(e.size, 128 * 1024);
     assert_eq!(e.kind, EntryKind::File);
 }
+
+#[test]
+fn tree_exclude_negation_converges() {
+    // §16.7 v0.7.1 end-to-end: sender's negation pattern set filters BOTH
+    // scans identically; the re-included file syncs, the excluded one does
+    // not exist for the session.
+    let sender = TempTree::new("neg_sender");
+    let receiver = TempTree::new("neg_receiver");
+
+    sender.write("logs/a.log", &vec![1u8; 32 * 1024]);
+    sender.write("logs/keep.log", &vec![2u8; 32 * 1024]);
+    sender.write("main.bin", &vec![3u8; 32 * 1024]);
+
+    // Negation FIRST (first-match-wins): keep.log is re-included, every
+    // other *.log excluded; main.bin unaffected.
+    let excludes = ["!keep.log", "*.log"];
+    let (s, r) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &excludes, // sender patterns (rule the session)
+        &[],       // receiver patterns (delete guard only)
+        1,
+    );
+    let s = s.expect("sender ok");
+    let r = r.expect("receiver ok");
+    assert_eq!(s.files, 2, "keep.log + main.bin sync; a.log is invisible");
+    assert_eq!(receiver.read("logs/keep.log"), sender.read("logs/keep.log"));
+    assert_eq!(receiver.read("main.bin"), sender.read("main.bin"));
+    assert!(
+        !receiver.exists("logs/a.log"),
+        "excluded file never enters the session"
+    );
+    assert_eq!(r.deleted, 0);
+
+    // Second session with a receiver-only file matching the NEGATED pattern:
+    // the sender's re-include does NOT protect it from deletion (protection
+    // comes from the receiver's OWN patterns), but a.log (excluded) never
+    // reaches the delete pass at all. keep.log exists on both sides now, so
+    // nothing is receiver-only — add one on the receiver.
+    receiver.write("logs/stray.log", b"stray");
+    let excludes2 = ["!keep.log", "*.log"];
+    let (s2, r2) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &excludes2,
+        &["*.log"], // receiver protects all its *.log paths
+        1,
+    );
+    let _s2 = s2.expect("sender2 ok");
+    let r2 = r2.expect("receiver2 ok");
+    assert_eq!(
+        r2.deleted, 0,
+        "receiver's own *.log pattern protects stray.log"
+    );
+    assert!(receiver.exists("logs/stray.log"));
+}
+
+#[test]
+fn tree_negation_free_session_interoperates() {
+    // The negation flag must NOT ride when no pattern negates (byte-identical
+    // v4 behavior — the compatibility promise of §16.7 v0.7.1).
+    let sender = TempTree::new("noneg_sender");
+    let receiver = TempTree::new("noneg_receiver");
+    sender.write("a.bin", &vec![1u8; 16 * 1024]);
+    let excludes = ["*.log"];
+    let (s, r) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &excludes,
+        &[],
+        1,
+    );
+    let s = s.expect("sender ok");
+    let _r = r.expect("receiver ok");
+    assert_eq!(s.files, 1);
+}

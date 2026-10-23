@@ -534,6 +534,13 @@ pub const TREE_FLAG_PARALLEL: u16 = 1 << 3;
 /// TREE_BEGIN flag bit 4: each tree entry carries an additional `mode u32`
 /// field (§16.9, D18 — POSIX mode bits, 0 where the platform has none).
 pub const TREE_FLAG_METADATA: u16 = 1 << 4;
+/// TREE_BEGIN flag bit 5 (v0.7.1): the pattern section contains negations
+/// (`!`-prefixed re-includes) and must be evaluated first-match-wins. No
+/// payload change — a peer that cannot evaluate negations must reject the
+/// bit (it would parse `!foo` as a literal basename pattern and desync
+/// triage). Sessions without negations never set it and interoperate with
+/// any peer.
+pub const TREE_FLAG_NEGATION: u16 = 1 << 5;
 /// Tree flags a decoder must reject as unknown (§16.8): everything beyond
 /// the bits this protocol version defines. CHECKSUM/NO_DELETE live in
 /// `crate::tree` next to the triage that consumes them.
@@ -541,7 +548,8 @@ const TREE_FLAG_KNOWN: u16 = crate::tree::TREE_FLAG_CHECKSUM
     | crate::tree::TREE_FLAG_NO_DELETE
     | TREE_FLAG_EXCLUDES
     | TREE_FLAG_PARALLEL
-    | TREE_FLAG_METADATA;
+    | TREE_FLAG_METADATA
+    | TREE_FLAG_NEGATION;
 
 impl TreeBegin {
     pub fn into_frame(self) -> io::Result<Frame> {

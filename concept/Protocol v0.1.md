@@ -600,8 +600,8 @@ old any-match behavior (the first matching pattern is an exclude, as
 they all are), so existing pattern sets and old peers' expectations are
 unchanged. A leading `!` in a literal filename is written `!!foo`
 (strip one `!`, the rest is the pattern — there are no backslash
-escapes); to exclude a file literally named `!foo` without negating,
-use a class (`[!x]foo`).
+escapes); the class spelling for a literal `!` member is `[]!]`
+(POSIX: `]` first in a class is literal).
 
 - **Ordering is the wire's job too:** patterns travel as an ordered
   list; both peers evaluate the same order. The receiver's own patterns
