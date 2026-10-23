@@ -6,6 +6,8 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-23
+
 ### Added
 
 - **QUIC transport (`--quic`; §17, D13 step 2):** an opt-in transport beside
@@ -21,6 +23,35 @@ All notable changes to ffsync are documented here. The format follows
   bounded handshake timeout naming the fallback. The sync state machines
   stay synchronous (tokio lives at the transport edge only, D3); the wire
   bytes are unchanged, so no protocol VERSION bump.
+
+### Fixed
+
+- **QUIC teardown standoff (§17.6):** the CLI's tree sender held its
+  session for the receiver's close while the receiver held it for the
+  sender's close — every QUIC session paid the full 10 s teardown bound.
+  Delivery proof is reading the final reply (stream order guarantees
+  everything before it arrived); the sender now closes right after, and
+  the receiver's bounded wait observes that close in milliseconds. Found
+  by timing whole CLI sessions in the loopback tool comparison, not by
+  the library tests (they drive the state machines directly).
+
+### Documented
+
+- **Loopback tool comparison** (`evaluation/comparison.md`): ffsync
+  (TCP/QUIC) vs rsync 3.1.3 (daemon + pipe) vs croc 11.5.5 vs sendme
+  0.37.1 on the 100-file / 423 MiB seed-42 tree, scenarios fresh / delta
+  / noop, every cell SHA-256-tree-verified. ffsync's noop cell is 30×
+  faster than rsync's full walk (the D15 warm-start index); QUIC ≈ TCP on
+  loopback; sendme pays ~124 s fixed overhead per transfer in this
+  version.
+- **Real-content chunking results** (`evaluation/chunking.md`): the CDC /
+  delta measurements repeated on real media and code (545 MiB VP9 video,
+  284 MiB gzipped source tree, H.264 clip, prose). On large real files
+  the shipped defaults match the smaller sweep config within noise with
+  4× fewer chunks; CDC boundary stability holds on video and gzip
+  streams; the small-file penalty is quantified (1.2 MiB text file: one
+  edit drags 64.56% to the wire at the defaults, 23.10% at 16k/64k/256k)
+  and registered as a possible adaptive follow-up, not scheduled.
 
 ## [0.5.0] - 2026-10-22
 
@@ -246,6 +277,8 @@ First working implementation: single-file sync between two peers over TCP.
   fixed blocks); ffsync's advantage is the parallel scan (~3.8x cold start on
   the 72.7 GiB reference file) and resumability.
 
+[0.6.0]: https://github.com/bennischober/ffsync/releases/tag/v0.6.0
+[0.5.0]: https://github.com/bennischober/ffsync/releases/tag/v0.5.0
 [0.4.0]: https://github.com/bennischober/ffsync/releases/tag/v0.4.0
 [0.3.1]: https://github.com/bennischober/ffsync/releases/tag/v0.3.1
 [0.3.0]: https://github.com/bennischober/ffsync/releases/tag/v0.3.0
