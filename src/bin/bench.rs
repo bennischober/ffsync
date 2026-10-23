@@ -205,7 +205,8 @@ Options:
   --size-mib <N>   fixture size in MiB (default: {})
   --quick          use a {} MiB fixture for a fast run
   --seed <N>       deterministic fixture seed (comparable runs across code changes)
-  --cdc <m/a/M>    FastCDC sizes, e.g. 64k/256k/1m (default 256k/1m/4m)
+  --cdc <m/a/M>    FastCDC sizes, e.g. 64k/256k/1m (default: derived from
+                   the fixture size, D19)
   --sweep          run a chunk-size sweep (6 CDC configs) and compare deltas
   --disconnect     simulate a mid-transfer disconnect and compare resume costs
   --warm           measure the warm-start index: cold scan + index write, then
@@ -213,6 +214,14 @@ Options:
   --tree           simulate a directory-tree session (D17): generate a
                    multi-file tree, run both sides' scan + triage, measure
                    per-file delta, session-level fast path, and warm starts
+  --latency        run real in-process duplex tree sessions (the send/
+                   receive state machines over in-memory links) and time
+                   them per --parallel level
+  --rtt-ms <N>     simulated round-trip time for --latency runs (default 30)
+  --parallel <K,...> comma list of connection counts for --latency,
+                   e.g. 1,4,8 (each 1..=16)
+  --gen-tree       emit the 100-file tree fixture into <out-dir>/lat_sender
+                   and exit (used by the wan-measure workflow)
   --out-dir <path> directory for fixtures and scratch output (default: {})
   --rsync          additionally compare against rsync (native, or via WSL)
   --json           print a machine-readable JSON summary as the last line
