@@ -85,7 +85,14 @@ best roadmap for when we lift it.
   chunk size on the modified scenario, then revisit D12's cost statement and
   possibly the default config.
 - **F2 — Track SeqCDC:** watch for a Rust implementation; benchmark against
-  `fastcdc` when one exists.
+  `fastcdc` when one exists. (Update 2026-10-23: the trigger has fired —
+  a young implementation exists, `seq-chunking` 0.1.0 on crates.io /
+  `puntakana/seqcdc-rs`, MIT, single release, minimal adoption; MinCDC
+  (`orlp/mincdc`) and mothcdc are further candidates. The benchmark
+  belongs in a standalone experiment crate first: chunk boundaries are
+  wire-protocol-relevant, so a chunker swap must pass the boundary
+  fingerprint + delta discipline of `evaluation/chunking.md` before it
+  can ship behind the `Chunker` trait.)
 - **F3 — v0.2 transport evaluation:** QUIC via quinn/iroh/ant-quic against
   the criteria in D13 (loss resilience, migration, relay fallback, BLAKE3
   synergy, maintenance health).
