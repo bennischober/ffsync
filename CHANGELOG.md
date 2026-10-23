@@ -4,6 +4,23 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-10-23
+
+### Added
+
+- **Exclude negation (`!pattern`, §16.7 v0.7.1):** a leading `!` turns an
+  exclude pattern into a re-include; patterns are evaluated in the order
+  given and the first match decides (rsync's model). Identical to the
+  previous any-match behavior for sets without negations, so existing
+  invocations are unchanged. `!!foo` matches a literal `!foo`; the
+  class spelling for a literal `!` member is `[]!]`. The known caveat
+  stands: a negation cannot re-include inside a pruned directory —
+  exclude the children (`dir/*`) instead of the directory (`dir/`),
+  negation first. Wire: TREE_BEGIN flag bit 5, no version bump; sessions
+  without negations are byte-identical to v4 and interoperate with any
+  peer (a peer that cannot evaluate negations rejects the session loudly
+  instead of misreading the pattern).
+
 ## [0.7.0] - 2026-10-23
 
 ### Added

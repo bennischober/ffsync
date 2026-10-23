@@ -12,7 +12,7 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.7.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
@@ -201,7 +201,12 @@ ffsync receive ./project 7788 --exclude-from ./ffsync-excludes.txt
 Grammar: `*` and `?` never cross `/`; `**` as a whole segment matches any
 depth; `[a-z]`/`[!a-z]` are character classes; a pattern containing `/`
 matches from the tree root, without it matches the basename at any depth;
-a trailing `/` restricts to directories. The sender's patterns rule the
+a trailing `/` restricts to directories. A leading `!` **re-includes**
+(negation, v0.7.1): patterns are evaluated in the order given and the
+first match decides — `!keep.log` before `*.log` syncs every log except
+`keep.log`. A negation cannot reach inside a pruned directory; exclude
+the children (`target/*`, negation first) instead of the directory
+(`target/`). The sender's patterns rule the
 session (they travel in the protocol, so both peers filter identically);
 a receiver's own patterns additionally protect matching paths - and
 everything under an excluded directory - from deletion (e.g. keep local
@@ -393,8 +398,8 @@ The reasoning is the product; it is all recorded:
 - **Done (0.4.0) - excludes/pattern matching (§16.7):** `--exclude`
   and `--exclude-from` filter tree sessions; the sender's patterns travel
   in the protocol so both peers filter identically, and a receiver's own
-  patterns protect paths from deletion. No negation syntax yet
-  (re-includes may come later).
+  patterns protect paths from deletion. Negation (`!pattern`,
+  first-match-wins) landed in 0.7.1 (§16.7 v0.7.1).
 - **Done (0.5.0) - parallel per-file conversations (§16.8, D13 step
   1):** `--parallel K` spreads a tree session's conversations over K
   connections (native threads, no async); measured 3.4×–6.1× on a

@@ -1,6 +1,6 @@
 [package]
 name = "ffsync"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 # Minimum Supported Rust Version, enforced by the msrv job in CI. Not the
 # edition floor (1.85) but what the dependency tree actually requires:
