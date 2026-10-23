@@ -197,6 +197,17 @@ The harness measures reconstruction time separately, so this decision gets
 revisited on data, not vibes. On slow links it is irrelevant; on fat pipes it
 becomes the next bottleneck after the scan is fixed.
 
+**Amendment (2026-10-23):** flaw 1 is fixed. `Reconstructor` caches a
+read-only handle on the local source (`copy_local_chunk`), and the
+single-file receive loop (`sync::receive`) caches its temp/old-file read
+handles across plan entries — no more per-chunk opens. Measured on the
+Windows bench host (NTFS, seeded fixtures): 32 MiB reconstruction
+~105 ms -> ~50 ms median, 128 MiB ~15% faster, 1 GiB ~1.79-2.12 s ->
+~1.70-1.88 s (-10-15%, ~3.4k opens removed). Flaw 2 (serialized writes,
+adjacent-chunk coalescing) stands as future work. The `--latency`
+simulation (empty receiver) is unchanged by design: its conversations
+carry no Local entries, so the fixed path is not exercised there.
+
 ## D8 — The link speed is a protocol parameter
 
 **Decision:** the diff strategy must adapt to the link, not be fixed.
