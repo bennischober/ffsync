@@ -1,43 +1,50 @@
 name: WAN measurement
 
-# One-shot experiment (manual dispatch, never on push): the RUNNER is the
-# RECEIVER behind a Cloudflare quick tunnel; the local machine is the SENDER.
-# This is the shared-bottleneck WAN path the toxiproxy experiment could not
-# simulate: K connections share one real pipe (the home UPLINK, the scarce
-# direction on typical connections).
+# One-shot experiment (manual dispatch, never on push). The RUNNER is the
+# SENDER; the local machine (home uplink = the shared bottleneck pipe) is
+# the RECEIVER. Zero-coordination design: the operator opens FOUR local
+# receivers (fresh empty tree each, one per --parallel value) behind FOUR
+# quick tunnels and passes their hostnames as inputs; this workflow then
+# sends cell-by-cell with nobody waiting on markers.
 #
-#   runner: cloudflared tunnel (tcp) -> ffsync receive 7788 --parallel K
-#   local:  cloudflared access tcp --hostname <url> --url 127.0.0.1:7789
-#           ffsync send <fixture> 127.0.0.1:7789 --parallel K
+#   runner: cloudflared access tcp --hostname <t_K> --url 127.0.0.1:970K
+#           ffsync send fixture 127.0.0.1:970K [--parallel K]  (timed)
+#   local:  cloudflared tunnel --url tcp://127.0.0.1:778K
+#           ffsync receive recv_tree_K 778K --plaintext
 #
-# Coordination: the receiver runs ALL cells in one job, printing
-# "READY k=N" before each cell; the local operator starts the matching
-# sender when the marker appears (one dispatch per K, sender-side timed).
-# The job streams its log live; nothing here waits on the sender except
-# the receive call itself. Each cell hash-verifies receiver content
-# against the fixture and records wall time server-side too (includes
-# the local sender's connect+scan; treat as upper bound).
+# Plaintext both ends by design: the tunnel is TLS-terminated end to end
+# (access client <-> Cloudflare edge <-> tunnel process), and a one-shot
+# measurement does not justify the ephemeral-identity pin dance (D16
+# explicitly allows plaintext inside tunnels). This also removes the TLS
+# handshake as a variable across cells.
 #
-# Fixture: bench --gen-tree, seed 42 (100 files, 423 MiB, 8 dirs) — the
-# same fixture as the model and toxiproxy rows in evaluation/parallel.md.
+# Timing: wall time around the send process (connect + manifest + data +
+# commit), comparable across cells because the sender-side scan is
+# identical. Receiver-side convergence is verified on the operator's
+# machine after the run (hash of each recv tree vs the seed-42 fixture).
 
 on:
   workflow_dispatch:
     inputs:
-      cells:
-        description: "comma list of --parallel values to receive, in order (e.g. 1,4,8,16)"
+      t1:
+        description: "tunnel hostname for the K=1 cell (no https://)"
         required: true
-        default: "1,4,8,16"
-      sender_fp:
-        description: "SHA-256 fingerprint of the local sender identity (pinned with --trust)"
+      t4:
+        description: "tunnel hostname for the K=4 cell (no https://)"
+        required: true
+      t8:
+        description: "tunnel hostname for the K=8 cell (no https://)"
+        required: true
+      t16:
+        description: "tunnel hostname for the K=16 cell (no https://)"
         required: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  receive:
-    name: wan receiver
+  send:
+    name: wan sender (cells 1,4,8,16)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -53,57 +60,50 @@ jobs:
           curl -L -o cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-      - name: Identity + tunnel
-        id: setup
+      - name: Send cells
         run: |
-          FP_RECV="$(./target/release/ffsync fingerprints | grep 'this peer:' | sed 's/this peer: *//')"
-          echo "receiver fingerprint: $FP_RECV"
-          echo "fp=$FP_RECV" >> "$GITHUB_OUTPUT"
-          ./cloudflared tunnel --url tcp://127.0.0.1:7788 --no-autoupdate > tunnel.log 2>&1 &
-          sleep 10
-          URL="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel.log | head -1)"
-          echo "TUNNEL URL: $URL"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          if [ -z "$URL" ]; then exit 1; fi
-      - name: Receive cells
-        run: |
-          FP_SEND="${{ inputs.sender_fp }}"   # pinned by --trust per cell
-          FP_RECV="${{ steps.setup.outputs.fp }}"
-          URL="${{ steps.setup.outputs.url }}"
-          echo "=== SENDER INSTRUCTIONS ==="
-          echo "tunnel: $URL"
-          echo "receiver fp (pin with --trust): $FP_RECV"
-          IFS=',' read -ra CELLS <<< "${{ inputs.cells }}"
           : > cells.txt
-          for K in "${CELLS[@]}"; do
-            K="$(echo "$K" | tr -d ' ')"
-            rm -rf recv_tree && mkdir recv_tree
-            ARGS=()
+          send_cell() {
+            local K="$1" HOST="$2" PORT="$3"
+            ./cloudflared access tcp --hostname "$HOST" --url "127.0.0.1:$PORT" \
+              > "access_k${K}.log" 2>&1 &
+            local APID=$!
+            # wait for the local forwarder to accept
+            local ok=""
+            for i in $(seq 1 20); do
+              if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then ok=1; exec 3<&- 3>&-; break; fi
+              sleep 1
+            done
+            if [ -z "$ok" ]; then
+              echo "CELL K=$K rc=access-dead wall=0 converged=NO" | tee -a cells.txt
+              kill $APID 2>/dev/null; return
+            fi
+            local ARGS=()
             [ "$K" -gt 1 ] && ARGS=(--parallel "$K")
-            echo "READY k=$K"          # operator starts the sender NOW
-            START=$(date +%s.%N)
-            timeout 900 ./target/release/ffsync receive recv_tree 7788 "${ARGS[@]}" \
-              --trust "$FP_SEND" > "recv_k${K}.log" 2>&1
-            RC=$?
-            END=$(date +%s.%N)
-            WALL=$(echo "$END $START" | awk '{printf "%.2f", $1-$2}')
-            HASH_R="$(find recv_tree -type f ! -name '*.ffsync-*' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
-            HASH_S="$(find fixture/lat_sender -type f ! -name '*.ffsync-*' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
-            COUNT_R="$(find recv_tree -type f ! -name '*.ffsync-*' | wc -l)"
-            if [ "$HASH_R" = "$HASH_S" ] && [ "$COUNT_R" -eq 100 ]; then CONV=yes; else CONV=NO; fi
-            echo "CELL K=$K rc=$RC wall=${WALL}s converged=$CONV files=$COUNT_R"
-            echo "K=$K rc=$RC wall=${WALL}s converged=$CONV" >> cells.txt
-            sleep 3   # let the sender's connection teardown drain
-          done
+            local START=$(date +%s.%N)
+            timeout 900 ./target/release/ffsync send fixture/lat_sender \
+              "127.0.0.1:$PORT" --plaintext "${ARGS[@]}" \
+              > "send_k${K}.log" 2>&1
+            local RC=$?
+            local END=$(date +%s.%N)
+            local WALL=$(echo "$END $START" | awk '{printf "%.2f", $1-$2}')
+            echo "CELL K=$K rc=$RC wall=${WALL}s (receiver-side verify: operator)" | tee -a cells.txt
+            kill $APID 2>/dev/null
+            sleep 5
+          }
+          send_cell 1  "${{ inputs.t1 }}"  9701
+          send_cell 4  "${{ inputs.t4 }}"  9702
+          send_cell 8  "${{ inputs.t8 }}"  9703
+          send_cell 16 "${{ inputs.t16 }}" 9704
           echo "==== CELLS ===="
           cat cells.txt
-      - name: Upload cell results + receiver logs
+      - name: Upload cell results + sender logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: wan-results
           path: |
             cells.txt
-            recv_k*.log
-            tunnel.log
+            send_k*.log
+            access_k*.log
           retention-days: 7
