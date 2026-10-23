@@ -1365,9 +1365,6 @@ fn run_one_latency_session(
 
     let send_root = sender_root.to_path_buf();
     let recv_root = receiver_root.to_path_buf();
-    let send_addrs: Vec<LatencyEnd> = Vec::new();
-
-    let _ = send_addrs;
     let mut sender_ends: Vec<LatencyEnd> = Vec::new();
     let mut receiver_ends: Vec<LatencyEnd> = Vec::new();
     for (s, r) in pairs {
