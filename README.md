@@ -17,7 +17,7 @@ commands.
 
 </div>
 
-> **Status: v0.7.0.** Single-file **and directory-tree** sync between two
+> **Status: v0.8.0.** Single-file **and directory-tree** sync between two
 > peers over TLS work end-to-end, including resume after mid-transfer
 > disconnects. Trees sync by metadata triage (D17): only changed files get
 > conversations, synced files adopt the sender's mtime, and a run with
@@ -136,7 +136,7 @@ length-prefixed, no protobuf.
 | rsync (comparison only) | Baseline | The tool this project is measured against, and its delta algorithm is respected, not wrapped |
 
 Design decisions and their alternatives are recorded in
-[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1-D17).
+[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1-D19).
 
 ## Using it
 
@@ -370,7 +370,7 @@ The reasoning is the product; it is all recorded:
 - [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D17 with
   alternatives and rejected options
 - [`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md) — the wire protocol
-  (tracks all versions; currently v3), frame by frame
+  (tracks all versions; currently v4), frame by frame
 - [`concept/Deep Research Digest.md`](concept/Deep%20Research%20Digest.md) —
   what the two deep-research runs got right, and what was rejected
 - [`evaluation/chunking.md`](evaluation/chunking.md),

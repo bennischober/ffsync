@@ -1,0 +1,4 @@
+# Normalize all text files to LF in the repo and on checkout.
+# The repo is edited from both Windows and WSL; mixed line endings were
+# producing whitespace-only churn in git status.
+* text=auto eol=lf

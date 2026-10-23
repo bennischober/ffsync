@@ -79,6 +79,11 @@ where
     H: Hasher + 'static,
 {
     let file = File::open(path)?;
+    // SAFETY: the file is opened read-only and no writer touches it for
+    // the lifetime of the mapping — the pipeline holds the only reference,
+    // hash workers just slice it, and (receiving) commits go through a
+    // separate temp file. Modifying or truncating a mapped file is UB;
+    // this invariant is documented in the root AGENTS.md gotchas.
     let mmap = unsafe { Mmap::map(&file)? };
     let mmap = Arc::new(mmap);
 
