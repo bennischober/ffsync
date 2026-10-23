@@ -574,10 +574,12 @@ is a parse error):
 - A trailing `/` restricts the pattern to **directories** (`build/`).
 
 **Scanning rule (both peers):** an excluded directory is pruned — its
-whole subtree never enters the manifest (contents cannot re-include; there
-is no negation syntax). An excluded file is skipped. The scan-sidecar
-filter (`*.ffsync-index` / `*.ffsync-tmp`, §16.2) takes precedence and is
-not user-visible.
+whole subtree never enters the manifest (a negation under a pruned
+directory cannot re-include anything — see the grammar note below; to
+re-include inside an excluded directory, exclude its children
+(`target/*`) instead of the directory itself (`target/`)). An excluded
+file is skipped. The scan-sidecar filter (`*.ffsync-index` /
+`*.ffsync-tmp`, §16.2) takes precedence and is not user-visible.
 
 **Delete-pass protection (receiver).** A path is skipped by the delete
 pass when the path itself matches one of the receiver's patterns, or when
@@ -585,6 +587,40 @@ any of its ancestor directories matches one (an excluded directory
 protects its whole subtree from deletion). Conflict resolution (§16.3) is
 not gated on excludes — the sender's kind change is explicit and
 authoritative.
+
+**Negation (v0.7.1, first-match-wins).** A pattern whose first character
+is `!` is a **re-include**: it removes paths from the exclusion set
+rather than adding them. This upgrades the evaluation model from
+any-match to rsync's **ordered first-match-wins**: patterns are checked
+in the order given (CLI flag order; `--exclude-from` lines in file
+order, at the position of the flag), and the first pattern that matches
+a path decides — exclude, or (negation) include. A path matching no
+pattern is included. For a set without negations this is exactly the
+old any-match behavior (the first matching pattern is an exclude, as
+they all are), so existing pattern sets and old peers' expectations are
+unchanged. A leading `!` in a literal filename is written `!!foo`
+(strip one `!`, the rest is the pattern — there are no backslash
+escapes); to exclude a file literally named `!foo` without negating,
+use a class (`[!x]foo`).
+
+- **Ordering is the wire's job too:** patterns travel as an ordered
+  list; both peers evaluate the same order. The receiver's own patterns
+  (delete-pass guard) follow the same rule locally.
+- **Delete-pass protection** inherits the semantics through the verdict:
+  an ancestor directory protects its subtree from deletion iff its
+  first-match verdict is *exclude* — a negated ancestor is not an
+  exclusion and therefore protects nothing.
+- **Wire form:** TREE_BEGIN gains flag bit 5 `negation`, set by the
+  sender iff any of its patterns starts with `!`. No payload change (the
+  pattern section layout is unchanged; only the interpretation of the
+  strings is flag-gated). No VERSION bump: no existing layout changes
+  and the default (no negations, no bit) is byte-identical to before.
+  The bit's purpose is compatibility: a v3/v4 peer that receives a
+  negation-carrying session rejects the unknown flag bit loudly
+  (Malformed) instead of parsing `!foo` as a literal basename pattern —
+  the two peers would filter differently and desync the conversation
+  sequence, so the loud failure is the correct one. A session without
+  negations interoperates with any peer.
 
 ### 16.8 Parallel per-file conversations (v4 flag, D13 step 1)
 
