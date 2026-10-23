@@ -2,26 +2,37 @@
 
 Guidance for AI coding agents (and humans) working in this repository.
 
+**Generated:** 2026-10-23 · **Commit:** 953666a · **Branch:** main
+
 ## What this project is
 
 `ffsync` is a file synchronization tool written in Rust that syncs data at the
 chunk level to minimize transfer and I/O, similar in spirit to rsync. As of
-v0.3, single-file sync **and directory-tree sync** between two peers over TCP
-work end-to-end: parallel chunking/hashing pipeline, file
+v0.8.0, single-file sync **and directory-tree sync** between two peers over
+TCP or QUIC work end-to-end: parallel chunking/hashing pipeline, file
 reconstruction, manifest/plan exchange, zstd-compressed transfer,
 chunk-root verification, mtime/size fast path (sub-second mtimes),
 resume after mid-transfer disconnects, the persistent chunk index for warm
-starts (D15), TLS transport with mutual TOFU fingerprint pinning (D16), and
+starts (D15), TLS transport with mutual TOFU fingerprint pinning (D16),
 tree sync (D17: protocol v3 — TREE_BEGIN/TREE_END envelope, sequential
 per-file conversations, mtime preservation on commit, deletes deferred to
-session end, `--no-delete` opt-out) and tree-mode excludes (§16.7:
+session end, `--no-delete` opt-out), tree-mode excludes (§16.7:
 `--exclude`/`--exclude-from`, sender's patterns rule the session,
-receiver's patterns guard the delete pass), and parallel per-file
+receiver's patterns guard the delete pass), parallel per-file
 conversations (§16.8, D13 step 1: `--parallel K` over K connections,
-measured 3.4×–6.1× at 30 ms RTT), and the QUIC transport (`--quic`, §17,
+measured 3.4×–6.1× at 30 ms RTT), the QUIC transport (`--quic`, §17,
 D13 step 2: one QUIC connection per session, tree conversations ride
-streams, same identity/pinning). Not implemented yet:
-permissions/xattrs/symlink policy (D9).
+streams, same identity/pinning), and POSIX mode-bit preservation on commit
+(§16.9, v4/D18 — chmod-only changes are deliberately NOT synced; mode rides
+the size+mtime fast path, is sender-authoritative, and Windows senders send
+no section). Not implemented yet: xattrs, hardlinks, and symlinks as
+first-class synced entries (rest of D9; the directory-symlink scan-safety
+part is done).
+
+Per-directory knowledge bases: `src/chunking/AGENTS.md`,
+`src/protocol/AGENTS.md`, and `src/transport/AGENTS.md` hold
+subtree-specific conventions and invariants — consult them when working in
+those directories.
 
 Design documents (read before making architectural changes):
 
@@ -31,21 +42,33 @@ Design documents (read before making architectural changes):
 - `concept/Design Decisions.md` — recorded decisions with reasoning and
   alternatives; add new decisions there, do not silently change old ones
 - `concept/Protocol v0.1.md` — the wire protocol (named for its first
-  release; it tracks the protocol across versions — currently v2: HELLO
-  gained `file_mtime_nanos`): framing, handshake, manifest/plan/data flow,
-  verification, resume. The implementation follows it; deviations are
-  protocol bugs unless the spec is amended first
+  release; it tracks the protocol across versions — currently v4: v3 added
+  tree sync §16, v4 added the metadata/mode section §16.9): framing,
+  handshake, manifest/plan/data flow, verification, resume, tree sync,
+  QUIC. The implementation follows it; deviations are protocol bugs unless
+  the spec is amended first
 - `concept/Deep Research Digest.md` — what the two deep-research runs
   (architecture + P2P connectivity, saved alongside as markdown) got right,
-  and what we rejected
+  and what we rejected; its follow-ups F1–F4 are all closed
 - `concept/File Synchronisation Workflow.md` — the four-phase sync pipeline
   (shallow → medium → deep diff, then pipelined transfer and reconstruction)
 - `concept/File Reconstruction.md` — out-of-place reconstruction with a
   pre-allocated temp file and atomic rename
+- `concept/P2P Connection Challenge Resolution.md` — raw NAT-traversal
+  research (STUN/TURN/ICE); the basis for keeping P2P out of scope (D9)
+- `concept/Designing a High-Performance, Resilient File Synchronization
+  Protocol in Rust_ ….md` — raw architecture research (QUIC, BLAKE3, CDC,
+  zstd) that fed the design docs
 - `evaluation/chunking.md` — measured performance of chunking approaches and
   the reasoning behind the current pipeline design
 - `evaluation/memory.md` — measured memory footprint of the sync paths
   (heap is O(chunks) ≈ 0.05% of file size; trees stay flat with file count)
+- `evaluation/parallel.md` — `--parallel K` scaling (model + real-TCP +
+  real-WAN)
+- `evaluation/comparison.md` — loopback comparison vs rsync/croc/sendme plus
+  the threat-model table
+- `evaluation/rsync.md` — the chunk-size sweep (F1) that picked the
+  64k/256k/1m defaults, and rsync delta comparison
 
 ## Commands
 
@@ -53,21 +76,29 @@ Design documents (read before making architectural changes):
 | --- | --- |
 | `cargo build` | Build the binary |
 | `cargo check --tests` | Fast compile check including tests |
-| `cargo test` | Run unit and integration tests (`tests/integration.rs`) |
+| `cargo test` | Run unit and integration tests (six test files: `integration`, `loopback`, `tree`, `tls`, `quic`, `soak`) |
 | `cargo run` | Run the CLI (`ffsync send/receive`, see `--help`) |
-| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--rsync`, `--disconnect`, `--warm`, `--tree`, `--latency` (+ `--rtt-ms`, `--parallel K,...`), `--json`) |
+| `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--cdc m/a/M`, `--sweep`, `--rsync`, `--disconnect`, `--warm`, `--tree`, `--latency` (+ `--rtt-ms`, `--parallel K,...`), `--gen-tree`, `--out-dir P`, `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
 | `cargo clippy` | Lint (no `clippy.toml`) |
 | `cargo audit` | Check `Cargo.lock` against RustSec advisories (see D14 in `concept/Design Decisions.md`) |
+| `cargo test --test soak -- --ignored` | Run the leak-guard soak test (100 sessions under a counting allocator; excluded from normal runs and CI) |
 
 CI (`.github/workflows/`) runs on push to `main` and on PRs, on
 Windows **and** Linux: `cargo fmt --check`, `cargo clippy --all-targets
--- -D warnings`, `cargo test`, `cargo audit` — keep all four green
-locally before pushing. A weekly scheduled workflow re-runs `cargo audit`
-so advisories published between pushes are caught (D14).
+-- -D warnings`, `cargo test`, plus an MSRV job (`cargo check
+--all-targets` on Rust 1.88) and `cargo audit` — keep them green locally
+before pushing. A weekly scheduled workflow re-runs `cargo audit` so
+advisories published between pushes are caught (D14). `release.yml` (tag
+pushes) verifies the tag against `Cargo.toml`, runs the same gates, then
+`cargo publish --locked` and builds 4-platform artifacts;
+`wan-measure.yml` is a manual-dispatch WAN benchmark workflow (it uses
+`bench --gen-tree`).
 
-Toolchain: current stable Rust (1.99.x as of 2026-10), edition 2024. The crate
-is a lib + two bins (`ffsync`, `bench`); tests import via `ffsync::chunking` /
+Toolchain: current stable Rust (1.99.x as of 2026-10), edition 2024,
+`rust-version = 1.88` (dependency-driven: rcgen 0.14 / time 0.3 need 1.88;
+CI enforces it as a separate msrv job). The crate is a lib + two bins
+(`ffsync`, `bench`); tests import via `ffsync::chunking` /
 `ffsync::reconstruction`. Run `cargo audit` whenever dependencies change; on
 fastcdc upgrades additionally fingerprint chunk boundaries before/after with
 `cargo run --release --bin bench -- --quick --seed 42` (identical chunk counts
@@ -84,19 +115,23 @@ pre-existing.
 ## Architecture
 
 - `src/lib.rs` — lib target; exposes `chunking`, `index`, `protocol`,
-  `reconstruction`, and `transport` (tests and the bench binary import
-  through it).
+  `reconstruction`, `transport`, and `tree` (tests and the bench binary
+  import through it).
 - `src/main.rs` — the `ffsync` CLI (`send`/`receive`/`trust`/`untrust`/
-  `fingerprints`): argument parsing, progress display, TCP setup, TLS
-  wiring, and error reporting. Thin by design; the sync logic lives in
-  `protocol::sync`.
+  `fingerprints`): argument parsing, progress display, TCP/TLS/QUIC setup,
+  the TOFU decision (prompt or `--trust`), and error reporting (~1300
+  lines — tree glue lives here too, but the sync logic itself stays in
+  `protocol::sync` / `protocol::tree_sync`).
 - `src/bin/bench.rs` — the benchmark harness: generates fixture variants
   (identical / modified / appended / fresh), scans both sides through the real
   pipeline, simulates the delta against a hash set, reconstructs the target
   through the real `Reconstructor` with hash verification, and projects
   transfer times across link speeds and zstd ratios. Optional `--rsync`
   comparison (native or via WSL), `--disconnect` resume simulation, `--warm`
-  warm-start index measurement. Zero dependencies beyond the crate's own.
+  warm-start index measurement, `--tree`/`--latency` tree-session runs,
+  `--gen-tree` fixture emission (used by `wan-measure.yml`), `--cdc m/a/M`
+  + `--sweep` CDC experiments, `--out-dir` fixture location. Zero
+  dependencies beyond the crate's own.
 - `src/chunking/` — the core data pipeline. The public API is re-exported from
   `mod.rs`.
   - `pipeline.rs` — `process_file()` is the entry point: it memory-maps the
@@ -132,7 +167,9 @@ pre-existing.
   deletions; plus the v4 parallel sessions of §16.8 — `--parallel K`
   spreads conversations over K connections, one native thread per
   connection, membership-validated via TREE_FILE). State machines are
-  generic over `S: Read + Write` — transport-agnostic by design.
+  generic over `S: Read + Write` — transport-agnostic by design. `mod.rs`
+  carries `MAGIC` and `VERSION` (currently 4: v3 tree sync, v4
+  metadata/mode section).
 - `src/tree.rs` — the tree layer (D17): metadata-only directory scan
   (sorted, ffsync sidecar files excluded, optional exclude patterns with
   subtree pruning — §16.7), relative-path validation (no traversal, wire
@@ -199,6 +236,17 @@ pre-existing.
   that split (async at the edge, sync at the seam). The async-file-I/O
   measurement (`evaluation/chunking.md`, ~5× slower) still rules out any
   async in the chunking/reconstruction paths.
+- No rustfmt.toml / clippy.toml / toolchain pin files exist: default
+  rustfmt and clippy behavior is authoritative, and lint enforcement
+  happens via CI (`cargo clippy --all-targets -- -D warnings`; no
+  crate-level `#![deny]`/`#![forbid]`).
+- The crate's only `unsafe` block is the mmap at
+  `src/chunking/pipeline.rs:82` — keep it that way, and add the missing
+  `SAFETY:` comment when you touch it.
+- `src/lib.rs`'s crate-level doc comment is stale (calls main.rs a
+  benchmark harness) — fix on touch.
+- `.opencode/` holds tracked agent tooling (a git-commit-message skill);
+  credentials under it are untracked and must stay that way.
 
 ## Gotchas (non-obvious invariants)
 
@@ -323,8 +371,9 @@ mtime preservation, deferred deletes), tree-mode excludes (§16.7), and
 parallel per-file conversations (§16.8, D13 step 1: `--parallel K` over
 K connections — measured 3.4×–6.1× on a 100-file full transfer at
 30 ms RTT), and the QUIC transport (§17, D13 step 2: `--quic`, one
-connection per session, conversations ride streams). Not yet implemented:
-permissions/xattrs/symlinks as first-class metadata (D9). See
+connection per session, conversations ride streams), and POSIX mode-bit
+preservation (§16.9, v4/D18). Not yet implemented: xattrs, hardlinks, and
+symlinks as first-class synced metadata (rest of D9). See
 `concept/Design Decisions.md` D5 (checksum-based change detection) and
 D8 (link-adaptive diff strategy) for the design questions the pipelining
 step must answer.
