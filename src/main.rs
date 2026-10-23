@@ -687,13 +687,14 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
         }
     };
     report_tree_outcome("send", &outcome, display);
-    // §17.6 (QUIC): the receiver replies to our TREE_END (the delete
-    // report) and then waits for OUR close. Hold the connection until the
-    // receiver's close arrives so the report is ACKed, not discarded —
-    // QUIC close discards unACKed stream data, TCP close flushes.
-    if let Some(session) = quic_wait {
-        session.wait_for_peer_close(Duration::from_secs(10));
-    }
+    // §17.6 (QUIC): delivery of our final frames is proven by *reading the
+    // receiver's TREE_END report* — done inside tree_send, stream order
+    // guarantees everything sent before it was received. The session handle
+    // drops here, closing the connection; that close is what the receiver's
+    // bounded wait observes. Do NOT wait for the peer's close on the sender
+    // side: both ends holding for each other burns the full teardown bound
+    // on every QUIC session (a symmetric standoff, not delivery proof).
+    drop(quic_wait);
     Ok(())
 }
 
@@ -830,7 +831,9 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
     report_tree_outcome("receive", &outcome, display);
     // §17.6: the sender's last frames (TREE_END report path) are only
     // provably delivered when the sender closes; hold the connection
-    // briefly so its close lands.
+    // briefly so its close lands. (The sender closes right after reading
+    // our TREE_END report — this wait observes that close, usually in
+    // milliseconds.)
     if let Some(session) = session {
         session.wait_for_peer_close(Duration::from_secs(10));
     }
