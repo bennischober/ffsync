@@ -93,6 +93,15 @@ best roadmap for when we lift it.
   wire-protocol-relevant, so a chunker swap must pass the boundary
   fingerprint + delta discipline of `evaluation/chunking.md` before it
   can ship behind the `Chunker` trait.)
+  (Update 2026-10-23, same day: **F2 closed — no integration.** The
+  experiment ran (`evaluation/chunking.md`, "Alternative chunkers on our
+  scenarios"): MinCDC is 3.6× faster than FastCDC at equal delta quality
+  but scan time is disk-bound cold and a few percent of sync wall time;
+  SeqCDC fails the sync metric outright (relative cut rule re-anchors
+  boundaries after in-place edits — 2.7–6× worse delta on media); MothCDC
+  is MinCDC byte-identical on our data (caterpillar inert without
+  repeated regions). MinCDC stays the tracked candidate only if warm/fast
+  rescans ever become the bottleneck.)
 - **F3 — v0.2 transport evaluation:** QUIC via quinn/iroh/ant-quic against
   the criteria in D13 (loss resilience, migration, relay fallback, BLAKE3
   synergy, maintenance health).

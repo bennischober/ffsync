@@ -270,3 +270,123 @@ all bench_tmp fixtures): a throwaway cargo project depending on the crate
 by path, so it stays in sync with the production pipeline automatically.
 The corpus files are in `bench_tmp/corpus/` with their provenance in the
 table above; re-download them to reproduce.
+
+## Alternative chunkers on our scenarios (F2, 2026-10-23)
+
+The vendor benchmarks for SeqCDC / MinCDC / MothCDC measure **corpus dedup
+savings at ~8 KiB chunks on VM images, source archives, and Wikipedia
+text** — not ffsync's workload (pairwise delta between two versions of one
+file at ~256 KiB chunks, on media). This section re-benchmarks them on our
+corpus with our metrics, at matched average chunk size. The mutation
+patterns, corpus, and delta definition are identical to the section above
+(two ~1% middle regions at 45%/55%; ~10% tail; delta = target chunk bytes
+whose hash the source lacks).
+
+Configs (measured average chunk size in parentheses; the vendor chunkers
+have no avg parameter — MinCDC's distribution is uniform in [min, max]):
+
+- `fastcdc 64/256k/1m (shipped)` — the baseline (313 KiB)
+- `fastcdc 16/64k/256k` — the sweep's best point (77 KiB)
+- `fastcdc 192/256/320k (narrow ctrl)` — control separating "narrow range"
+  from "uniform distribution" as the cause of any delta movement (296 KiB)
+- `mincdc 64/448k (uniform)` — uniform, matched to shipped avg (278 KiB)
+- `mincdc 192/320k (narrow)` — vendor-recommended narrow shape (256 KiB)
+- `mothcdc 64/448k` — MinCDC + caterpillar coalescing (278 KiB)
+- `seqcdc thr=5 224/448k` — SeqCDC's best shot at our scale (226 KiB)
+- `seqcdc thr=32 64/448k` — shipped-threshold sensitivity probe (447 KiB)
+
+Chunking throughput (MiB/s, single thread, in memory, boundary generation
+only — hashing untimed, matching the vendor benches' methodology):
+
+| file | fcdc shipped | fcdc narrow | mincdc wide | mincdc narrow | mothcdc | seqcdc t5 | seqcdc t32 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rust-src.tar.gz | 2793 | 6329 | 9754 | 24078 | 9797 | (142086)* | 2720 |
+| tos.webm | 2826 | 6291 | 10146 | 24418 | 10036 | (158014)* | 2723 |
+| video720.mp4 | 3019 | 6367 | 9717 | 19679 | 11639 | (166799)* | 2833 |
+
+\* Not a real scan speed. SeqCDC's cut rule is `restart + min + first
+rising byte-run of threshold length` with no content anchoring — on
+high-entropy data a rising run appears almost immediately after `min`, so
+the boundary lands at `min + ~2 KB` jitter (measured avg 226 KiB) and the
+scanner only *examines* ~1% of the bytes. That is near-fixed-size chunking
+at min, and the delta numbers below prove it is not achieving FastCDC-like
+locality. At thr=32 the rising run essentially never occurs and cuts land
+at max (447 KiB = fixed-size chunking), giving honest FastCDC-comparable
+throughput (2720 MiB/s).
+
+Delta % (what the wire would carry; lower is better):
+
+| file | fcdc shipped | fcdc narrow | mincdc wide | mincdc narrow | mothcdc | seqcdc t5 | seqcdc t32 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rust-src mod | 2.27 | 3.11 | 2.39 | 2.91 | 2.39 | 13.99 | 2.47 |
+| tos.webm mod | 2.17 | 3.00 | 2.14 | 2.41 | 2.14 | 5.93 | 2.17 |
+| video720 mod | 10.29 | 52.16 | 12.94 | 15.08 | 12.94 | 48.92 | 12.06 |
+| mobydick mod | 64.56 | 51.35 | 18.43 | 31.14 | 18.43 | 36.72 | 35.94 |
+| appends (all) | 9.10 | 9.11 | 9.14 | 9.13 | 9.14 | 9.10 | 9.12 |
+
+Chunk counts (tos.webm, 545 MiB): fastcdc 1781, mincdc wide 2001, mincdc
+narrow 2177, mothcdc 2001, seqcdc t5 2460, seqcdc t32 1246.
+
+Appends: on large files every algorithm and config costs exactly the
+appended bytes (~9.1%) — the universal CDC property on tail growth,
+confirmed across all eight configs. On the 1.2 MiB file the appended-chunk
+boundary shift dominates (FastCDC 14.67%, MinCDC 36.93%) — again the
+small-file chunk-size effect from finding 4, not a chunker-quality
+difference.
+
+### Findings
+
+1. **MinCDC is the only real finding**: 3.6× FastCDC's throughput
+   (9.7–10.1 GiB/s vs 2.8) at **equal delta quality** on large media (2.14%
+   vs 2.17% on tos.webm, within noise of each other and of the shipped
+   default). Its uniform distribution does not measurably change edit
+   locality; the narrow-range control shows the narrow configs' delta
+   regressions come from the range, not the distribution.
+2. **MothCDC is byte-identical to MinCDC on our data** — records == chunks
+   on every real file (caterpillar fires only on the synthetic zero file:
+   1024 chunks → 1 record). Its extra speed claim (~15.7 GiB/s on zeros)
+   applies to a data shape ffsync does not target; on our data it is MinCDC
+   with no advantage. Correct per its own docs ("no-op on data with no
+   runs").
+3. **SeqCDC fails the sync metric** on high-entropy content: 2.7–6× worse
+   delta on the movie (5.93% vs 2.17%) and the archive (13.99% vs 2.27%),
+   and the video720 mod case (48.92% vs 10.29%) shows the predicted
+   cascade: its cut decision is relative to the chunk *start*, so an
+   in-place edit re-anchors every subsequent boundary. Its throughput
+   number is an artifact of not reading most of the data (see table note).
+4. **Small files**: MinCDC's uniform distribution *halves* mobydick's delta
+   (18.43% vs 64.56%) — but this is the same small-file effect already
+   documented above (few chunks = one boundary shift dominates); mincdc's
+   smaller average (103 KiB measured, vs FastCDC's 311 KiB skew at this
+   file size) is the cause, and the `fastcdc 16/64k/256k` config got the
+   same improvement (23.10%) with a proportionally smaller chunk size. Not
+   a chunker win — a chunk-size win, already registered as a possible
+   adaptive-chunking follow-up.
+5. **Chunk counts** at matched average are comparable (mincdc 2001 vs
+   fastcdc 1781 on tos.webm; the vendor tables' "FastCDC makes fewer
+   records" reflected their 8 KiB targets, not our scale).
+
+### Verdict (F2 closed)
+
+No integration. The throughput argument evaporates end-to-end: our scan is
+disk-bound cold (100% drive utilization measured above) and the scan is a
+few percent of sync wall time (comparison.md cells); MinCDC's 3.6× would
+save ~0.1 s on the measured loopback cells. The delta argument goes the
+wrong way for SeqCDC and is a wash for MinCDC. MinCDC remains the tracked
+candidate **if** a fast-NVMe/warm-rescan scenario ever becomes the
+bottleneck (its correctness story is solid: SIMD argmin with a scalar
+oracle, property-tested against streaming equivalence) — but the swap
+would still need the boundary-fingerprint + D15 index-version discipline
+from the top of this document. SeqCDC and MothCDC are ruled out on our
+metrics.
+
+### Harness note (cdc_exp)
+
+The experiment harness lives in `bench_tmp/cdc_exp/` (gitignored): a
+throwaway cargo project depending on `ffsync` by path plus
+`mothcdc 0.7.2` / `seq_chunking 0.1.0`. It reuses corpus_bench's mutation
+patterns and delta definition; reconstruction is exercised via the real
+`Reconstructor` on files < 32 MiB (disk path is chunker-independent). The
+vendor chunkers have no avg parameter; configs are matched on the
+*measured* average chunk size, reported per config above. Run:
+`cargo run --release` inside `bench_tmp/cdc_exp`.
