@@ -635,7 +635,9 @@ fn simulate_disconnect(
                         length: chunk.length,
                     },
                 };
-                reconstructor.copy_local_chunk(&task, &mut local_scratch)?;
+                // The bytes were just read and verified above; write them
+                // directly (copy_local_chunk would re-read them).
+                reconstructor.write_chunk(&task, &local_scratch[..chunk.length])?;
             }
         }
     }

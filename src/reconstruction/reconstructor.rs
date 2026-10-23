@@ -19,6 +19,12 @@ pub struct ReconstructionTask {
 pub struct Reconstructor {
     temp_file: File,
     local_source_path: PathBuf,
+    /// Lazily opened read handle on `local_source_path` (D7): copying many
+    /// local chunks must not re-open the file per chunk (tens of thousands
+    /// of opens on large files). `RefCell` keeps the public methods
+    /// `&self`-compatible; a Reconstructor is used from one thread per
+    /// session, so `Sync` is not required.
+    source_file: std::cell::RefCell<Option<File>>,
 }
 
 impl Reconstructor {
@@ -41,6 +47,7 @@ impl Reconstructor {
         Ok(Self {
             temp_file: file,
             local_source_path: local_source_path.to_path_buf(),
+            source_file: std::cell::RefCell::new(None),
         })
     }
 
@@ -61,6 +68,7 @@ impl Reconstructor {
         Ok(Self {
             temp_file: file,
             local_source_path: local_source_path.to_path_buf(),
+            source_file: std::cell::RefCell::new(None),
         })
     }
 
@@ -83,25 +91,30 @@ impl Reconstructor {
     /// Process a single chunk by copying it from the local source file.
     ///
     /// The bytes are read through `scratch_buffer` (resized as needed) so
-    /// repeated calls do not reallocate. Bench and integration tests use
-    /// this to simulate the locals-first write order without a peer; the
-    /// protocol itself resolves local chunks itself because it must verify
-    /// each chunk's hash before writing (D12).
+    /// repeated calls do not reallocate. The source file handle is opened
+    /// once and cached (D7) — it is read-only, so the cached handle never
+    /// conflicts with the temp file's write handle on either platform.
+    /// Bench and integration tests use this to simulate the locals-first
+    /// write order without a peer; the protocol itself resolves local
+    /// chunks itself because it must verify each chunk's hash before
+    /// writing (D12).
     pub fn copy_local_chunk(
         &self,
         task: &ReconstructionTask,
         scratch_buffer: &mut Vec<u8>,
     ) -> io::Result<()> {
-        // Open a fresh handle per chunk. For millions of chunks we might
-        // want to keep a thread-local handle open; for now, open it here to
-        // keep the struct `Send`-agnostic (see D7 for the batching/parallel
-        // work this eventually needs).
-        let source_file = File::open(&self.local_source_path)?;
+        if self.source_file.borrow().is_none() {
+            *self.source_file.borrow_mut() = Some(File::open(&self.local_source_path)?);
+        }
         if scratch_buffer.len() < task.source.length {
             scratch_buffer.resize(task.source.length, 0);
         }
         let slice = &mut scratch_buffer[0..task.source.length];
-        source_file.read_at(slice, task.source.offset)?;
+        {
+            let mut guard = self.source_file.borrow_mut();
+            let source_file = guard.as_mut().expect("source handle was just cached above");
+            source_file.read_at(slice, task.source.offset)?;
+        }
         self.temp_file.write_at(slice, task.target_offset)?;
         Ok(())
     }

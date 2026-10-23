@@ -934,6 +934,12 @@ where
         // the two files' chunkings).
         let mut scratch: Vec<u8> = Vec::new();
         let mut received: u64 = 0;
+        // D7: cache the per-file read handles across plan entries — the old
+        // code re-opened the source file for every Local entry (thousands
+        // of opens per sync on large files). Both handles are read-only and
+        // may coexist with the reconstructor's temp write handle.
+        let mut temp_read: Option<File> = None;
+        let mut local_read: Option<File> = None;
         for entry in &plan {
             match *entry {
                 PlanEntry::Local {
@@ -949,9 +955,9 @@ where
                             "plan references a chunk not in our manifest",
                         )
                     })?;
-                    let (path, offset) = match origin {
-                        LocalOrigin::Temp { offset, .. } => (&temp_path, *offset),
-                        LocalOrigin::OldFile { offset, .. } => (&request.local_source, *offset),
+                    let offset = match origin {
+                        LocalOrigin::Temp { offset, .. } => *offset,
+                        LocalOrigin::OldFile { offset, .. } => *offset,
                     };
                     // Spec §12 resource limits: writes stay inside the
                     // declared file size.
@@ -962,7 +968,20 @@ where
                             "plan chunk extends beyond the declared file size",
                         ));
                     }
-                    let source_file = File::open(path)?;
+                    let source_file = match origin {
+                        LocalOrigin::Temp { .. } => {
+                            if temp_read.is_none() {
+                                temp_read = Some(File::open(&temp_path)?);
+                            }
+                            temp_read.as_mut().expect("temp read handle just opened")
+                        }
+                        LocalOrigin::OldFile { .. } => {
+                            if local_read.is_none() {
+                                local_read = Some(File::open(&request.local_source)?);
+                            }
+                            local_read.as_mut().expect("local read handle just opened")
+                        }
+                    };
                     scratch.clear();
                     scratch.resize(length as usize, 0);
                     source_file.read_at(&mut scratch[..length as usize], offset)?;
