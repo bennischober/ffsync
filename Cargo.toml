@@ -2,6 +2,10 @@
 name = "ffsync"
 version = "0.5.0"
 edition = "2024"
+# Minimum Supported Rust Version, enforced by the msrv job in CI. Not the
+# edition floor (1.85) but what the dependency tree actually requires:
+# rcgen 0.14 / time 0.3 need rustc 1.88 (verified with cargo +1.88 check).
+rust-version = "1.88"
 description = "Chunk-level file synchronization for big files and fast links"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bennischober/ffsync"

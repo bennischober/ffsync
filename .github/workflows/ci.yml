@@ -47,3 +47,17 @@ jobs:
       # Runs on every push/PR; the weekly scheduled cadence for drifted
       # advisories is covered by the separate audit-weekly workflow (D14).
       - run: cargo audit
+
+  msrv:
+    name: msrv (rust-version = 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep the declared rust-version honest: if a dependency bump or a
+      # new language feature silently raises the real floor, this job
+      # fails and the field gets updated deliberately, not by accident.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+      - run: cargo check --all-targets
