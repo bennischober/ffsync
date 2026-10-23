@@ -3,11 +3,13 @@
 Specification for the ffsync wire protocol. Written for v0.1 (protocol
 version 1: **one file pair, two peers, one TCP connection**); it tracks the
 protocol across versions — changes ship with a `VERSION` bump and are
-recorded in the relevant sections. Current version: **3** (v0.2: HELLO
+recorded in the relevant sections. Current version: **5** (v0.2: HELLO
 gained `file_mtime_nanos`, see §3/§4; v0.3 adds the tree envelope, see
 §16; v0.4/v0.5 work extends TREE_BEGIN additively under flag bits —
 §16.7 excludes, §16.8 parallel sessions — without a VERSION bump, since
-unknown flag bits are rejected and the default layouts are unchanged).
+unknown flag bits are rejected and the default layouts are unchanged;
+v0.6 adds §17, the QUIC carrier, also without a bump; v0.7 adds §16.9,
+per-entry POSIX mode bits under a flag, with a VERSION bump — see §16.9).
 §17 specifies the QUIC transport (D13 step 2): a carrier change under
 the same wire bytes, no VERSION bump.
 
@@ -34,9 +36,12 @@ the same wire bytes, no VERSION bump.
 
 **Out of scope, per D9:**
 
-- Metadata beyond (path, size, mtime): no permissions, xattrs, symlinks,
-  hardlinks. (v0.3 follows symlinks to their target type; dangling ones are
-  skipped with a warning — recorded, not silent.)
+- Metadata beyond (path, size, mtime): no xattrs, no hardlinks, no
+  symlink-as-entry. (v0.3 follows file symlinks to their target type;
+  dangling ones are skipped with a warning — recorded, not silent.
+  v0.7 amends this once: tree sync carries POSIX mode bits under a flag
+  — §16.9 — and directory symlinks/junctions are no longer recursed
+  into; both still recorded, not silent.)
 - Bidirectional merge / continuous sync (that is Syncthing's job; D9, D17).
 
 ## 2. Model
@@ -666,6 +671,90 @@ no async runtime enters the tree (the D13 amendment's constraint). QUIC
 (D13 step 2) can later substitute the transport: a QUIC stream is
 `Read + Write`, so worker connections map onto streams without touching
 this layer again. That substitution is specified in §17.
+
+### 16.9 File metadata: POSIX mode bits (v5, D9 amendment)
+
+**Scope decision (D9 amendment, 2026-10-23).** Tree sync gains one metadata
+axis: the POSIX mode bits (permissions + setuid/setgid/sticky). Xattrs and
+hardlinks stay out of scope (xattrs: platform-fragmented semantics for
+little sync value here; hardlinks: a linked file would need the same
+chunk list under two paths, breaking the one-path-one-chunk-list identity
+model that D15 indexes and per-file verification are built on).
+Single-file mode is unchanged (metadata rides the tree manifest only —
+the asymmetry is documented, and HELLO keeps its layout).
+
+**Wire format (additive, flag-gated — the §16.7/§16.8 pattern).**
+TREE_BEGIN flag bit 4 `metadata`: when set, each tree entry in this
+TREE_BEGIN carries an additional `mode u32` field:
+
+```
+TreeEntry (metadata flag) := ...existing fields... | mode u32
+```
+
+`mode u32` carries the low 12 bits of the POSIX mode (rwxrwxrwx +
+setuid/setgid/sticky, `0o7777` mask), encoded as the raw st_mode low bits
+— i.e. the value `unix::fs::MetadataExt::mode()` masked with `0o7777`,
+or 0 where the platform has no such concept. Flag bit 4 joins
+`TREE_FLAG_KNOWN`; decoders reject it when unknown (old receivers fail
+loudly against new senders — correct, because triage inputs must be
+identical on both peers).
+
+**Semantics.**
+
+- **Scan:** `mode` is read at scan time on every platform; on Windows and
+  any platform without POSIX modes it is 0.
+- **Triage:** mode differences do NOT trigger sync by themselves. Triage
+  inputs stay (path, kind, size, mtime) — adding mode to the skip rule
+  would make a chmod-only change invisible to the skip decision but
+  visible to the metadata pass, splitting the deterministic-triage
+  invariant. Instead: mode rides along with every conversation the
+  existing triage already starts, and a **chmod-only tree change**
+  (same size+mtime everywhere, differing modes) is simply not synced —
+  same trade rsync's default fast path makes. The metadata is best-effort
+  convergence, not a change detector. (`--checksum` still forces full
+  per-file conversations, which then also apply metadata.)
+- **Apply:** after a file's reconstruction succeeds and before the mtime
+  preservation write (§16.6), the receiver applies the sender's mode:
+  on unix, `fchmod`-equivalent via `std::os::unix::fs::PermissionsExt`
+  (mode masked `0o7777`); on Windows, the no-write bits
+  (`0o222` for owner/group/other) map to clearing the read-only
+  attribute — write-enable always wins (an attribute cannot express
+  read-denial; documenting the lossy direction is the honest choice).
+  Directories: mode applies to created directories at creation time;
+  pre-existing directories keep their mode (the receiver's directory is
+  not replaced — matching the "dir with files needs no entry" rule).
+- **Order is load-bearing:** mode write → mtime write → stat → D15 index
+  write. The index must record the post-metadata mtime or every
+  metadata-synced file re-syncs (§16.6's ordering rule, extended one
+  step earlier).
+- **Index (D15):** the index format gains the mode field (per-file
+  codec version bump). Warm validation compares mode only to decide
+  whether the metadata pass must re-apply it — a mode mismatch makes the
+  file's conversation run again via the normal path (it is never a
+  silent skip, because triage decides on size+mtime as before; the index
+  mode is applied at commit of the *next* sync of that file).
+- **Determinism:** both peers derive the same triage from the same two
+  manifests; the metadata section changes only what rides *with* a
+  conversation, never *which* conversations exist. The §16.3 invariant
+  is untouched.
+
+**Symlinks (D9 amendment — policy, no wire change).** The §1 behavior is
+restated and sharpened: symlinks to files are followed and synced as
+their target type; symlinks to directories are followed but **never
+recursed into as directories during scan** (the scan reads the link's
+own metadata, sees "symlink", and skips it with a warning) — this closes
+the junction/junk-symlink recursion hazard on Windows, where a junction
+needs no privileges and can point at an ancestor. Dangling symlinks are
+skipped with a warning (unchanged). Sync-as-entry (link + target on the
+wire) remains out of scope: Windows symlink creation needs privilege or
+developer mode, and target validation would add a traversal surface for
+a feature ffsync's niche (big-file sync) does not need.
+
+**Version:** protocol v3 → **v5** (two flag-gated additive extensions
+shipped under v3/v4 without bumping — excludes and parallel — but this
+one changes per-entry layout under a flag *and* the D15 index codec, so
+it takes the bump; old/unknown flag bits were already rejected, making
+the migration path the loud-failure one the protocol prefers).
 
 ## 17. QUIC transport (D13 step 2, v0.6 work)
 

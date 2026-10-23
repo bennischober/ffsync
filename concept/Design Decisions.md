@@ -673,3 +673,73 @@ fine, and the per-directory database note in D15 stays the scale trigger);
 deletes are a trust decision deferred to session end (a receiver that
 trusts the sender's fingerprint already trusts it with writes).
 
+## D18 — File metadata, first-class at last: POSIX mode bits, symlink scan fix (D9 amendment)
+
+**Decision (2026-10-23, 0.7.0 scope).** D9's "metadata out of scope until
+the core is proven" condition is met — the core is proven end-to-end
+(single file, trees, resume, warm starts, TLS, QUIC, excludes, parallel).
+The one metadata axis that matters for ffsync's niche is adopted, the
+rest stays out:
+
+- **In: POSIX mode bits** (low 12 bits: rwxrwxrwx + setuid/setgid/sticky)
+  for tree sync, riding TREE_BEGIN entries under a new flag bit (§16.9).
+  Rationale: executable bits and read-only state are the metadata that
+  actually breaks a cross-machine sync of scripts/binaries/trees; xattrs
+  are platform-fragmented with little sync value here; hardlinks break
+  the one-path-one-chunk-list identity model (D15 index, per-file
+  verification); symlink-as-entry needs Windows privileges and adds a
+  target-validation traversal surface.
+- **Out (unchanged): xattrs, hardlinks, symlink-as-entry, ACLs.**
+- **Single-file mode unchanged** — metadata rides the tree manifest only;
+  documented asymmetry, HELLO layout untouched.
+- **Triage unchanged in shape:** mode differences do not trigger sync;
+  metadata rides conversations the existing (size, mtime) triage already
+  starts. A chmod-only tree change is not synced — the same trade rsync's
+  fast path makes, chosen deliberately to preserve the
+  deterministic-triage invariant (both peers derive identical
+  conversations from identical manifests; adding mode to the skip rule
+  without adding it to both manifests' *conversation semantics* would
+  split that). `--checksum` mode applies metadata on every file.
+- **Symlink scan fix (the real bug this decision found):** `scan_dir`
+  recursed on `metadata().is_dir()` — on Windows an NTFS junction needs
+  no privileges, carries the directory attribute, and may point at an
+  ancestor, so a junction loop was a plausible infinite recursion/hang.
+  Fix: the scan reads each entry's *symlink* metadata (`symlink_metadata`),
+  follows file symlinks to their target content (today's documented
+  behavior), and never recurses into directory symlinks/junctions — skip
+  with a warning, recorded not silent. This fix is chunker- and
+  version-independent and lands regardless of the metadata feature.
+- **Apply order is load-bearing:** mode write → mtime write (§16.6) →
+  stat → D15 index write. The index must record the post-metadata mtime
+  or every metadata-synced file re-syncs on the next run (the §16.6
+  ordering rule extended one step earlier).
+- **Wire:** TREE_BEGIN flag bit 4 `metadata`; when set, each entry gains
+  `mode u32` (st_mode low bits masked `0o7777`, 0 where the platform has
+  no POSIX modes — Windows maps no-write bits to the read-only attribute,
+  write-enable always wins, lossy direction documented). Protocol v3 → v5
+  (the flag-gated field changes per-entry layout; unknown flags were
+  already rejected, so old peers fail loudly — the migration path the
+  protocol prefers). D15 index codec bumps its version for the mode
+  field.
+
+**Alternatives rejected:**
+- *Read-only-bit-only* (cross-platform, no unix value — exec bits are
+  the actual need).
+- *Mode as a triage trigger* (breaks deterministic triage / turns a
+  chmod into a metadata-only sync class; see reasoning above).
+- *Sync symlink entries* (privilege surface on Windows; traversal
+  validation; niche).
+- *Bump only the index codec, not VERSION* — rejected because per-entry
+  wire layout changed under a flag; the flag mechanism is safe for
+  *unknown* senders only when the layout is unknown, and here old peers
+  would parse a metadata-flagged TREE_BEGIN with wrong entry sizes if
+  VERSION still said 3/4. Loud mismatch is the protocol's failure mode
+  of choice.
+
+**Validation plan:** tree loopback tests gain mode assertions (unix:
+chmod'd file converges; setuid bit round-trips; Windows: read-only
+attribute maps both ways); scan tests for junction/dir-symlink
+non-recursion and dangling-symlink warning; index codec version bump
+test (old index refused loudly, cold rescan); v3-peer-rejects-v5-HELLO
+test; the full §16.6-style mtime-preservation regression suite re-run.
+
