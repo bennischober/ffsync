@@ -727,12 +727,16 @@ identical on both peers).
   write. The index must record the post-metadata mtime or every
   metadata-synced file re-syncs (§16.6's ordering rule, extended one
   step earlier).
-- **Index (D15):** the index format gains the mode field (per-file
-  codec version bump). Warm validation compares mode only to decide
-  whether the metadata pass must re-apply it — a mode mismatch makes the
-  file's conversation run again via the normal path (it is never a
-  silent skip, because triage decides on size+mtime as before; the index
-  mode is applied at commit of the *next* sync of that file).
+- **Index (D15): no change.** The index stays (chunk list, root, size,
+  mtime): triage never reads mode (chmod-only changes are accepted as
+  not-synced — the §16.3 invariant), the sender's manifest mode comes
+  from a fresh metadata scan at session start (never from the index —
+  the tree scan is metadata-only and always current), and the per-file
+  warm path serves chunks, not metadata. Applying mode before mtime
+  (above) keeps the index's recorded mtime correct without mode ever
+  touching the index. (An earlier draft of this section bumped the index
+  codec for a mode field; the implementation review dropped it — nothing
+  consumes it.)
 - **Determinism:** both peers derive the same triage from the same two
   manifests; the metadata section changes only what rides *with* a
   conversation, never *which* conversations exist. The §16.3 invariant

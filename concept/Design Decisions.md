@@ -719,8 +719,8 @@ rest stays out:
   write-enable always wins, lossy direction documented). Protocol v3 → v5
   (the flag-gated field changes per-entry layout; unknown flags were
   already rejected, so old peers fail loudly — the migration path the
-  protocol prefers). D15 index codec bumps its version for the mode
-  field.
+  protocol prefers). The D15 index codec is unchanged (nothing in it
+  consumes mode; see §16.9).
 
 **Alternatives rejected:**
 - *Read-only-bit-only* (cross-platform, no unix value — exec bits are
@@ -739,7 +739,6 @@ rest stays out:
 **Validation plan:** tree loopback tests gain mode assertions (unix:
 chmod'd file converges; setuid bit round-trips; Windows: read-only
 attribute maps both ways); scan tests for junction/dir-symlink
-non-recursion and dangling-symlink warning; index codec version bump
-test (old index refused loudly, cold rescan); v3-peer-rejects-v5-HELLO
+non-recursion and dangling-symlink warning; v3-peer-rejects-v5-HELLO
 test; the full §16.6-style mtime-preservation regression suite re-run.
 
