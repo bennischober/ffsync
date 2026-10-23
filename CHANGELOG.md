@@ -6,6 +6,35 @@ All notable changes to ffsync are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **POSIX mode bits in tree sync (§16.9, D18; protocol v3 → v4):** the
+  sender's permission bits (rwxrwxrwx + setuid/setgid/sticky) ride the
+  tree manifest under a new flag and are applied at commit — unix exact
+  (exec bits converge), Windows via the read-only attribute (no-write
+  bits set it, any write-enable clears it; the lossy direction is
+  documented). Mode is never a triage input: a chmod-only change is not
+  synced (the same trade rsync's fast path makes); metadata rides the
+  conversations the size+mtime triage already starts, so the
+  deterministic-triage invariant is untouched. Single-file mode is
+  unchanged; the D15 index codec is unchanged. Old peers fail loudly on
+  the version check (and would reject the unknown flag bit anyway).
+
+### Fixed
+
+- **Directory symlinks/junctions are no longer recursed into during the
+  tree scan.** The scan classified entries by their *target's* metadata;
+  on Windows an NTFS junction needs no privileges, carries the directory
+  attribute, and may point at an ancestor — a plausible infinite
+  recursion/hang. File symlinks are still followed (synced as their
+  target's content); dangling links are skipped with a warning (recorded,
+  not silent).
+- **A read-only target file on Windows could not be synced over** (rename
+  and truncate both fail with os error 5). The attribute is cleared
+  best-effort before every commit write; a sender's read-only mode is
+  re-asserted after, so read-only state still converges when the wire
+  carries it.
+
 ## [0.6.0] - 2026-10-23
 
 ### Added

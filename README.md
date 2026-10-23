@@ -17,16 +17,17 @@ commands.
 
 </div>
 
-> **Status: v0.6.0.** Single-file **and directory-tree** sync between two
-> peers over TLS work end-to-end, including resume after mid-transfer
-> disconnects. Trees sync by metadata triage (D17): only changed files get
-> conversations, synced files adopt the sender's mtime, and a run with
-> nothing changed reads metadata only. Deletions of receiver-only files
-> apply after every transfer succeeded, opt-out with `--no-delete`.
-> Exclude patterns filter tree sessions (§16.7). Parallel per-file
-> conversations (`--parallel K`, §16.8) cut WAN sync time by the connection
-> count; QUIC transport (`--quic`, §17) puts K conversations on one
-> connection with stream-level loss recovery. See [roadmap](#roadmap) below.
+> **Status: v0.6.0 (+unreleased D18).** Single-file **and directory-tree**
+> sync between two peers over TLS work end-to-end, including resume after
+> mid-transfer disconnects. Trees sync by metadata triage (D17): only
+> changed files get conversations, synced files adopt the sender's mtime,
+> and a run with nothing changed reads metadata only. Deletions of
+> receiver-only files apply after every transfer succeeded, opt-out with
+> `--no-delete`. Exclude patterns filter tree sessions (§16.7). Parallel
+> per-file conversations (`--parallel K`, §16.8) cut WAN sync time by the
+> connection count; QUIC transport (`--quic`, §17) puts K conversations on
+> one connection with stream-level loss recovery. Unreleased work adds
+> POSIX mode bits to tree sync (§16.9, D18). See [roadmap](#roadmap) below.
 
 ## Why
 
@@ -418,7 +419,16 @@ The reasoning is the product; it is all recorded:
   later boundary); MothCDC is byte-identical to MinCDC on our data. The
   `Chunker` trait keeps swapping cheap; MinCDC is the tracked candidate
   if fast/warm rescans ever become the bottleneck.
-- **Later - permissions/xattrs/symlinks as first-class metadata** (D9).
+- **Done (unreleased) - POSIX mode bits (§16.9, D18; protocol v4):**
+  tree sync carries and applies the sender's permission bits (unix exact,
+  Windows via the read-only attribute); mode never triggers syncs (the
+  size+mtime fast path is untouched), and the tree scan no longer
+  recurses into directory symlinks/junctions (the Windows junction
+  recursion hazard). Xattrs/hardlinks/symlink-as-entry stay out of scope
+  (D9/D18).
+- **Later - permissions/xattrs/symlinks as first-class metadata** (D9):
+  the mode-bit slice of this landed; xattrs, hardlinks, and
+  symlink-as-entry remain out of scope with recorded reasoning.
 
 ## License
 

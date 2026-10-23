@@ -226,6 +226,20 @@ pre-existing.
   D15 index (order: rename → set_modified → stat → write_index). Reversing
   the order leaves the index recording the wrong mtime and every subsequent
   tree sync re-checks the file.
+- Mode bits (§16.9, v4/D18) extend that ordering: rename → **apply_mode** →
+  set_modified → stat → write_index. Mode is never a triage input (a
+  chmod-only change is not synced — the same trade as rsync's fast path);
+  it rides conversations the size+mtime triage already starts. The
+  metadata flag is sender-authoritative and mirrored by the receiver
+  (triage inputs must be identical on both peers); a Windows sender sends
+  no section (synthesized modes would corrupt unix exec bits). On Windows,
+  read-only targets block rename/truncate (os error 5) —
+  `clear_readonly_best_effort` runs before every commit write and
+  `apply_commit_mode` re-asserts read-only after.
+- The tree scan never recurses into directory symlinks/junctions (an
+  ancestor junction on Windows needs no privilege and was a plausible
+  infinite loop); file symlinks are followed, dangling ones warn+skip.
+  Classification goes through symlink metadata, not the target's.
 - Tree manifests must exclude `*.ffsync-index` / `*.ffsync-tmp` — they are
   ffsync's own bookkeeping; syncing them would sync internal state and
   desync warm starts (an index written at commit changes mtime → re-sync
