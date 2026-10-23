@@ -1,0 +1,89 @@
+name: WAN measurement
+
+# One-shot experiment (manual dispatch, never on push): a hosted runner is
+# the RECEIVER; the local machine (bennischober's PC) is the SENDER and
+# reaches it through a Cloudflare quick tunnel. This is the shared-bottleneck
+# WAN path the toxiproxy experiment could not simulate: K connections share
+# one real pipe (the home downlink).
+#
+#   runner: cloudflared tunnel (tcp) -> ffsync receive 7788 --parallel K
+#   local:  cloudflared access -> ffsync send <url> --parallel K
+#
+# The receiver prints its fingerprint and the tunnel URL; the sender pins
+# the receiver with --trust (input from the previous step's log).
+# Fixture: bench --gen-tree, seed 42 (100 files, 423 MiB, 8 dirs) — same
+# fixture as the model and toxiproxy rows in evaluation/parallel.md.
+# Every cell hash-verifies receiver content against the sender tree.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tunnel_url:
+        description: "trycloudflare.com URL of the running local tunnel (no https://)"
+        required: true
+      sender_fp:
+        description: "SHA-256 fingerprint of the local sender identity"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  receive:
+    name: wan receive / parallel sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Generate fixture (seed 42)
+        run: ./target/release/bench --gen-tree --out-dir fixture --seed 42
+      - name: Install cloudflared
+        run: |
+          curl -L -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+      - name: Start tunnel + receiver (K)
+        id: recv
+        run: |
+          URL="${{ inputs.tunnel_url }}"
+          FP_SEND="${{ inputs.sender_fp }}"
+          echo "tunnel: $URL"
+          ./cloudflared tunnel --url tcp://127.0.0.1:7788 --no-autoupdate > tunnel.log 2>&1 &
+          sleep 8
+          # identify this peer for the sender's --trust
+          FP_RECV="$(./target/release/ffsync fingerprints | grep 'this peer:' | sed 's/this peer: *//')"
+          echo "receiver fingerprint: $FP_RECV"
+          echo "fp=$FP_RECV" >> "$GITHUB_OUTPUT"
+          # one cell per K; each cell gets a fresh empty receiver tree
+          for K in 1 4 8 16; do
+            rm -rf recv_tree && mkdir recv_tree
+            ARGS=()
+            [ "$K" -gt 1 ] && ARGS=(--parallel "$K")
+            START=$(date +%s.%N)
+            ./target/release/ffsync receive recv_tree 7788 "${ARGS[@]}" --trust "$FP_SEND" \
+              > "recv_k${K}.log" 2>&1
+            END=$(date +%s.%N)
+            WALL=$(echo "$END $START" | awk '{printf "%.2f", $1-$2}')
+            # convergence check: content hash of both trees must match
+            HASH_R="$(find recv_tree -type f ! -name '*.ffsync-*' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+            HASH_S="$(find fixture/lat_sender -type f ! -name '*.ffsync-*' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+            COUNT_R="$(find recv_tree -type f ! -name '*.ffsync-*' | wc -l)"
+            if [ "$HASH_R" = "$HASH_S" ] && [ "$COUNT_R" -eq 100 ]; then CONV=yes; else CONV=NO; fi
+            echo "CELL K=$K wall=${WALL}s converged=$CONV files=$COUNT_R"
+            echo "K=$K wall=${WALL}s converged=$CONV" >> cells.txt
+          done
+          cat cells.txt
+      - name: Upload cell results + receiver logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wan-results
+          path: |
+            cells.txt
+            recv_k*.log
+            tunnel.log
+          retention-days: 7
