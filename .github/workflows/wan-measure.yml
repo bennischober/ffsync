@@ -62,22 +62,19 @@ jobs:
           chmod +x cloudflared
       - name: Send cells
         run: |
+          set +e   # a failed cell must not kill the sweep; rc goes to cells.txt
           : > cells.txt
           send_cell() {
             local K="$1" HOST="$2" PORT="$3"
             ./cloudflared access tcp --hostname "$HOST" --url "127.0.0.1:$PORT" \
               > "access_k${K}.log" 2>&1 &
             local APID=$!
-            # wait for the local forwarder to accept
-            local ok=""
-            for i in $(seq 1 20); do
-              if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then ok=1; exec 3<&- 3>&-; break; fi
-              sleep 1
-            done
-            if [ -z "$ok" ]; then
-              echo "CELL K=$K rc=access-dead wall=0 converged=NO" | tee -a cells.txt
-              kill $APID 2>/dev/null; return
-            fi
+            # No probe: a /dev/tcp check would OPEN A REAL CONNECTION to the
+            # receiver — in parallel mode that EOF kills its control
+            # connection (fail-closed), which is exactly how run 3 died at
+            # K=4. The access client needs ~8 s to bind; the send's own
+            # retry window covers the rest.
+            sleep 8
             local ARGS=()
             [ "$K" -gt 1 ] && ARGS=(--parallel "$K")
             local START=$(date +%s.%N)
