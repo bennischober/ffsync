@@ -12,12 +12,12 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue)](CHANGELOG.md)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
 
-> **Status: v0.5.0.** Single-file **and directory-tree** sync between two
+> **Status: v0.6.0.** Single-file **and directory-tree** sync between two
 > peers over TLS work end-to-end, including resume after mid-transfer
 > disconnects. Trees sync by metadata triage (D17): only changed files get
 > conversations, synced files adopt the sender's mtime, and a run with
@@ -344,12 +344,12 @@ src/
   protocol/       wire protocol: framing, messages, state machines, tree sessions
   tree.rs         tree scan, path validation, triage (D17)
   index.rs        persistent chunk index (warm starts): codec, validate, atomic write
-  transport.rs    TLS + fingerprint pinning (D16), QUIC carrier (D13 step 2)
-                (transport/quic.rs: quinn streams as sync Read + Write)
+  transport/       TLS + fingerprint pinning (D16), QUIC carrier (D13 step 2)
+                 (transport/quic.rs: quinn streams as sync Read + Write)
   main.rs         the CLI
   bin/bench.rs    the benchmark harness
 concept/          design docs (positioning, decisions, protocol spec, research)
-evaluation/       measured results (chunking, rsync, parallel sessions)
+evaluation/       measured results (chunking, rsync, parallel, tool comparison, memory)
 ```
 
 ## Design docs
@@ -365,9 +365,12 @@ The reasoning is the product; it is all recorded:
 - [`concept/Deep Research Digest.md`](concept/Deep%20Research%20Digest.md) —
   what the two deep-research runs got right, and what was rejected
 - [`evaluation/chunking.md`](evaluation/chunking.md),
-  [`evaluation/rsync.md`](evaluation/rsync.md) and
-  [`evaluation/parallel.md`](evaluation/parallel.md) — the measurements
-  behind the defaults
+  [`evaluation/rsync.md`](evaluation/rsync.md),
+  [`evaluation/parallel.md`](evaluation/parallel.md),
+  [`evaluation/comparison.md`](evaluation/comparison.md) and
+  [`evaluation/memory.md`](evaluation/memory.md) — the measurements
+  behind the defaults (comparison.md: ffsync vs rsync/croc/sendme
+  head-to-head on loopback, every cell hash-verified)
 
 ## Roadmap
 
@@ -395,7 +398,7 @@ The reasoning is the product; it is all recorded:
   100-file full transfer at 30 ms simulated RTT
   (`evaluation/parallel.md`). QUIC (one connection,
   K streams + connection migration) can now slot in as a transport swap.
-- **Done (unreleased) - QUIC transport (D13 step 2, §17):** `--quic`
+- **Done (0.6.0) - QUIC transport (D13 step 2, §17):** `--quic`
   puts a whole session on one QUIC connection — tree conversations ride
   QUIC streams instead of separate TCP connections (one handshake
   instead of K), stream-level loss recovery replaces the TCP
