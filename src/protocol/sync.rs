@@ -116,6 +116,11 @@ pub enum Progress {
     Verifying,
     /// Sync completed without any transfer (fast path or empty plan).
     NothingToDo,
+    /// An empty file was created (or truncated to empty) and committed —
+    /// real work (a state change on disk) even though no bytes moved.
+    /// Distinguished from `NothingToDo` so the display never calls a
+    /// just-created file "up to date" (§16.3 empty-file conversations).
+    CreatedEmpty,
 }
 
 /// Everything the sender needs to know about the file being sent.
@@ -1092,7 +1097,7 @@ where
         );
         message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
         stream.flush()?;
-        progress(Progress::NothingToDo);
+        progress(Progress::CreatedEmpty);
         return Ok(SyncOutcome::Transferred {
             bytes: 0,
             chunks: 0,
@@ -1178,7 +1183,7 @@ where
                 );
                 message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
                 stream.flush()?;
-                progress(Progress::NothingToDo);
+                progress(Progress::CreatedEmpty);
                 return Ok(SyncOutcome::Transferred {
                     bytes: 0,
                     chunks: 0,

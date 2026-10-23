@@ -195,6 +195,7 @@ impl ProgressDisplay {
             }
             Progress::Verifying => "verifying comparing final root hash".to_string(),
             Progress::NothingToDo => "up to date".to_string(),
+            Progress::CreatedEmpty => "created (empty file)".to_string(),
         };
         // Single-line update via carriage return; final states end with a
         // newline via the caller printing the outcome.
@@ -726,6 +727,7 @@ impl TreeDisplay {
             }
             Progress::Verifying => "verifying".to_string(),
             Progress::NothingToDo => "up to date".to_string(),
+            Progress::CreatedEmpty => "created (empty file)".to_string(),
         };
         self.set_line(format!("sync      {}  {}", file, inner));
     }
