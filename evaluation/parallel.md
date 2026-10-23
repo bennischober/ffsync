@@ -68,6 +68,50 @@ stable, which is the quantity this evaluation is about.
 - Sessions were re-run per K with a **fresh empty receiver** so every
   measurement is the full-transfer worst case and comparable across K.
 
+## Real TCP check (toxiproxy, 2026-10-23)
+
+The model's known blind spots — congestion window, real ACK clocking,
+per-packet delay — are testable on the real kernel TCP stack without a
+second machine: two actual `ffsync` processes (TLS, pinned fingerprints)
+talk through a [toxiproxy](https://github.com/Shopify/toxiproxy) TCP
+proxy on loopback, which delays each direction by RTT/2 (+5 ms jitter).
+Same fixture (100 files, 423 MiB, 8 dirs, seed 42), receiver empty per
+cell, every cell hash-verified for content convergence
+(sender/receiver SHA-256 over all 100 files must match), sender exit 0.
+
+| RTT | K=1 | K=4 | K=8 |
+|---|---|---|---|
+| 30 ms — model | 21.0 s | 6.25 s (3.36×) | 3.46 s (6.07×) |
+| 30 ms — real TCP | 13.16 s | 5.05 s (2.61×) | 3.04 s (4.33×) |
+| 150 ms — real TCP | 36.39 s | 15.18 s (2.40×) | 9.08 s (4.01×) |
+
+Findings:
+
+- **The mechanism survives real TCP.** The K-ratio is not an artifact of
+  the channel model: K=4 buys ~2.4–2.6×, K=8 ~4.0–4.3× on a path with
+  genuine RTT. Parallel conversations are worth their connections.
+- **The model over-counts, as suspected.** Real K=1 (13.2 s) beats the
+  model's 21.0 s at the same RTT: real TCP pipelines frames within a
+  conversation better than the model's per-read latency charging, and
+  toxiproxy delays bytes per direction crossing, letting in-flight data
+  accumulate during the sleep instead of charging every read a full
+  flight. The model is therefore a conservative upper bound on the dead
+  air — the right tool for *whether* parallelism helps, not for *how
+  much*.
+- **Real ratios sit below the model's** (4.33× vs 6.07× at K=8/30 ms):
+  same over-count mechanism — the sequential baseline loses more dead
+  air in the model than it does on real TCP, so the model flatters the
+  ratio too.
+- 150 ms (intercontinental shape) shows the same ratios: the win scales
+  with RTT in dead-air terms but the *relative* gain is stable across
+  the two points measured.
+
+Not simulated here either: toxiproxy applies its toxics per connection
+direction, so K flows do **not** share one bottleneck pipe — the
+shared-bandwidth congestion question (does the win shrink when the link,
+not the RTT, is the bottleneck?) still needs `tc netem` with a single
+`rate` queue (CI workflow or a VM). No packet loss was injected.
+
 ## What the model does not simulate
 
 - **Bandwidth ceiling and congestion control**: no slow start, no cwnd,
@@ -88,9 +132,10 @@ stable, which is the quantity this evaluation is about.
 ## Absolute numbers are not UX numbers
 
 21.0 s / 6.25 s / 3.46 s are the *model's* wall times, not what a user
-experiences. The model cannot produce a transfer-time projection the way
-`bench --size-mib` projects link speeds for the chunk pipeline, because
-the wall time here is RTT-dominated by construction. Before quoting
+experiences. The real-TCP section above is the closest local check (real
+kernel TCP, real congestion window, real handshake — but loopback
+bandwidth and no loss); the remaining gap to a user experience is a
+genuine WAN with its bandwidth shape and loss profile. Before quoting
 absolute seconds as user experience, measure two real peers across a WAN
 (two cheap VPSes on different continents, `--parallel 1,4,8`, same
 fixture) — the K-ratio on real TCP is the number that validates the
