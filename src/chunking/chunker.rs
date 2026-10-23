@@ -5,6 +5,43 @@ pub const CHUNK_AVG: usize = 256 * 1024;
 /// FastCDC upper bound of the default configuration.
 pub const CHUNK_MAX: usize = 1024 * 1024;
 
+/// Files below this size chunk with the small-file configuration (D19).
+/// The size-ladder sweep (`evaluation/chunking.md`, 2026-10-23) puts the
+/// crossover here: below 16 MiB the smaller config wins unambiguously
+/// (rust-src 8 MiB: 18.1% → 4.1% delta; tos.webm 16 MiB: 8.6% → 3.8%), at
+/// 32 MiB the difference is noise, and chunk counts stay trivial at the
+/// boundary (~200 chunks ≈ 9 KiB manifest/index per file).
+pub const SMALL_FILE_BOUNDARY: u64 = 16 * 1024 * 1024;
+/// Small-file configuration (D19): the F1-sweep best point.
+pub const SMALL_CHUNK_MIN: usize = 16 * 1024;
+/// Small-file average target.
+pub const SMALL_CHUNK_AVG: usize = 64 * 1024;
+/// Small-file upper bound.
+pub const SMALL_CHUNK_MAX: usize = 256 * 1024;
+
+/// The CDC parameters for a file of `size` bytes (D19): a pure function of
+/// the size, evaluated by the sender before scanning and sent in HELLO
+/// (`cdc_min/cdc_avg/cdc_max`) — the receiver honors the wire values, so
+/// this policy only decides what the sender sends. Files at or above the
+/// boundary chunk exactly as the shipped defaults always have, which keeps
+/// every existing large-file index valid.
+pub fn cdc_params_for_size(size: u64) -> (usize, usize, usize) {
+    if size < SMALL_FILE_BOUNDARY {
+        (SMALL_CHUNK_MIN, SMALL_CHUNK_AVG, SMALL_CHUNK_MAX)
+    } else {
+        (CHUNK_MIN, CHUNK_AVG, CHUNK_MAX)
+    }
+}
+
+/// Sanity-checks peer-supplied CDC parameters (HELLO): usable only when
+/// ordered and non-degenerate. Nonsense values fall back to `fallback`
+/// instead of trusting the wire — a hostile peer must not be able to steer
+/// our chunker into a pathological configuration.
+pub fn sane_cdc_params(p: (u32, u32, u32)) -> bool {
+    let (min, avg, max) = (p.0 as usize, p.1 as usize, p.2 as usize);
+    min > 0 && min <= avg && avg <= max && max <= 64 * 1024 * 1024
+}
+
 /// Trait for different chunking strategies
 pub trait Chunker: Send {
     fn chunk<'a>(&'a mut self, data: &'a [u8]) -> Box<dyn Iterator<Item = ChunkBoundary> + 'a>;

@@ -845,6 +845,7 @@ fn run_warm_simulation(
         chunks.clone(),
         size,
         ffsync::index::stat_mtime(file).unwrap_or((0, 0)),
+        (cdc.0 as u32, cdc.1 as u32, cdc.2 as u32),
     );
     let t_write = Instant::now();
     ffsync::index::write_index(file, &index)?;
@@ -1224,6 +1225,7 @@ fn simulate_tree_session(
                 chunks,
                 size,
                 ffsync::index::stat_mtime(&probe).unwrap_or((0, 0)),
+                (cdc.0 as u32, cdc.1 as u32, cdc.2 as u32),
             );
             ffsync::index::write_index(&probe, &index)?;
         }

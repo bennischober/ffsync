@@ -21,10 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use blake3::Hash;
 
 use crate::chunking::{
-    Blake3Hasher, CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, Chunk, ChunkEvent, FastCDCChunker,
-    PipelineConfig, chunk_root, process_file,
+    Blake3Hasher, Chunk, ChunkEvent, FastCDCChunker, PipelineConfig, cdc_params_for_size,
+    chunk_root, process_file, sane_cdc_params,
 };
-use crate::index::{FileIndex, load_index};
+use crate::index::{FileIndex, load_index, load_index_with_cdc};
 use crate::protocol::framing::{self, FrameError};
 use crate::protocol::message::{
     self, ErrorCode, FLAG_RESUMING, FLAG_TRUST_TIMES, Hello, ManifestChunk, Message, MessageError,
@@ -295,12 +295,18 @@ where
         .unwrap_or((0, 0));
 
     progress(Progress::Scanning(0, file_size));
+    // D19: the CDC parameters are a pure function of the file size, chosen
+    // by the sender and announced in HELLO. The warm start serves its chunk
+    // list only when the stored parameters match these (a foreign layout
+    // could never reproduce the root).
+    let cdc = cdc_params_for_size(file_size);
+    let cdc_u32 = (cdc.0 as u32, cdc.1 as u32, cdc.2 as u32);
     let warm = if request.force_checksum {
         // Checksum mode must derive the root from a real scan (D15: the
         // index is never evidence that scanning can be skipped).
         None
     } else {
-        load_index(&request.path)
+        load_index_with_cdc(&request.path, cdc_u32)
     };
     let warmed = warm.is_some();
     let (source_chunks, root) = match warm {
@@ -309,9 +315,10 @@ where
             (idx.chunks, idx.root)
         }
         None => {
-            let (_scan_stats, chunks) = scan_with_progress(&request.path, pipeline, |hashed| {
-                progress(Progress::Scanning(hashed, file_size))
-            })?;
+            let (_scan_stats, chunks) =
+                scan_with_progress(&request.path, pipeline, cdc, |hashed| {
+                    progress(Progress::Scanning(hashed, file_size))
+                })?;
             let root = chunk_root(&chunks);
             (chunks, root)
         }
@@ -328,9 +335,9 @@ where
         version: super::VERSION,
         flags: hello_flags,
         role: Role::Sender,
-        cdc_min: CHUNK_MIN as u32,
-        cdc_avg: CHUNK_AVG as u32,
-        cdc_max: CHUNK_MAX as u32,
+        cdc_min: cdc.0 as u32,
+        cdc_avg: cdc.1 as u32,
+        cdc_max: cdc.2 as u32,
         file_size,
         file_mtime: mtime_secs,
         file_mtime_nanos: mtime_nanos,
@@ -536,6 +543,7 @@ where
                 source_chunks,
                 file_size,
                 crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                cdc_u32,
             );
             let _ = crate::index::write_index(&request.path, &index);
             // InSync is for plans that changed nothing on the receiver: the
@@ -616,68 +624,12 @@ where
         }
     }
 
-    // ---- Scan our local file for the manifest (§5). ----
-    // Warm start (D15): a valid index (size + mtime match) supplies the
-    // chunk list and root without reading file contents. In --checksum
-    // mode the index is never used to skip the scan (its root would claim
-    // content identity without reading), per D15.
+    // ---- Metadata for HELLO (scanning happens after the handshake, D19:
+    // the manifest scan uses the sender's CDC parameters, which we learn
+    // from its HELLO). ----
     let local_meta = std::fs::metadata(&request.local_source).ok();
     let local_size = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let local_mtime = local_meta.as_ref().and_then(|m| m.modified().ok());
-
-    let warm_idx = if local_size > 0 && !request.force_checksum {
-        load_index(&request.local_source)
-    } else {
-        None
-    };
-    let (local_chunks, local_root) = match warm_idx {
-        Some(idx) => {
-            progress(Progress::WarmStart(idx.chunks.len()));
-            (idx.chunks, Some(idx.root))
-        }
-        None => {
-            if local_size > 0 {
-                progress(Progress::Scanning(0, local_size));
-                let (_stats, chunks) =
-                    scan_with_progress(&request.local_source, pipeline, |hashed| {
-                        progress(Progress::Scanning(hashed, local_size))
-                    })?;
-                let root = chunk_root(&chunks);
-                (chunks, Some(root))
-            } else {
-                (Vec::new(), None)
-            }
-        }
-    };
-
-    // ---- Resume manifest (D10): union of temp chunks and old-file chunks,
-    // temp-first. Offsets in the manifest are resolved per (hash -> file)
-    // below when the plan references them. ----
-    let temp_chunks: Vec<Chunk> = if resuming {
-        let tsize = std::fs::metadata(&temp_path)?.len();
-        progress(Progress::Scanning(0, tsize));
-        let (_stats, chunks) = scan_with_progress(&temp_path, pipeline, |hashed| {
-            progress(Progress::Scanning(hashed, tsize))
-        })?;
-        chunks
-    } else {
-        Vec::new()
-    };
-    // hash -> which file to read the chunk from (Temp beats OldFile: the
-    // temp content is the newest state; old-file entries only fill gaps).
-    let mut manifest_map: HashMap<Hash, LocalOrigin> = HashMap::new();
-    for c in &temp_chunks {
-        manifest_map.entry(c.hash).or_insert(LocalOrigin::Temp {
-            offset: c.offset,
-            length: c.length,
-        });
-    }
-    for c in &local_chunks {
-        manifest_map.entry(c.hash).or_insert(LocalOrigin::OldFile {
-            offset: c.offset,
-            length: c.length,
-        });
-    }
 
     // ---- HELLO ----
     let mut flags = if request.force_checksum {
@@ -692,9 +644,11 @@ where
         version: super::VERSION,
         flags,
         role: Role::Receiver,
-        cdc_min: CHUNK_MIN as u32,
-        cdc_avg: CHUNK_AVG as u32,
-        cdc_max: CHUNK_MAX as u32,
+        // Decorative until the sender's values arrive (§4.3: the sender's
+        // parameters are authoritative); kept for symmetric encoding.
+        cdc_min: cdc_params_for_size(local_size).0 as u32,
+        cdc_avg: cdc_params_for_size(local_size).1 as u32,
+        cdc_max: cdc_params_for_size(local_size).2 as u32,
         file_size: local_size,
         file_mtime: unix_secs(local_mtime),
         file_mtime_nanos: local_mtime
@@ -733,6 +687,84 @@ where
         apply_mtime: request.apply_mtime.or(peer_mtime),
         ..(*request).clone()
     };
+
+    // ---- CDC parameters for this conversation (D19): the sender's values
+    // govern (§4.3). Nonsense values fall back to our size-derived policy —
+    // a hostile peer must not steer our chunker. ----
+    let cdc = if sane_cdc_params((peer.cdc_min, peer.cdc_avg, peer.cdc_max)) {
+        (
+            peer.cdc_min as usize,
+            peer.cdc_avg as usize,
+            peer.cdc_max as usize,
+        )
+    } else {
+        cdc_params_for_size(local_size)
+    };
+    let cdc_u32 = (cdc.0 as u32, cdc.1 as u32, cdc.2 as u32);
+
+    // ---- Scan our local file for the manifest (§5), now that the
+    // parameters are known. Warm start (D15): a valid index (size + mtime +
+    // parameter match) supplies the chunk list and root without reading
+    // file contents. In --checksum mode the index is never used to skip
+    // the scan (its root would claim content identity without reading),
+    // per D15. ----
+    let warm_idx = if local_size > 0 && !request.force_checksum {
+        // D19: parameters are not known yet (the sender's HELLO decides);
+        // load without parameter validation here — the check happens after
+        // the handshake, before the warm list is actually used.
+        load_index(&request.local_source)
+    } else {
+        None
+    };
+    let (local_chunks, local_root) = match warm_idx {
+        Some(idx) if idx.validate(&request.local_source, cdc_u32).is_some() => {
+            progress(Progress::WarmStart(idx.chunks.len()));
+            (idx.chunks, Some(idx.root))
+        }
+        _ => {
+            if local_size > 0 {
+                progress(Progress::Scanning(0, local_size));
+                let (_stats, chunks) =
+                    scan_with_progress(&request.local_source, pipeline, cdc, |hashed| {
+                        progress(Progress::Scanning(hashed, local_size))
+                    })?;
+                let root = chunk_root(&chunks);
+                (chunks, Some(root))
+            } else {
+                (Vec::new(), None)
+            }
+        }
+    };
+
+    // ---- Resume manifest (D10): union of temp chunks and old-file chunks,
+    // temp-first. The temp file holds the sender's content (partial copy
+    // from the interrupted session), so it scans with the sender's
+    // parameters (D19). ----
+    let temp_chunks: Vec<Chunk> = if resuming {
+        let tsize = std::fs::metadata(&temp_path)?.len();
+        progress(Progress::Scanning(0, tsize));
+        let (_stats, chunks) = scan_with_progress(&temp_path, pipeline, cdc, |hashed| {
+            progress(Progress::Scanning(hashed, tsize))
+        })?;
+        chunks
+    } else {
+        Vec::new()
+    };
+    // hash -> which file to read the chunk from (Temp beats OldFile: the
+    // temp content is the newest state; old-file entries only fill gaps).
+    let mut manifest_map: HashMap<Hash, LocalOrigin> = HashMap::new();
+    for c in &temp_chunks {
+        manifest_map.entry(c.hash).or_insert(LocalOrigin::Temp {
+            offset: c.offset,
+            length: c.length,
+        });
+    }
+    for c in &local_chunks {
+        manifest_map.entry(c.hash).or_insert(LocalOrigin::OldFile {
+            offset: c.offset,
+            length: c.length,
+        });
+    }
 
     // ---- Fast path (§4): the sender may answer NOT_MODIFIED right after
     // the HELLO exchange when size+mtime match and both sides trust times.
@@ -1020,11 +1052,11 @@ where
         // ---- VERIFY (§8) ----
         progress(Progress::Verifying);
         let verify_root = message::read_verify(stream)?;
-        // Verification (§8.2): re-scan the temp file with the same CDC
-        // parameters and compute the chunk-tree root. With identical
+        // Verification (§8.2): re-scan the temp file with the sender's CDC
+        // parameters (D19) and compute the chunk-tree root. With identical
         // parameters, the receiver's chunking of correct chunk data
         // reproduces the sender's chunk list, so the roots match.
-        let temp_chunks = scan_file_plain(&temp_path, pipeline)?;
+        let temp_chunks = scan_file_plain(&temp_path, pipeline, cdc)?;
         let temp_root = chunk_root(&temp_chunks);
         if temp_root != verify_root {
             let _ = std::fs::remove_file(&temp_path);
@@ -1051,6 +1083,7 @@ where
                 temp_chunks,
                 target_size,
                 crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                cdc_u32,
             ),
         );
         message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
@@ -1104,6 +1137,7 @@ where
                 Vec::new(),
                 0,
                 crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                cdc_u32,
             ),
         );
         message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
@@ -1114,11 +1148,11 @@ where
             chunks: 0,
         });
     }
-    let (state_root, state_desc): (Option<Hash>, &str) = if resuming {
-        let chunks = scan_file_plain(&temp_path, pipeline)?;
-        (Some(chunk_root(&chunks)), "temp")
+    let (state_root, state_desc, state_chunks): (Option<Hash>, &str, Vec<Chunk>) = if resuming {
+        let chunks = scan_file_plain(&temp_path, pipeline, cdc)?;
+        (Some(chunk_root(&chunks)), "temp", chunks)
     } else {
-        (local_root, "old file")
+        (local_root, "old file", Vec::new())
     };
     match state_root {
         Some(root) if root == verify_root => {
@@ -1128,15 +1162,19 @@ where
                 std::fs::rename(&temp_path, &request.path)?;
                 apply_commit_mode(&request.path, request.apply_mode)?;
                 apply_commit_mtime(&request)?;
-                // Persist the committed state (D15). The temp scan above is
-                // the verified chunk list; reuse it instead of re-scanning.
-                let chunks = scan_file_plain(&temp_path, pipeline).unwrap_or_default();
+                // Persist the committed state (D15): the temp scan above IS
+                // the verified chunk list — reuse it instead of re-scanning.
+                // (Found while landing D19: this site re-scanned the temp
+                // path AFTER renaming it away, so `unwrap_or_default` fed an
+                // empty index after every successful resume commit — the
+                // warm start then served nothing.)
                 let _ = crate::index::write_index(
                     &request.path,
                     &FileIndex::from_scan(
-                        chunks,
+                        state_chunks,
                         target_size,
                         crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                        cdc_u32,
                     ),
                 );
             } else if request.local_source == request.path {
@@ -1155,6 +1193,7 @@ where
                         local_chunks.clone(),
                         local_size,
                         crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
+                        cdc_u32,
                     ),
                 );
             }
@@ -1195,6 +1234,7 @@ where
                         Vec::new(),
                         0,
                         crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                        cdc_u32,
                     ),
                 );
                 message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
@@ -1301,14 +1341,17 @@ fn apply_commit_mtime(request: &ReceiveRequest) -> io::Result<()> {
 }
 
 /// Scans a file with progress callbacks bridged from the pipeline events.
+/// The CDC parameters are explicit (D19): the sender scans with its
+/// size-derived policy, the receiver with the sender's HELLO values.
 fn scan_with_progress(
     path: &Path,
     pipeline: &PipelineConfig,
+    cdc: (usize, usize, usize),
     mut on_progress: impl FnMut(u64),
 ) -> Result<(u64, Vec<Chunk>), SyncError> {
     let rx = process_file(
         path,
-        move || FastCDCChunker::new(CHUNK_MIN, CHUNK_AVG, CHUNK_MAX),
+        move || FastCDCChunker::new(cdc.0, cdc.1, cdc.2),
         Blake3Hasher,
         pipeline,
     )?;
@@ -1337,7 +1380,11 @@ fn scan_with_progress(
 }
 
 /// Scans a file without progress reporting (verification re-scan).
-fn scan_file_plain(path: &Path, pipeline: &PipelineConfig) -> Result<Vec<Chunk>, SyncError> {
-    let (_, chunks) = scan_with_progress(path, pipeline, |_| {})?;
+fn scan_file_plain(
+    path: &Path,
+    pipeline: &PipelineConfig,
+    cdc: (usize, usize, usize),
+) -> Result<Vec<Chunk>, SyncError> {
+    let (_, chunks) = scan_with_progress(path, pipeline, cdc, |_| {})?;
     Ok(chunks)
 }

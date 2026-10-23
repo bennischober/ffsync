@@ -324,7 +324,7 @@ mod tests {
         // Corrupt the target's index on disk (truncated): receiver must
         // treat it as missing and cold-scan.
         let tgt_index = ffsync::index::index_path_for(&target);
-        std::fs::write(&tgt_index, b"FFSYIX01corrupt").unwrap();
+        std::fs::write(&tgt_index, b"FFSYIX02corrupt").unwrap();
 
         // Backdate both files' mtimes to DISTINCT values so the wire fast
         // path (size+mtime, D11) cannot mask the scenario — with natural
@@ -344,6 +344,10 @@ mod tests {
             }],
             src_data.len() as u64,
             ffsync::index::stat_mtime(fx.source()).unwrap(),
+            {
+                let (a, b, c) = ffsync::chunking::cdc_params_for_size(src_data.len() as u64);
+                (a as u32, b as u32, c as u32)
+            },
         );
         ffsync::index::write_index(fx.source(), &stale).unwrap();
 
@@ -514,8 +518,11 @@ mod tests {
 
         let s = s.expect("sender ok");
         let r = r.expect("receiver ok");
+        // D19: 2 MiB < 16 MiB, so the conversation chunks with the
+        // small-file config — the sender's 2 MiB of periodic content is 8
+        // capped 256 KiB chunks (was 2 × 1 MiB under the shipped defaults).
         assert!(
-            matches!(r, SyncOutcome::Transferred { chunks: 2, .. }),
+            matches!(r, SyncOutcome::Transferred { chunks: 8, .. }),
             "receiver must execute the all-Local plan: {r:?}"
         );
         assert!(
@@ -873,11 +880,7 @@ mod tests {
                 &ffsync::chunking::scan_file_ordered(
                     &target,
                     &PipelineConfig::default(),
-                    (
-                        ffsync::chunking::CHUNK_MIN,
-                        ffsync::chunking::CHUNK_AVG,
-                        ffsync::chunking::CHUNK_MAX,
-                    ),
+                    ffsync::chunking::cdc_params_for_size(new_data.len() as u64),
                 )
                 .expect("target scan")
                 .1,
@@ -889,5 +892,292 @@ mod tests {
                 "target index must describe the target's own content"
             );
         }
+    }
+
+    #[test]
+    fn cdc_policy_boundary_and_sanity() {
+        // D19: params are a pure function of the file size.
+        use ffsync::chunking::{
+            CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, SMALL_CHUNK_AVG, SMALL_CHUNK_MAX, SMALL_CHUNK_MIN,
+            SMALL_FILE_BOUNDARY, cdc_params_for_size, sane_cdc_params,
+        };
+        assert_eq!(
+            cdc_params_for_size(SMALL_FILE_BOUNDARY - 1),
+            (SMALL_CHUNK_MIN, SMALL_CHUNK_AVG, SMALL_CHUNK_MAX),
+            "below the boundary: small-file config"
+        );
+        assert_eq!(
+            cdc_params_for_size(SMALL_FILE_BOUNDARY),
+            (CHUNK_MIN, CHUNK_AVG, CHUNK_MAX),
+            "at the boundary (inclusive): shipped defaults"
+        );
+        assert_eq!(
+            cdc_params_for_size(u64::MAX),
+            (CHUNK_MIN, CHUNK_AVG, CHUNK_MAX)
+        );
+        // Sane-parameter gate (the receiver's hostile-peer guard).
+        assert!(sane_cdc_params((16, 64, 256)));
+        assert!(sane_cdc_params((64, 256, 1024)));
+        assert!(!sane_cdc_params((0, 64, 256)), "zero min is degenerate");
+        assert!(!sane_cdc_params((256, 64, 256)), "min > avg is nonsense");
+        assert!(!sane_cdc_params((64, 256, 32)), "avg > max is nonsense");
+        assert!(
+            !sane_cdc_params((1, 1, 128 * 1024 * 1024)),
+            "max beyond the 64 MiB cap is refused"
+        );
+    }
+
+    #[test]
+    fn small_file_session_chunks_with_small_config_and_warm_restarts() {
+        // D19 end-to-end: a sub-boundary file converges with the small-file
+        // parameters, and the indexes both sides write record those
+        // parameters — a second sync warm-starts (the served layout matches
+        // the session's).
+        use ffsync::chunking::{SMALL_CHUNK_AVG, SMALL_CHUNK_MAX, SMALL_CHUNK_MIN};
+        use ffsync::index::index_path_for;
+
+        let fx = Fixture::new("adaptive_small");
+        let mut src_data = vec![0u8; 2 * 1024 * 1024];
+        for (i, b) in src_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29).wrapping_add((i / 4096) as u8);
+        }
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data[..1024 * 1024]);
+
+        let mk_send = || SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "source.bin".into(),
+            mtime: None,
+            force_checksum: false,
+            tree: false,
+        };
+        let mk_recv = || ReceiveRequest {
+            path: target.clone(),
+            local_source: target.clone(),
+            force_checksum: false,
+            tree: false,
+            apply_mode: None,
+            apply_mtime: None,
+        };
+
+        // Sync 1: converges; both indexes record the small-file parameters.
+        let (s1, r1) = run_sync(mk_send(), mk_recv());
+        s1.expect("sync 1 sender ok");
+        r1.expect("sync 1 receiver ok");
+        assert_eq!(read_file(&target), src_data);
+        let expected_cdc = (
+            SMALL_CHUNK_MIN as u32,
+            SMALL_CHUNK_AVG as u32,
+            SMALL_CHUNK_MAX as u32,
+        );
+        for (what, p) in [("sender", fx.source()), ("receiver", &target)] {
+            let idx = ffsync::index::load_index(p).expect("index written at commit");
+            assert_eq!(
+                idx.cdc, expected_cdc,
+                "{what} index records the session's CDC parameters"
+            );
+        }
+
+        // Sync 2 (unchanged): fast path on the wire (size+mtime) — but force
+        // a scan-less warm check by changing nothing; InSync either way.
+        let (_s2, r2) = run_sync(mk_send(), mk_recv());
+        assert!(matches!(r2.expect("sync 2 ok"), SyncOutcome::InSync));
+
+        // The written indexes validate against the session's parameters and
+        // refuse a foreign layout — the D19 warm-start contract.
+        for (what, p) in [("sender", fx.source()), ("receiver", &target)] {
+            let idx = ffsync::index::load_index(p).unwrap();
+            assert!(
+                idx.validate(p, expected_cdc).is_some(),
+                "{what} index validates with the session's parameters"
+            );
+            assert!(
+                idx.validate(p, (64, 256, 1024)).is_none(),
+                "{what} index refuses a foreign layout"
+            );
+        }
+        // The index path naming convention is untouched by the codec bump.
+        assert!(
+            index_path_for(&target)
+                .to_string_lossy()
+                .ends_with(".ffsync-index"),
+            "suffix appended, not substituted (D6/D15)"
+        );
+    }
+
+    #[test]
+    fn large_file_session_keeps_default_layout_and_warm_restarts() {
+        // The compatibility promise of D19: a file at/above the boundary
+        // chunks byte-identically to the shipped defaults — its index
+        // validates against the DEFAULT parameters.
+        use ffsync::chunking::{CHUNK_AVG, CHUNK_MAX, CHUNK_MIN};
+        let fx = Fixture::new("adaptive_large");
+        // Just above the boundary is enough (16 MiB + 1); the pipeline caps
+        // chunk max at 1 MiB so this scans fast.
+        let mut src_data = vec![0u8; ffsync::chunking::SMALL_FILE_BOUNDARY as usize + 1];
+        for (i, b) in src_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add((i / 8192) as u8);
+        }
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, Vec::new().as_slice());
+
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: false,
+                tree: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: false,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+            },
+        );
+        s.expect("sender ok");
+        r.expect("receiver ok");
+        assert_eq!(read_file(&target), src_data);
+
+        let expected_cdc = (CHUNK_MIN as u32, CHUNK_AVG as u32, CHUNK_MAX as u32);
+        for (what, p) in [("sender", fx.source()), ("receiver", &target)] {
+            let idx = ffsync::index::load_index(p).expect("index written at commit");
+            assert_eq!(idx.cdc, expected_cdc, "{what} index records the defaults");
+            assert!(
+                idx.validate(p, expected_cdc).is_some(),
+                "{what} index validates with default parameters (large-file layout unchanged)"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_v1_index_is_treated_as_missing() {
+        // A pre-D19 (FFSYIX01) index must not be served: the magic differs,
+        // so the warm start cold-scans and the commit rewrites it as v2.
+        let fx = Fixture::new("v1index");
+        let src_data = vec![7u8; 1024 * 1024];
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data);
+
+        // Forge a v1 index: the old header layout (68 bytes) with plausible
+        // content. Whatever its claims, a v2 reader must refuse it.
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(b"FFSYIX01");
+        v1.extend_from_slice(&(src_data.len() as u64).to_le_bytes());
+        v1.extend_from_slice(&1_700_000_000u64.to_le_bytes());
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        v1.extend_from_slice(&[0u8; 32]); // root: garbage
+        v1.extend_from_slice(&0u64.to_le_bytes()); // 0 chunks
+        let src_index = ffsync::index::index_path_for(fx.source());
+        std::fs::write(&src_index, &v1).unwrap();
+        assert!(
+            ffsync::index::load_index(fx.source()).is_none(),
+            "v1 magic is not an index to a v2 reader"
+        );
+
+        // The sync still works (cold scan) and rewrites the index as v2.
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: false,
+                tree: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: false,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+            },
+        );
+        s.expect("sender ok");
+        r.expect("receiver ok");
+        let idx = ffsync::index::load_index(fx.source()).expect("index rewritten at commit");
+        // 1 MiB of constant bytes: FastCDC cuts the mandatory minimum chunk
+        // (min = 64 KiB) plus the tail — the exact count is content-defined,
+        // so assert the layout identity instead: the recorded root equals a
+        // fresh small-config scan of the same file.
+        let (fresh_root, fresh_chunks) = {
+            use ffsync::chunking::scan_file_ordered;
+            let scanned = scan_file_ordered(
+                fx.source(),
+                &PipelineConfig::default(),
+                ffsync::chunking::cdc_params_for_size(src_data.len() as u64),
+            )
+            .expect("fresh scan");
+            (ffsync::chunking::chunk_root(&scanned.1), scanned.1)
+        };
+        assert_eq!(
+            idx.root, fresh_root,
+            "index describes the small-config layout"
+        );
+        assert_eq!(idx.chunks.len(), fresh_chunks.len());
+        assert!(idx.cdc.0 == 16 * 1024 && idx.cdc.1 == 64 * 1024 && idx.cdc.2 == 256 * 1024);
+    }
+
+    #[test]
+    fn resume_commit_writes_nonempty_index() {
+        // Found while landing D19: the resume commit path re-scanned the
+        // temp path AFTER renaming it away, feeding `unwrap_or_default` an
+        // empty chunk list — every successful resume commit wrote an EMPTY
+        // index, so the next sync never warmed. Regression test: the index
+        // written by a resumed session must describe the target.
+        use ffsync::protocol::sync::SyncOutcome;
+        let fx = Fixture::new("resumeindex");
+        let src_data: Vec<u8> = (0..2 * 1024 * 1024u32)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add((i / 8192) as u8))
+            .collect();
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data[..1024 * 1024]);
+
+        // Seed a temp file: the receiver will see FLAG_RESUMING and union
+        // the temp chunks into its manifest.
+        let temp_path = ffsync::reconstruction::Reconstructor::temp_path_for(&target);
+        std::fs::copy(&target, &temp_path).unwrap();
+
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: false,
+                tree: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: false,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+            },
+        );
+        let s = s.expect("sender ok");
+        let r = r.expect("receiver ok");
+        assert!(
+            matches!(s, SyncOutcome::Transferred { .. })
+                || matches!(r, SyncOutcome::Transferred { .. }),
+            "the resumed session must have executed a plan: {s:?} / {r:?}"
+        );
+        assert_eq!(read_file(&target), src_data, "resume converges");
+        let idx = ffsync::index::load_index(&target).expect("index written at resume commit");
+        assert!(
+            !idx.chunks.is_empty(),
+            "the resume commit's index must describe the target (was empty before the fix)"
+        );
+        assert!(
+            idx.validate(&target, idx.cdc).is_some(),
+            "and it validates against the target"
+        );
     }
 }

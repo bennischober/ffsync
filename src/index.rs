@@ -22,15 +22,17 @@ use blake3::Hash;
 
 use crate::chunking::{Chunk, chunk_root};
 
-/// Index format magic + version: `FFSYIX01`. A mismatch means the file is
-/// not an index or was written by an incompatible version — treat as missing
-/// (no migration machinery in v0.2; a format bump rewrites indexes at the
-/// next commit).
-const MAGIC: [u8; 8] = *b"FFSYIX01";
+/// Index format magic + version: `FFSYIX02` (v2, D19 — the header carries
+/// the CDC parameters that produced the chunk list; a v1 `FFSYIX01` file is
+/// not an index to this reader — treated as missing, rewritten at the next
+/// commit, no migration machinery). A mismatch means the file is not an
+/// index or was written by an incompatible version — treat as missing.
+const MAGIC: [u8; 8] = *b"FFSYIX02";
 
 /// Fixed-size header: magic (8) + file size (8) + mtime secs (8) + mtime
-/// subsec nanos (4) + root (32) + chunk count (8) = 68 bytes.
-const HEADER_LEN: usize = 8 + 8 + 8 + 4 + 32 + 8;
+/// subsec nanos (4) + CDC min/avg/max (12, D19) + root (32) + chunk count
+/// (8) = 80 bytes.
+const HEADER_LEN: usize = 8 + 8 + 8 + 4 + 12 + 32 + 8;
 
 /// One chunk entry: hash 32 B + offset u64 + length u32 = 44 bytes (the
 /// wire-manifest layout, D15).
@@ -48,6 +50,11 @@ pub struct FileIndex {
     /// loopback test — the mtime convention must match `--checksum`
     /// semantics, D11/D15).
     pub file_mtime: (u64, u32),
+    /// The CDC parameters (min, avg, max) that produced the chunk list
+    /// (D19). The warm start serves the list only when the session's
+    /// parameters match — a foreign layout would hash-match poorly and
+    /// could never reproduce the root.
+    pub cdc: (u32, u32, u32),
     /// Chunk-tree root of the indexed content.
     pub root: Hash,
     /// Ordered chunk list (canonical file order — the root is
@@ -69,11 +76,17 @@ pub fn stat_mtime(path: &Path) -> Option<(u64, u32)> {
 
 impl FileIndex {
     /// Builds an index from a scanned chunk list and the file's metadata.
-    pub fn from_scan(chunks: Vec<Chunk>, file_size: u64, file_mtime: (u64, u32)) -> Self {
+    pub fn from_scan(
+        chunks: Vec<Chunk>,
+        file_size: u64,
+        file_mtime: (u64, u32),
+        cdc: (u32, u32, u32),
+    ) -> Self {
         let root = chunk_root(&chunks);
         Self {
             file_size,
             file_mtime,
+            cdc,
             root,
             chunks,
         }
@@ -86,6 +99,9 @@ impl FileIndex {
         out.extend_from_slice(&self.file_size.to_le_bytes());
         out.extend_from_slice(&self.file_mtime.0.to_le_bytes());
         out.extend_from_slice(&self.file_mtime.1.to_le_bytes());
+        out.extend_from_slice(&self.cdc.0.to_le_bytes());
+        out.extend_from_slice(&self.cdc.1.to_le_bytes());
+        out.extend_from_slice(&self.cdc.2.to_le_bytes());
         out.extend_from_slice(self.root.as_bytes());
         out.extend_from_slice(&(self.chunks.len() as u64).to_le_bytes());
         for c in &self.chunks {
@@ -106,8 +122,13 @@ impl FileIndex {
         let file_size = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
         let secs = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
         let nanos = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
-        let root = Hash::from_bytes(bytes[28..60].try_into().ok()?);
-        let count = u64::from_le_bytes(bytes[60..68].try_into().ok()?);
+        let cdc = (
+            u32::from_le_bytes(bytes[28..32].try_into().ok()?),
+            u32::from_le_bytes(bytes[32..36].try_into().ok()?),
+            u32::from_le_bytes(bytes[36..40].try_into().ok()?),
+        );
+        let root = Hash::from_bytes(bytes[40..72].try_into().ok()?);
+        let count = u64::from_le_bytes(bytes[72..80].try_into().ok()?);
         // Overflow guard: count × 44 must fit the remaining bytes exactly.
         if count > (bytes.len() - HEADER_LEN) as u64 / ENTRY_LEN as u64 {
             return None;
@@ -142,15 +163,22 @@ impl FileIndex {
         Some(Self {
             file_size,
             file_mtime: (secs, nanos),
+            cdc,
             root,
             chunks,
         })
     }
 
-    /// Validates the index against the file's current stat. Size must match
-    /// exactly and mtime must match at nanosecond granularity. Any mismatch
-    /// or missing file ⇒ `None` (cold start).
-    pub fn validate(&self, path: &Path) -> Option<()> {
+    /// Validates the index against the file's current stat AND the session's
+    /// CDC parameters (D19). Size must match exactly, mtime must match at
+    /// nanosecond granularity, and the stored parameters must equal the
+    /// ones the session chunks with — a foreign layout would serve a chunk
+    /// list the current session cannot reproduce. Any mismatch or missing
+    /// file ⇒ `None` (cold start).
+    pub fn validate(&self, path: &Path, cdc: (u32, u32, u32)) -> Option<()> {
+        if self.cdc != cdc {
+            return None;
+        }
         let meta = std::fs::metadata(path).ok()?;
         if meta.len() != self.file_size {
             return None;
@@ -201,17 +229,29 @@ pub fn write_index(path: &Path, index: &FileIndex) -> io::Result<()> {
 }
 
 /// Loads and returns the index for `path` if it exists, parses cleanly, and
-/// validates against the file's current stat. Any failure ⇒ `None`
-/// (warm start refused, cold scan). Best-effort removal of a corrupt index
-/// is NOT done here — the next successful commit overwrites it anyway.
-pub fn load_index(path: &Path) -> Option<FileIndex> {
+/// validates against the file's current stat and the session's CDC
+/// parameters (D19). Any failure ⇒ `None` (warm start refused, cold scan).
+/// Best-effort removal of a corrupt index is NOT done here — the next
+/// successful commit overwrites it anyway.
+pub fn load_index_with_cdc(path: &Path, cdc: (u32, u32, u32)) -> Option<FileIndex> {
     let idx_path = index_path_for(path);
     let mut f = File::open(&idx_path).ok()?;
     let mut bytes = Vec::new();
     f.read_to_end(&mut bytes).ok()?;
     let index = FileIndex::decode(&bytes)?;
-    index.validate(path)?;
+    index.validate(path, cdc)?;
     Some(index)
+}
+
+/// Loads an index without parameter validation — for callers that validate
+/// later against session parameters they learn from the wire (or for the
+/// corrupt-index probes in tests).
+pub fn load_index(path: &Path) -> Option<FileIndex> {
+    let idx_path = index_path_for(path);
+    let mut f = File::open(&idx_path).ok()?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).ok()?;
+    FileIndex::decode(&bytes)
 }
 
 /// Removes the index for a target (called when a sync replaces or removes
@@ -237,7 +277,7 @@ mod tests {
     #[test]
     fn index_round_trip() {
         let chunks = sample_chunks(7);
-        let idx = FileIndex::from_scan(chunks, 7 * 256, (1_700_000_000, 0));
+        let idx = FileIndex::from_scan(chunks, 7 * 256, (1_700_000_000, 0), (64, 256, 1024));
         let bytes = idx.encode();
         assert_eq!(bytes.len(), HEADER_LEN + 7 * ENTRY_LEN);
         let back = FileIndex::decode(&bytes).expect("decode");
@@ -248,7 +288,7 @@ mod tests {
     fn index_decode_rejects_garbage() {
         assert!(FileIndex::decode(b"").is_none());
         assert!(FileIndex::decode(b"nonsense").is_none());
-        let idx = FileIndex::from_scan(sample_chunks(3), 768, (42, 0));
+        let idx = FileIndex::from_scan(sample_chunks(3), 768, (42, 0), (64, 256, 1024));
         let mut bytes = idx.encode();
         // Truncation.
         bytes.truncate(bytes.len() - 10);
@@ -263,28 +303,41 @@ mod tests {
         assert!(FileIndex::decode(&bytes).is_none());
         // Chunk count beyond the payload.
         let mut bytes = idx.encode();
-        bytes[56..64].copy_from_slice(&999u64.to_le_bytes());
+        bytes[72..80].copy_from_slice(&999u64.to_le_bytes());
         assert!(FileIndex::decode(&bytes).is_none());
     }
 
     #[test]
-    fn index_validate_checks_size_and_mtime() {
+    fn index_validate_checks_size_mtime_and_cdc() {
         let dir = std::env::temp_dir().join(format!("ffsync_idx_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("file.bin");
         std::fs::write(&path, vec![0u8; 1000]).unwrap();
 
         let mtime = crate::index::stat_mtime(&path).unwrap();
-        let idx = FileIndex::from_scan(sample_chunks(4), 1000, mtime);
-        assert!(idx.validate(&path).is_some(), "matching stat validates");
+        let idx = FileIndex::from_scan(sample_chunks(4), 1000, mtime, (64, 256, 1024));
+        assert!(
+            idx.validate(&path, (64, 256, 1024)).is_some(),
+            "matching stat + parameters validate"
+        );
+        assert!(
+            idx.validate(&path, (16, 64, 256)).is_none(),
+            "parameter mismatch refuses (D19): the stored layout is foreign"
+        );
 
         // Size mismatch.
         std::fs::write(&path, vec![0u8; 999]).unwrap();
-        assert!(idx.validate(&path).is_none(), "size mismatch refuses");
+        assert!(
+            idx.validate(&path, (64, 256, 1024)).is_none(),
+            "size mismatch refuses"
+        );
 
         // Missing file.
         std::fs::remove_file(&path).unwrap();
-        assert!(idx.validate(&path).is_none(), "missing file refuses");
+        assert!(
+            idx.validate(&path, (64, 256, 1024)).is_none(),
+            "missing file refuses"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -297,7 +350,7 @@ mod tests {
         std::fs::write(&path, vec![7u8; 512]).unwrap();
         let mtime = crate::index::stat_mtime(&path).unwrap();
 
-        let idx = FileIndex::from_scan(sample_chunks(2), 512, mtime);
+        let idx = FileIndex::from_scan(sample_chunks(2), 512, mtime, (64, 256, 1024));
         write_index(&path, &idx).unwrap();
         let loaded = load_index(&path).expect("valid index loads");
         assert_eq!(loaded, idx);

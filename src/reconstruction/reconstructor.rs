@@ -119,8 +119,7 @@ impl Reconstructor {
         pipeline: &crate::chunking::PipelineConfig,
         cdc: (usize, usize, usize),
     ) -> io::Result<()> {
-        use crate::chunking::{Blake3Hasher, CHUNK_MIN, ChunkEvent, FastCDCChunker, process_file};
-        let _ = CHUNK_MIN;
+        use crate::chunking::{Blake3Hasher, ChunkEvent, FastCDCChunker, process_file};
 
         let temp_path = final_path.with_extension("ffsync-tmp");
         let rx = process_file(
