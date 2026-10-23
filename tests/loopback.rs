@@ -1065,6 +1065,13 @@ mod tests {
         let target = fx.path("target.bin");
         create_file(&target, &src_data);
 
+        // Force the slow path: identical size + natural (same-second)
+        // mtimes would take the wire fast path (size+mtime, D11) and never
+        // reach a commit (bit us once already — see the stale-index test).
+        // Backdate the target so the sender scans for real.
+        let t_tgt = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(t_tgt)).unwrap();
+
         // Forge a v1 index: the old header layout (68 bytes) with plausible
         // content. Whatever its claims, a v2 reader must refuse it.
         let mut v1 = Vec::new();
