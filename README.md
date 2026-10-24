@@ -280,6 +280,13 @@ the next run of an unchanged file shows
 Deleting the index file (or the file itself, whose orphaned index is cleaned
 up automatically) always falls back to a full cold scan.
 
+Two known limitations: a file that is **open for writing on the receiver**
+(antivirus scan, media player) blocks the final rename with a sharing
+violation — the error is loud, nothing is corrupted, and a retry after the
+file closes succeeds; and `ffsync` syncs **file content, size, mtime, and
+POSIX mode bits** — other metadata (xattrs, alternate data streams,
+hardlink identity) is out of scope by design (D9).
+
 Progress is single-line: `hashing → diffing → sending/receiving → verifying`,
 with bytes, throughput, and elapsed time per phase. A scan-bound sync says so
 instead of being silently disk-busy/network-idle — that silence in rsync is
