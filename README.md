@@ -12,26 +12,16 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue)](CHANGELOG.md)
 [![Crates.io](https://img.shields.io/crates/v/ffsync)](https://crates.io/crates/ffsync)
 [![docs.rs](https://img.shields.io/docsrs/ffsync)](https://docs.rs/ffsync)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
 
-> **Status: v1.2.0 (stable).** Single-file **and directory-tree** sync between two
-> peers over TLS work end-to-end, including resume after mid-transfer
-> disconnects. Trees sync by metadata triage (D17): only changed files get
-> conversations, synced files adopt the sender's mtime, and a run with
-> nothing changed reads metadata only. Deletions of receiver-only files
-> apply after every transfer succeeded, opt-out with `--no-delete`.
-> Exclude patterns filter tree sessions (§16.7). Parallel per-file
-> conversations (`--parallel K`, §16.8) cut WAN sync time by the connection
-> count; QUIC transport (`--quic`, §17) puts K conversations on one
-> connection with stream-level loss recovery; tree sync carries POSIX
-> mode bits (§16.9, D18). Renamed files are detected and moved with
-> zero wire bytes (D22: the receiver's census of same-size indexed
-> files serves the rename from its own disk). See [roadmap](#roadmap) below.
+> **Status: v1.2.0 (stable).** Single-file and directory-tree sync between two
+> peers over TLS, with resume, excludes, parallel conversations, QUIC,
+> warm starts, and rename detection — all measured, no daemon, no config.
+> Details and per-feature flags: [Using it](#using-it) · history: [CHANGELOG](CHANGELOG.md) · [roadmap](#roadmap).
 
 ## Why
 
@@ -123,7 +113,7 @@ flowchart LR
    last, after every transfer succeeded (`--no-delete` keeps them).
 
 The wire protocol is specified in
-[`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md): 15 frame types,
+[`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md): 17 frame types,
 length-prefixed, no protobuf.
 
 ## Built on
@@ -140,7 +130,7 @@ length-prefixed, no protobuf.
 | rsync (comparison only) | Baseline | The tool this project is measured against, and its delta algorithm is respected, not wrapped |
 
 Design decisions and their alternatives are recorded in
-[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1-D19).
+[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1–D22).
 
 ## Using it
 
@@ -401,7 +391,7 @@ The reasoning is the product; it is all recorded:
 
 - [`concept/Positioning.md`](concept/Positioning.md) — why this exists, the
   niche, why "build around rsync" does not work
-- [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D17 with
+- [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D22 with
   alternatives and rejected options
 - [`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md) — the wire protocol
   (tracks all versions; currently v4), frame by frame
@@ -419,80 +409,26 @@ The reasoning is the product; it is all recorded:
 
 ## Roadmap
 
-- **Done (0.2.0) - transport security (D16):** TLS 1.3 by default,
-  mutual authentication by self-signed-cert fingerprint pinning (TOFU with
-  an out-of-band compare on first contact); `--plaintext` keeps LAN/SSH
-  tunnels. QUIC is deferred until measurement shows parallel streams
-  worthwhile (D13 amendment).
-- **Done (0.2.0) - persistent chunk index (warm restarts, D15):** chunks
-  are content-addressed, so a persisted index turns repeated syncs into
-  stat-only operations. This is the core product insight; rsync rescans
-  everything from scratch every run.
-- **Done (0.3.0) - directory-tree sync (D17):** metadata triage over a
-  tree, sequential per-file conversations over one connection, mtime
-  preservation, deferred deletes with `--no-delete`, empty files/dirs
-  first-class.
-- **Done (0.4.0) - excludes/pattern matching (§16.7):** `--exclude`
-  and `--exclude-from` filter tree sessions; the sender's patterns travel
-  in the protocol so both peers filter identically, and a receiver's own
-  patterns protect paths from deletion. Negation (`!pattern`,
-  first-match-wins) landed in 0.7.1 (§16.7 v0.7.1).
-- **Done (0.5.0) - parallel per-file conversations (§16.8, D13 step
-  1):** `--parallel K` spreads a tree session's conversations over K
-  connections (native threads, no async); measured 3.4×–6.1× on a
-  100-file full transfer at 30 ms simulated RTT
-  (`evaluation/parallel.md`). QUIC (one connection,
-  K streams + connection migration) can now slot in as a transport swap.
-- **Done (0.6.0) - QUIC transport (D13 step 2, §17):** `--quic`
-  puts a whole session on one QUIC connection — tree conversations ride
-  QUIC streams instead of separate TCP connections (one handshake
-  instead of K), stream-level loss recovery replaces the TCP
-  head-of-line block, and connection migration covers changing peer
-  addresses. Same identity/pinning model; the state machines stay
-  sync (tokio at the transport edge only, D3). TCP/TLS-over-TCP stay
-  the default.
-- **Evaluated, not adopted (F2, 2026-10-23) - alternative chunkers:**
-  SeqCDC / MinCDC / MothCDC benchmarked on the real-content corpus with
-  ffsync's own metrics ([`evaluation/chunking.md`](evaluation/chunking.md)):
-  MinCDC is 3.6× faster than FastCDC at equal delta quality, but the scan
-  is disk-bound cold and a few percent of sync wall time, so the win never
-  reaches the user end-to-end; SeqCDC fails edit locality on media (its
-  cut rule is chunk-start-relative, so in-place edits re-anchor every
-  later boundary); MothCDC is byte-identical to MinCDC on our data. The
-  `Chunker` trait keeps swapping cheap; MinCDC is the tracked candidate
-  if fast/warm rescans ever become the bottleneck.
-- **Done (0.7.0) - POSIX mode bits (§16.9, D18; protocol v4):**
-  tree sync carries and applies the sender's permission bits (unix exact,
-  Windows via the read-only attribute); mode never triggers syncs (the
-  size+mtime fast path is untouched), and the tree scan no longer
-  recurses into directory symlinks/junctions (the Windows junction
-  recursion hazard). Xattrs/hardlinks/symlink-as-entry stay out of scope
-  (D9/D18).
-- **Done (0.8.0) - small-file adaptive chunking (D19):** CDC parameters
-  are a pure function of file size — below 16 MiB the F1-sweep config
-  (16 KiB/64 KiB/256 KiB), otherwise the shipped defaults. Localized
-  edits to small files stop dragging whole large chunks to the wire
-  (size-ladder sweep: 18.09% → 4.14% delta on an 8 MiB source archive);
-  large files chunk byte-identically to before (indexes stay valid).
-  HELLO's existing `cdc_min/avg/max` fields carry the values (wire
-  layout unchanged); the chunk index records them (`FFSYIX02`) and warm
-  starts require a parameter match.
-- **Closed (D9 amendment, 2026-10-23) - the metadata remainder:**
-  symlink-as-entry, hardlinks, and xattrs are explicitly out of scope with
-  recorded reasoning (see D9 in `concept/Design Decisions.md`); the
-  follow-or-warn symlink policy and POSIX mode bits are the shipped
-  metadata story. D9's deferred metadata list is now empty.
-- **Done (1.0.0, post-release) - hardening regressions in CI (PR #15):**
-  Windows long-path tree sync (>260 chars) and a real-socket dry-run E2E
-  now run on every push; unix commits fsync the parent directory after
-  the rename.
-- **Done (post-1.0) - eager diff (D8, §9.2/§16.11):** `--eager` streams
-  chunk DATA during the manifest exchange, bounded by the position gate
-  (over-send 0 bytes in every paired run; 18–33% faster at 0 ms RTT,
-  12–18% at 30 ms). Landed for single-file first (PR #16), then tree
-  sessions including `--parallel` (PR #18): TREE_BEGIN bit 7, receiver
-  mirrors only on its own opt-in, a declining tree receiver converges
-  lazily.
+Shipped, one line each (full notes in the
+[CHANGELOG](CHANGELOG.md), decisions in
+[`concept/Design Decisions.md`](concept/Design%20Decisions.md)):
+
+- **0.2** TLS 1.3 with TOFU fingerprint pinning (D16); persistent per-file chunk index — repeated syncs become stat-only (D15).
+- **0.3** Directory-tree sync: metadata triage, per-file conversations, mtime preservation, deferred deletes (D17).
+- **0.4** Exclude patterns, sender-authoritative (§16.7); negation landed in 0.7.1.
+- **0.5** Parallel per-file conversations, `--parallel K`: measured 3.4×–6.1× at 30 ms RTT (§16.8).
+- **0.6** QUIC transport: K conversations on one connection, stream-level loss recovery (§17).
+- **0.7** POSIX mode bits ride tree sync (D18); small-file adaptive chunking (D19).
+- **0.8** Dry-run preview — zero-mutation session rehearsal (D20).
+- **1.0** The 1.0-prep hardening (commit durability, strict HELLO flags, long paths).
+- **1.1** Eager diff, single-file and tree: 18–33% faster at 0 ms RTT (D8, §9.2/§16.11); warm-started `--from` syncs (D21).
+- **1.2** Rename detection: renamed files move with zero wire bytes (D22).
+
+**Deliberately not planned** (positioning, D9): daemon/continuous sync
+(Syncthing's job), cloud remotes (rclone's job), xattrs/hardlinks,
+GUI, config files. Evaluated and rejected on measurement: alternative
+chunkers (F2), directory-mtime fast paths, write coalescing (D7) —
+recorded with reasoning in the design docs.
 
 ## License
 
