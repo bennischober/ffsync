@@ -556,6 +556,7 @@ const TREE_FLAG_KNOWN: u16 = crate::tree::TREE_FLAG_CHECKSUM
     | TREE_FLAG_PARALLEL
     | TREE_FLAG_METADATA
     | TREE_FLAG_NEGATION
+    | crate::tree::TREE_FLAG_EAGER
     | crate::tree::TREE_FLAG_DRY_RUN;
 
 impl TreeBegin {

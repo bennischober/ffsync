@@ -267,6 +267,12 @@ impl TreeManifest {
 /// the layout it gates.
 pub const TREE_FLAG_CHECKSUM: u16 = 1 << 0; // D11 tree-wide: no fast path
 pub const TREE_FLAG_NO_DELETE: u16 = 1 << 1; // §16.5 opt-out
+/// §16.8-adjacent eager opt-in (D8/§9.2 extended to trees): the sender's
+/// TREE_BEGIN announces the offer; the receiver mirrors it iff IT opted in
+/// with its own --eager — then every per-file conversation runs the §9.2
+/// eager machinery (position gate, hash-keyed pre-plan DATA buffer). A
+/// receiver that declined still converges (lazy), same as single-file.
+pub const TREE_FLAG_EAGER: u16 = 1 << 7;
 /// §16.10 dry-run: preview session — triage runs, conversations and
 /// deletions do not; the receiver reports what WOULD happen.
 pub const TREE_FLAG_DRY_RUN: u16 = 1 << 6;

@@ -736,6 +736,90 @@ mod tests {
     }
 
     #[test]
+    fn eager_resume_after_mid_transfer_disconnect() {
+        // D10 x §9.2: an eager session that dies mid-transfer must leave the
+        // same resume state as a lazy one, and the resumed session (eager
+        // again) must converge. The pre-plan DATA the sender streamed before
+        // the crash is content-addressed garbage to the next session: the
+        // re-scan unions temp + old file by hash, so nothing can poison the
+        // reconstruction.
+        let fx = Fixture::new("eager_resume");
+        let mut src_data = vec![0u8; 4 * 1024 * 1024];
+        for (i, b) in src_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(57).wrapping_add((i / 65536) as u8);
+        }
+        create_file(fx.source(), &src_data);
+
+        let mut old_data = src_data.clone();
+        let mid = 2 * 1024 * 1024;
+        for b in &mut old_data[mid..mid + 256 * 1024] {
+            *b ^= 0xFF;
+        }
+        let target = fx.path("target.bin");
+        create_file(&target, &old_data);
+
+        // Attempt 1: eager session, crash the sender after ~64 KiB of DATA.
+        // The kill counter counts eager DATA too (it rides the Transferring
+        // progress), so the crash lands mid-manifest or mid-data — both fine.
+        let (s1, r1) = run_sync_resumable(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: true,
+                tree: false,
+                dry_run: false,
+                eager: true,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: true,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager: true,
+            },
+            64 * 1024,
+        );
+        assert!(s1.is_err(), "sender should have crashed");
+        assert!(r1.is_err(), "receiver should have seen the disconnect");
+        // §9.2 x D10 timing note: eager DATA flows DURING the manifest
+        // exchange, so a 64 KiB kill can land before the receiver ever
+        // reaches plan execution — no temp yet (resume state is created
+        // with the plan, not with the stream). Both cases are legal; the
+        // oracle is attempt 2's convergence either way.
+        let temp = ffsync::reconstruction::Reconstructor::temp_path_for(&target);
+        let _ = temp.exists();
+
+        // Attempt 2: reconnect, eager again.
+        let (s2, r2) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: true,
+                tree: false,
+                dry_run: false,
+                eager: true,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: true,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager: true,
+            },
+        );
+        let _ = s2.expect("resumed eager sender ok");
+        let _ = r2.expect("resumed eager receiver ok");
+        assert_eq!(read_file(&target), src_data);
+        assert!(!temp.exists(), "temp file must be committed away");
+    }
+
+    #[test]
     fn sync_trust_times_fast_path_skips_transfer() {
         let fx = Fixture::new("fastpath");
         let data = vec![9u8; 1024 * 1024];

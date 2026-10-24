@@ -833,6 +833,26 @@ Old peers reject the unknown bit loudly at TREE_BEGIN decode (§16.2
 strict flag policy) — the same failure shape as every other flag-gated
 feature.
 
+### 16.11 Eager diff in tree sessions (v1.0.x work, D8 extended)
+
+`--eager` in tree mode is a TREE_BEGIN flag bit (bit 7,
+`TREE_FLAG_EAGER`), announced by the sender. The receiver mirrors the bit
+in its own TREE_BEGIN **iff it also opted in with its own `--eager`** —
+unlike the mirrored metadata/negation/dry-run bits, eager is an opt-in,
+not a session property: a receiver must never accept pre-plan DATA it
+did not agree to buffer. Eager is active for the whole session iff both
+peers set the bit; every per-file conversation (sequential §16.4 and
+parallel §16.8 workers alike) then runs the single-file §9.2 machinery
+inside the normal conversation frame order — the position gate, the
+hash-keyed pre-plan DATA buffer with its 64 MiB cap, and the
+offer-dedup contract (§9.2) are reused unchanged; no new frame types.
+
+A declining receiver converges lazily (silent fallback, same as the
+single-file offer), so mixed-version pairs and opt-out pairs stay
+compatible. The flag joins `TREE_FLAG_KNOWN`; old peers reject it loudly
+at decode — correct, since a peer that cannot parse bit 7 must not be
+asked to interpret conversations that ride it.
+
 ### 16.9 File metadata: POSIX mode bits (v4, D9 amendment)
 
 **Scope decision (D9 amendment, 2026-10-23).** Tree sync gains one metadata

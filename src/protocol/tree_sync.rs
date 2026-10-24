@@ -109,6 +109,12 @@ pub struct TreeSendRequest {
     /// deletion count), and never writes. Old peers reject the unknown
     /// TREE_BEGIN flag bit loudly (strict decode, §16.2).
     pub dry_run: bool,
+    /// §9.2 eager diff, tree-wide (D8 extended to trees): announced in
+    /// TREE_BEGIN (TREE_FLAG_EAGER); the receiver mirrors it iff IT also
+    /// opted in. Active only when both peers set the bit — every per-file
+    /// conversation then runs the single-file eager machinery. A declining
+    /// receiver converges lazily (same silent fallback as single-file).
+    pub eager: bool,
     /// Opens worker connection `index` (1..K−1) to the peer. The CLI
     /// supplies the closure (TCP connect + TLS); the state machine stays
     /// transport-agnostic. Called from multiple worker threads — Arc-shared,
@@ -136,6 +142,12 @@ pub struct TreeReceiveRequest {
     /// runs triage only — no conversations, no deletes, no writes; it
     /// reports what would happen instead.
     pub dry_run: bool,
+    /// The receiver's own §9.2 eager opt-in: it must NOT be derived from the
+    /// sender's TREE_BEGIN (mirroring an offer we never made would stream
+    /// pre-plan DATA we never agreed to buffer). Eager activates only when
+    /// the sender offered AND we opted in — then the receiver mirrors the
+    /// bit in its TREE_BEGIN and its conversations run eager.
+    pub eager: bool,
 }
 
 /// Object-safe read+write stream (worker connections come back as these).
@@ -273,6 +285,7 @@ fn run_sender_conversation<S>(
     root: &Path,
     rel: &str,
     checksum: bool,
+    eager: bool,
     pipeline: &crate::chunking::PipelineConfig,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<SyncOutcome, SyncError>
@@ -296,7 +309,7 @@ where
         force_checksum: checksum,
         tree: true,
         dry_run: false, // per-file conversations never preview (§16.10 gates the session)
-        eager: false,
+        eager,
     };
     // The sender's mode needs no wire field of its own: the receiver reads
     // it from the TREE_BEGIN manifest entry for this rel_path (§16.9) —
@@ -377,6 +390,10 @@ where
         crate::tree::TREE_FLAG_DRY_RUN
     } else {
         0
+    } | if request.eager {
+        crate::tree::TREE_FLAG_EAGER
+    } else {
+        0
     };
 
     // ---- TREE_BEGIN exchange ----
@@ -395,6 +412,10 @@ where
     // sender never deletes. The receiver combines both sides' flags (see
     // tree_receive); here the variable is only used for the record.
     let _ = request.no_delete || (peer_begin.flags & TREE_FLAG_NO_DELETE) != 0;
+    // §9.2 eager (tree-wide): active iff we offered AND the receiver opted
+    // in (its mirror bit). A declining receiver keeps every conversation
+    // lazy — same silent fallback as single-file mode.
+    let eager_active = request.eager && (peer_begin.flags & crate::tree::TREE_FLAG_EAGER) != 0;
 
     // ---- Triage (local, §16.3) ----
     // The sender's conversation set: files to Sync/Transfer, plus kind
@@ -485,6 +506,7 @@ where
                 &request.root,
                 rel,
                 checksum,
+                eager_active,
                 pipeline,
                 &mut |p| {
                     progress(TreeProgress::FileProgress {
@@ -570,6 +592,7 @@ where
                         &root,
                         rel,
                         checksum,
+                        eager_active,
                         &pipeline,
                         &mut |p| {
                             let _ = tx.send((rel_c.clone(), p));
@@ -607,6 +630,7 @@ where
                 &request.root,
                 rel,
                 checksum,
+                eager_active,
                 pipeline,
                 &mut |p| {
                     progress(TreeProgress::FileProgress {
@@ -735,6 +759,12 @@ where
     // §16.10: mirror the sender's dry-run bit — the session is a preview
     // or it is not, on both peers.
     let dry_run = (peer_begin.flags & crate::tree::TREE_FLAG_DRY_RUN) != 0;
+    // §9.2 eager (tree-wide): active iff the sender offered (their
+    // TREE_BEGIN bit) AND we opted in ourselves (request.eager). The
+    // mirror bit in OUR TREE_BEGIN below exists only so the sender's
+    // conversations go eager too; the buffer cap and decline semantics
+    // are the single-file ones (§9.2).
+    let eager = (peer_begin.flags & crate::tree::TREE_FLAG_EAGER) != 0 && request.eager;
     let flags = if request.force_checksum {
         TREE_FLAG_CHECKSUM
     } else {
@@ -757,6 +787,10 @@ where
         0
     } | if dry_run {
         crate::tree::TREE_FLAG_DRY_RUN
+    } else {
+        0
+    } | if eager {
+        crate::tree::TREE_FLAG_EAGER
     } else {
         0
     };
@@ -890,6 +924,7 @@ where
         struct ConvCtx<'a> {
             root: &'a Path,
             checksum: bool,
+            eager: bool,
             pipeline: &'a crate::chunking::PipelineConfig,
         }
         fn run_one<S: Read + Write>(
@@ -904,6 +939,7 @@ where
             let ConvCtx {
                 root,
                 checksum,
+                eager,
                 pipeline,
             } = *ctx;
             progress(TreeProgress::FileStart(idx, total));
@@ -928,7 +964,7 @@ where
                 // None (apply nothing) when the session has no metadata section
                 // or the entry is absent — the lookup is by rel_path.
                 apply_mode: sender_mode,
-                eager: false,
+                eager,
             };
             let rel_c = rel.to_string();
             let outcome = match sync::receive(stream, &recv_req, pipeline, &mut |p| {
@@ -954,6 +990,7 @@ where
             let ctx = ConvCtx {
                 root: &request.root,
                 checksum,
+                eager,
                 pipeline,
             };
             for (idx, rel) in conversation_paths.iter().enumerate() {
@@ -1044,6 +1081,7 @@ where
                 first_error: std::sync::Arc<std::sync::Mutex<Option<SyncError>>>,
                 root: PathBuf,
                 checksum: bool,
+                eager: bool,
                 /// §16.9: the sender's per-entry modes (empty when the session
                 /// has no metadata section).
                 sender_modes: std::collections::HashMap<String, u32>,
@@ -1065,6 +1103,7 @@ where
                 first_error: std::sync::Arc::clone(&first_error),
                 root: request.root.clone(),
                 checksum,
+                eager,
                 sender_modes: sender_modes_of(&peer_manifest, metadata),
                 pipeline: pipeline_clone(pipeline),
             });
@@ -1121,6 +1160,7 @@ where
                             &ConvCtx {
                                 root: &shared.root,
                                 checksum: shared.checksum,
+                                eager: shared.eager,
                                 pipeline: &shared.pipeline,
                             },
                             &mut s,
@@ -1242,6 +1282,7 @@ where
                             &ConvCtx {
                                 root: &request.root,
                                 checksum,
+                                eager,
                                 pipeline,
                             },
                             stream,

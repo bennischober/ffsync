@@ -264,13 +264,14 @@ sync to a new peer can be rehearsed on real data; both peers print
 "WOULD CHANGE (dry run - nothing was written)" and the would-delete
 counts. Old ffsync peers reject the flag loudly instead of syncing.
 
-**Eager diff** (`--eager`, single-file, both peers): start moving bytes
+**Eager diff** (`--eager`, single-file and tree, both peers): start moving bytes
 during the scan instead of after it. The sender streams chunk DATA as soon
 as the receiver's manifest proves the chunk missing (bounded by a position
 gate — over-send stayed 0 bytes in the paired bench runs), overlapping the
 scan and transfer phases: 18-33% faster at 0 ms RTT, 12-18% faster at
-30 ms RTT on the 128 MiB modified fixture. Both peers need the flag; a
-peer that declines fails the session loudly instead of hanging.
+30 ms RTT on the 128 MiB modified fixture. Both peers need the flag; in tree mode a
+declining receiver converges lazily instead. A single-file peer that
+declines fails the session loudly instead of hanging.
 
 Flags: `--checksum` disables the mtime/size fast path *and* the warm-start
 index (rsync `-c` semantics - always compare chunk roots; in tree mode it
