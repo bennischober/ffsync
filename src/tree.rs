@@ -1,6 +1,6 @@
 //! Directory-tree sync (D17): tree scan, wire manifest codec, and triage.
 //!
-//! A tree session (protocol v3, `concept/Protocol v0.1.md` §16) exchanges
+//! A tree session (protocol v3, `concept/Protocol.md` §16) exchanges
 //! both peers' tree manifests, triages locally and deterministically, then
 //! runs the existing per-file state machines sequentially inside a
 //! TREE_BEGIN/TREE_END envelope.

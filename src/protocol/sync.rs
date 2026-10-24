@@ -1,4 +1,4 @@
-//! The two-peer sync state machines (`concept/Protocol v0.1.md` §5–§8).
+//! The two-peer sync state machines (`concept/Protocol.md` §5–§8).
 //!
 //! Both sides are plain functions over a generic duplex stream so the same
 //! code runs over TCP, over an in-memory duplex pair, or inside tests.

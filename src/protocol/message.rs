@@ -1,4 +1,4 @@
-//! Typed protocol frames (`concept/Protocol v0.1.md` §3–§4).
+//! Typed protocol frames (`concept/Protocol.md` §3–§4).
 //!
 //! Each frame type maps to a struct with an explicit binary encoding on top
 //! of the [`framing`] envelope. Encoding is hand-rolled (D1: no protobuf).
@@ -30,7 +30,7 @@ impl Role {
     }
 }
 
-/// HELLO flags (`concept/Protocol v0.1.md` §4).
+/// HELLO flags (`concept/Protocol.md` §4).
 pub const FLAG_TRUST_TIMES: u16 = 1 << 0;
 pub const FLAG_EAGER: u16 = 1 << 1; // §9.2 (designed, unimplemented): must be 0 on the wire; rejected loudly
 pub const FLAG_RESUMING: u16 = 1 << 2;

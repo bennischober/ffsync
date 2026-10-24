@@ -42,8 +42,8 @@ Design documents (read before making architectural changes):
   "build around rsync" alternatives
 - `concept/Design Decisions.md` — recorded decisions with reasoning and
   alternatives; add new decisions there, do not silently change old ones
-- `concept/Protocol v0.1.md` — the wire protocol (named for its first
-  release; it tracks the protocol across versions — currently v4: v3 added
+- `concept/Protocol.md` — the wire protocol spec (one living document;
+  it tracks the protocol across versions — currently v4: v3 added
   tree sync §16, v4 added the metadata/mode section §16.9): framing,
   handshake, manifest/plan/data flow, verification, resume, tree sync,
   QUIC. The implementation follows it; deviations are protocol bugs unless
@@ -55,18 +55,14 @@ Design documents (read before making architectural changes):
   the §6.2 position gate (over-send 0 in paired runs; both peers opt in;
   single-file decline fails loudly, tree decline falls back to lazy). HELLO flag decode rejects unknown bits (strict
   codec).
-- `concept/Deep Research Digest.md` — what the two deep-research runs
-  (architecture + P2P connectivity, saved alongside as markdown) got right,
-  and what we rejected; its follow-ups F1–F4 are all closed
+- `concept/Deep Research Digest.md` — what the two inception-phase
+  deep-research runs (architecture + P2P connectivity) got right, and what we
+  rejected; its follow-ups F1–F4 are all closed. The raw research documents
+  were removed from the repo on 2026-10-24 (recoverable from git history).
 - `concept/File Synchronisation Workflow.md` — the four-phase sync pipeline
   (shallow → medium → deep diff, then pipelined transfer and reconstruction)
 - `concept/File Reconstruction.md` — out-of-place reconstruction with a
   pre-allocated temp file and atomic rename
-- `concept/P2P Connection Challenge Resolution.md` — raw NAT-traversal
-  research (STUN/TURN/ICE); the basis for keeping P2P out of scope (D9)
-- `concept/Designing a High-Performance, Resilient File Synchronization
-  Protocol in Rust_ ….md` — raw architecture research (QUIC, BLAKE3, CDC,
-  zstd) that fed the design docs
 - `evaluation/chunking.md` — measured performance of chunking approaches and
   the reasoning behind the current pipeline design
 - `evaluation/memory.md` — measured memory footprint of the sync paths

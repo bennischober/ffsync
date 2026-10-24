@@ -1,4 +1,4 @@
-//! Wire framing for the ffsync v0.1 protocol (`concept/Protocol v0.1.md` §3).
+//! Wire framing for the ffsync v0.1 protocol (`concept/Protocol.md` §3).
 //!
 //! Frame layout: `type: u8 | payload_len: u32 (LE) | payload`.
 //! All integers are little-endian. Maximum payload is 64 MiB. Unknown frame

@@ -176,7 +176,7 @@ until the core engine is proven. Deferring QUIC is a scope decision, not a
 rejection; connection migration alone makes it the right fit for the
 "friend over the internet" scenario v0.1 cannot serve.
 
-**Wire mapping:** the framing in `concept/Protocol v0.1.md` §3 is
+**Wire mapping:** the framing in `concept/Protocol.md` §3 is
 transport-agnostic by construction; §14.4 reserves parallel streams, and the
 digest's F3 registers the v0.2 evaluation (quinn vs. iroh vs. ant-quic).
 
@@ -268,7 +268,7 @@ buffers pre-plan DATA by hash (sender dedups by hash; duplicates ignored as
 today) under a fixed 64 MiB cap; overflow is a loud ERROR and a lazy retry,
 not a spill file. Writes happen in arrival order under eager (D10's
 locals-first ordering is a lazy-mode property; resume is unaffected because
-the temp re-scan is content-addressed). Full design: `Protocol v0.1.md`
+the temp re-scan is content-addressed). Full design: `concept/Protocol.md`
 §9.2. Implementation is deliberately deferred until the bench harness grows
 an eager-mode simulation cell — D8's own doctrine: decided on data, and the
 cell will measure over-send and wall-time against lazy at 0/30 ms RTT.
@@ -425,7 +425,7 @@ hash falls out of the chunking pipeline for free (D5), the paranoid mode is
 also free — users pay only in scan time, never in an extra pass.
 
 **Wire mapping:** a `trust_times` flag in the protocol handshake
-(`concept/Protocol v0.1.md` §4). Protocol-level framing decisions (little-
+(`concept/Protocol.md` §4). Protocol-level framing decisions (little-
 endian framing, exact-match rule) are recorded there and in D12.
 
 ## D12 — Exact (hash, length) matching for local chunk reuse

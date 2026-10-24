@@ -1,6 +1,9 @@
 # Wire Protocol
 
-Specification for the ffsync wire protocol. Written for v0.1 (protocol
+Specification for the ffsync wire protocol. (Named `Protocol v0.1.md`
+until 2026-10-24 — the filename carried the first release's version; the
+file itself tracks the protocol across versions and now lives under its
+version-neutral name.) Written for v0.1 (protocol
 version 1: **one file pair, two peers, one TCP connection**); it tracks the
 protocol across versions — changes ship with a `VERSION` bump and are
 recorded in the relevant sections. Current version: **4** (v0.2: HELLO
