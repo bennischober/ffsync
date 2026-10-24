@@ -4,9 +4,14 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-10-24
 
 ### Added
+
+- **Hardening regressions in CI (PR #15):** Windows long-path tree sync
+  (>260 chars) and a real-socket dry-run E2E test run on every push; unix
+  commits fsync the target's parent directory after the rename (strict
+  POSIX durability).
 
 - **Eager diff in tree sessions (D8, §16.11):** `--eager` now extends to
   tree sync: TREE_BEGIN flag bit 7, mirrored only on the receiver's own
