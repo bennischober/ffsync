@@ -86,6 +86,7 @@ fn run_tree_session_ex(
         sender_excludes,
         receiver_excludes,
         1,
+        false,
     )
 }
 
@@ -100,6 +101,7 @@ fn run_tree_session_full(
     sender_excludes: &[&str],
     receiver_excludes: &[&str],
     parallel: u16,
+    dry_run: bool,
 ) -> (
     Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
     Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
@@ -131,7 +133,7 @@ fn run_tree_session_full(
                     tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
                     Ok(Box::new(tcp))
                 }),
-                dry_run: false,
+                dry_run,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -152,7 +154,7 @@ fn run_tree_session_full(
             no_delete,
             excludes: send_excludes,
             parallel,
-            dry_run: false,
+            dry_run,
             connect_worker: std::sync::Arc::new(move |_index: u16| {
                 let tcp = std::net::TcpStream::connect(send_addr)
                     .map_err(|e| std::io::Error::other(format!("cannot connect worker: {e}")))?;
@@ -675,7 +677,16 @@ fn tree_parallel_converges_and_reports_all_files() {
     sender.write("sub/nested.bin", b"nested");
     let receiver = TempTree::new("par_conv_r");
 
-    let (s, r) = run_tree_session_full(sender.path(), receiver.path(), false, false, &[], &[], 4);
+    let (s, r) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        4,
+        false,
+    );
     let s = s.unwrap_or_else(|e| panic!("sender failed: {e}"));
     let r = r.unwrap_or_else(|e| panic!("receiver failed: {e}"));
     assert_eq!(s.files, 13);
@@ -693,7 +704,16 @@ fn tree_parallel_converges_and_reports_all_files() {
     }
     assert_eq!(receiver.read("sub/nested.bin").unwrap(), b"nested");
     // Second session: nothing changed → everything in sync (warm path).
-    let (s2, r2) = run_tree_session_full(sender.path(), receiver.path(), false, false, &[], &[], 4);
+    let (s2, r2) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        4,
+        false,
+    );
     let s2 = s2.expect("sender ok");
     let r2 = r2.expect("receiver ok");
     assert_eq!(s2.files, 0, "second session has no conversations");
@@ -788,7 +808,16 @@ fn tree_parallel_fail_closed_on_worker_error() {
         let _ = std::fs::remove_file(&vanish_target);
     });
 
-    let (s, r) = run_tree_session_full(sender.path(), receiver.path(), false, false, &[], &[], 2);
+    let (s, r) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        2,
+        false,
+    );
     let _ = vanish.join();
     // Either the session failed on the vanished file, or the racer landed
     // late and everything synced — but if it failed, NOTHING was deleted.
@@ -1014,6 +1043,7 @@ fn tree_exclude_negation_converges() {
         &excludes, // sender patterns (rule the session)
         &[],       // receiver patterns (delete guard only)
         1,
+        false,
     );
     let s = s.expect("sender ok");
     let r = r.expect("receiver ok");
@@ -1041,6 +1071,7 @@ fn tree_exclude_negation_converges() {
         &excludes2,
         &["*.log"], // receiver protects all its *.log paths
         1,
+        false,
     );
     let _s2 = s2.expect("sender2 ok");
     let r2 = r2.expect("receiver2 ok");
@@ -1067,8 +1098,87 @@ fn tree_negation_free_session_interoperates() {
         &excludes,
         &[],
         1,
+        false,
     );
     let s = s.expect("sender ok");
     let _r = r.expect("receiver ok");
     assert_eq!(s.files, 1);
+}
+
+/// Windows long paths (>260 chars) — the 1.0 readiness assessment verified
+/// this once by hand (PowerShell E2E, later deleted); this test pins it in
+/// CI: a full tree session whose receiver target path exceeds MAX_PATH,
+/// byte-verified. The `\\?\` prefix is NOT used: the tree scan and commit
+/// paths must work without it (std handles long paths on modern Windows).
+#[test]
+fn tree_long_paths_over_260_chars_converge() {
+    let sender = TempTree::new("longpath_send");
+    let receiver = TempTree::new("longpath_recv");
+    // Three 80-char segments under the temp dir push the FILE path well
+    // past 260 on Windows (temp root alone is ~40-60 chars).
+    let seg = "l".repeat(80);
+    let deep_rel = format!("{seg}/{seg}/{seg}/file.bin");
+    let data = vec![42u8; 3 * 1024 * 1024];
+    sender.write(&deep_rel, &data);
+    let (s, r) = run_tree_session(sender.path(), receiver.path(), false, false);
+    let s = s.expect("sender ok");
+    let r = r.expect("receiver ok");
+    assert_eq!(s.files, 1);
+    assert_eq!(r.files, 1);
+    assert_eq!(receiver.read(&deep_rel).unwrap(), data);
+    // And the receiver-side full path really is long (guards against a
+    // silently-shortened temp dir).
+    let p = receiver
+        .0
+        .join(deep_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+    assert!(
+        p.to_string_lossy().len() > 260,
+        "test setup must exceed MAX_PATH: {}",
+        p.display()
+    );
+}
+
+/// Real-TCP dry-run E2E (§16.10): the loopback tests (in-memory duplex
+/// pipes) cover the state machines; this covers the session over real
+/// sockets — TREE_BEGIN bit 6 exchange, triage-only receiver, would-delete
+/// report — and pins the zero-mutation guarantee on real directories.
+#[test]
+fn tree_dry_run_reports_without_mutating_over_real_tcp() {
+    let sender = TempTree::new("dryrun_send");
+    let receiver = TempTree::new("dryrun_recv");
+    sender.write("a.bin", &vec![7u8; 512 * 1024]);
+    sender.write("sub/b.bin", &vec![7u8; 512 * 1024]);
+    // Receiver-only stale file: the would-delete report must COUNT it,
+    // not remove it.
+    receiver.write("stale.bin", b"old content");
+    // Sender-only directory: triage CreateDir must NOT create it in a
+    // preview (the triage section mutates in a real session).
+    let (s, r) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        1,
+        true,
+    );
+    let s = s.expect("sender ok");
+    let r = r.expect("receiver ok");
+    // Preview numbers: 2 conversations would run, 1 stale file would go.
+    assert_eq!(s.files, 2, "sender's triage counts the conversations");
+    assert_eq!(r.deleted, 1, "receiver reports the WOULD-delete");
+    assert_eq!(r.deleted_bytes, 11);
+    // Zero mutation on the receiver:
+    assert_eq!(receiver.read("stale.bin").unwrap(), b"old content");
+    assert!(!receiver.0.join("a.bin").exists());
+    assert!(
+        !receiver.0.join("sub").exists(),
+        "CreateDir must not run in a preview"
+    );
+    // And a real session right after converges (the preview poisoned nothing).
+    let (s2, r2) = run_tree_session(sender.path(), receiver.path(), false, false);
+    assert!(s2.is_ok() && r2.is_ok());
+    assert_eq!(receiver.read("a.bin").unwrap(), vec![7u8; 512 * 1024]);
+    assert_eq!(receiver.read("stale.bin"), None, "real session deletes it");
 }
