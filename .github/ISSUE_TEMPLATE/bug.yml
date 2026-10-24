@@ -1,0 +1,65 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Sync bugs can lose data — if this report
+        involves data loss or corruption, say so prominently in the
+        description. Security issues do NOT belong here: see SECURITY.md
+        for private reporting.
+  - type: input
+    id: version
+    attributes:
+      label: ffsync version
+      description: Output of `ffsync --version` — on BOTH peers if they differ
+      placeholder: ffsync 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform(s)
+      options:
+        - Windows x64
+        - Windows ARM64
+        - Linux x64
+        - Linux ARM64
+        - other/mixed
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - TCP (TLS, default)
+        - QUIC
+        - TCP (--plaintext)
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Sync mode
+      options:
+        - single file
+        - directory tree
+        - dry run
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Include both sides' console output if available. Fingerprints are public keys — no need to redact them.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Exact commands on both sides (send/receive flags, file/tree description)
+    validations:
+      required: false
