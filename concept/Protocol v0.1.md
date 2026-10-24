@@ -147,7 +147,11 @@ connection after flushing; the peer must treat the transfer as failed.
 
 Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2 — designed below;
 still must be 0 on the wire until §9.2 is implemented, and a peer MUST
-reject a HELLO that sets it), bit 2 `resuming` (informational, §10).
+reject a HELLO that sets it), bit 2 `resuming` (informational, §10), bit 3
+`dry_run` (§7.1, implemented in v0.8 work: the sender offers a preview
+session; the receiver accepts with the DRY_RUN_ACK marker before any
+manifest/plan traffic). Unknown bits are rejected at decode (strict
+codec).
 
 ## 5. Scan and manifest exchange (cold start)
 
@@ -422,26 +426,24 @@ origin, D5):
 6. **Parallel data streams** for long fat networks (§14.4): how many, how
    scheduled.
 
-## 14. Extension points (reserved, not implemented)
+## 14. Extension points — status
 
-1. **Persistent index (v0.2):** peers may answer HELLO with an INDEX frame
-   carrying a manifest + root hash from a previous run, valid only if the
-   on-disk file's current size+mtime still match what the index recorded
-   (cheap stat; same trust level as the §4 fast path). Turns repeated syncs
-   into near-zero-scan operations — the core product insight
-   (`Positioning.md`).
-2. **Eager diff** (§9.2).
-3. **TLS** via rustls (decided: D16 — self-signed certs, mutual TOFU
-   fingerprint pinning, wraps the stream before frame 1; framing unchanged).
-   See also the D13 amendment for the QUIC sequencing.
-4. **Parallel chunk streams** (multiple TCP connections or QUIC streams) to
-   beat single-flow window limits on high-BDP paths.
-5. **Hash truncation:** BLAKE3 supports shorter outputs; truncating wire hashes
-   saves bandwidth at a quantifiable collision cost. Only with explicit
-   analysis; v0.1 always sends 32 bytes.
-6. **Tree sync:** implemented in v0.3 — §16 (D17). Open remains: parallel
-   per-file streams for high-BDP paths (needs QUIC or a conversation
-   multiplexer; deferred with D13's QUIC answer).
+1. **Persistent index:** IMPLEMENTED (D15, v0.4 — `FFSYIX02` sidecar
+   files; the INDEX-frame idea was dropped in favor of the on-disk
+   sidecar, same trust model: size+mtime+CDC-parameter validation).
+2. **Eager diff:** DESIGNED, not implemented (§9.2; gated on the
+   eager-mode bench cell — D8's doctrine).
+3. **TLS:** IMPLEMENTED (D16, v0.5 — rustls TLS 1.3, mutual TOFU
+   fingerprint pinning; QUIC followed in v0.6, §17).
+4. **Parallel chunk streams:** IMPLEMENTED (v0.7, §16.8 — per-file
+   conversations over K TCP connections; on QUIC they ride streams,
+   §17).
+5. **Hash truncation:** reserved, not implemented. BLAKE3 supports
+   shorter outputs; truncating wire hashes saves bandwidth at a
+   quantifiable collision cost. Only with explicit analysis; the wire
+   always sends 32 bytes.
+6. **Tree sync:** implemented in v0.3 — §16 (D17), including the
+   parallel per-file streams item above.
 
 ## 15. Worked example (3-chunk toy file)
 
