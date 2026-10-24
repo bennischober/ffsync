@@ -4,6 +4,58 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-10-24
+
+### Added
+
+- **Dry-run preview (D20):** `ffsync send --dry-run` previews a session with
+  zero mutation — rsync `-n` semantics. Single-file: the receiver answers the
+  plan with NOT_MODIFIED + DRY_RUN_ACK (would change) or COMMIT_ACK (nothing
+  would change), never creating a temp file or index; the sender skips DATA
+  and VERIFY. Tree: TREE_BEGIN flag bit 6 runs triage only and the delete
+  report counts what would be removed. Peers without the feature (≤0.8.0)
+  reject the offer loudly before anything moves.
+- **Commit durability (§8.3):** every commit flushes the temp file before the
+  atomic rename (`Reconstructor::sync_temp` plus both protocol commit sites)
+  — a crash can no longer leave a renamed-but-empty target.
+- **Strict HELLO flag decoding:** unknown flag bits are rejected at decode
+  (matching TREE_BEGIN's long-standing policy), closing the last
+  silent-bit-tolerance hole.
+
+### Changed
+
+- **D7 flaw 1 — reconstruction I/O:** the reconstructor and the single-file
+  receive loop cache their read-only source handles instead of re-opening the
+  file per chunk: 32 MiB reconstruction ~105 ms → ~50 ms median, 1 GiB
+  −10–15% (Windows bench host, NTFS, seeded fixtures).
+- **D7 flaw 2 — coalesced writes:** implemented, measured, and rejected — no
+  gain (NTFS positional writes are already ~µs-cheap; the run-buffer memcpy
+  outweighs the syscall saving). Reverted; the ledger records the data-backed
+  barrier a retry must clear.
+
+### Fixed
+
+- Documentation drift across spec (§3 frame table, §4 flag register, §9.2
+  eager design, §14 extension-point status), README (status, protocol
+  version, decision-ledger range, known limitations), `src/lib.rs` crate
+  doc, and the bench `--help` string (missing flags, wrong CDC default).
+- The mmap `unsafe` block carries its `SAFETY:` justification.
+- A flaky dry-run loopback test (same-size files with 100 ns-resolution
+  NTFS mtimes could legitimately take the fast path).
+
+### Removed
+
+- Dead code: `message::write_frame` and
+  `Reconstructor::finalize_chunk_root` (−54 lines; the real verification
+  lives inline in `sync::receive`).
+
+### Notes
+
+- The wire protocol stays at VERSION 4: 1.0.0 is the stability milestone
+  (the 1.x compatibility commitment), not a wire change. Remaining roadmap:
+  D8 eager mode (designed, gated on a bench cell) and D7 flaw 2 (open with
+  a documented retry barrier).
+
 ## [0.8.0] - 2026-10-23
 
 ### Added
