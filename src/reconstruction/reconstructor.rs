@@ -128,53 +128,6 @@ impl Reconstructor {
         Ok(())
     }
 
-    /// Finalize: verify the reconstructed file's chunk-tree root and rename.
-    ///
-    /// `expected_root` is the sender's `chunk_root` over its ordered chunk
-    /// list. Verifying requires re-scanning the temp file with the same CDC
-    /// parameters and computing the root over that chunk list — the chunk
-    /// tree is *the* verification identity (see `chunking::chunk_root`).
-    pub fn finalize_chunk_root(
-        self,
-        expected_root: Hash,
-        final_path: &Path,
-        pipeline: &crate::chunking::PipelineConfig,
-        cdc: (usize, usize, usize),
-    ) -> io::Result<()> {
-        use crate::chunking::{Blake3Hasher, ChunkEvent, FastCDCChunker, process_file};
-
-        let temp_path = final_path.with_extension("ffsync-tmp");
-        let rx = process_file(
-            &temp_path,
-            move || FastCDCChunker::new(cdc.0, cdc.1, cdc.2),
-            Blake3Hasher,
-            pipeline,
-        )?;
-        let mut chunks = Vec::new();
-        while let Ok(event) = rx.recv() {
-            if let ChunkEvent::Chunk(c) = event {
-                chunks.push(c);
-            }
-        }
-        // Canonical order (offsets are unique; hash workers race).
-        chunks.sort_by_key(|c| c.offset);
-        let actual_root = crate::chunking::chunk_root(&chunks);
-
-        if actual_root != expected_root {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Reconstructed chunk-root mismatch",
-            ));
-        }
-
-        // Durability (§8.3): flush before the rename.
-        self.temp_file.sync_all()?;
-        drop(self.temp_file);
-        std::fs::rename(temp_path, final_path)?;
-        Ok(())
-    }
-
     /// Legacy finalize using the standard BLAKE3 file hash.
     pub fn finalize<H: Hasher>(
         mut self,
