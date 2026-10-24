@@ -17,7 +17,7 @@ commands.
 
 </div>
 
-> **Status: v0.8.0.** Single-file **and directory-tree** sync between two
+> **Status: v1.0.0 (stable).** Single-file **and directory-tree** sync between two
 > peers over TLS work end-to-end, including resume after mid-transfer
 > disconnects. Trees sync by metadata triage (D17): only changed files get
 > conversations, synced files adopt the sender's mtime, and a run with
