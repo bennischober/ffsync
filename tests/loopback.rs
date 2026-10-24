@@ -1207,10 +1207,15 @@ mod tests {
     #[test]
     fn dry_run_reports_would_change_without_writing() {
         let fx = Fixture::new("dry_run_change");
+        // Different SIZES from the receiver's old file: the size+mtime fast
+        // path is content-blind by design (D11), so same-size files with
+        // same-tick NTFS timestamps (100 ns resolution) would legitimately
+        // fast-path to InSync and make this test flaky. Size differences
+        // make the would-change path deterministic.
         let src_data = vec![7u8; 2 * 1024 * 1024];
         create_file(fx.source(), &src_data);
-        // Receiver's old file differs entirely.
-        let old_data = vec![9u8; 2 * 1024 * 1024];
+        // Receiver's old file differs in size and content.
+        let old_data = vec![9u8; 1024 * 1024 + 4096];
         let target = fx.path("target.bin");
         create_file(&target, &old_data);
         let before = std::fs::metadata(&target).unwrap().modified().unwrap();
