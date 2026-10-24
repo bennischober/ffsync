@@ -1246,6 +1246,7 @@ where
         reconstructor.sync_temp()?;
         clear_readonly_best_effort(&request.path);
         std::fs::rename(&temp_path, &request.path)?;
+        fsync_parent_dir_best_effort(&request.path);
         apply_commit_mode(&request.path, request.apply_mode)?;
         apply_commit_mtime(&request)?;
         // Persist the verified state for the next warm start (D15): the
@@ -1346,6 +1347,7 @@ where
                 drop(reconstructor);
                 clear_readonly_best_effort(&request.path);
                 std::fs::rename(&temp_path, &request.path)?;
+                fsync_parent_dir_best_effort(&request.path);
                 apply_commit_mode(&request.path, request.apply_mode)?;
                 apply_commit_mtime(&request)?;
                 // Persist the committed state (D15): the temp scan above IS
@@ -1468,6 +1470,24 @@ fn clear_readonly_best_effort(path: &Path) {
 
 #[cfg(not(windows))]
 fn clear_readonly_best_effort(_path: &Path) {}
+
+/// Durability (§8.3, unix strict form): after the atomic rename, flush the
+/// parent directory entry so the rename itself survives a crash. On Linux
+/// the file-data fsync before the rename (Reconstructor::sync_temp) makes
+/// the content durable; the rename is journaled, but a directory fsync is
+/// the strict POSIX guarantee for the new name. Windows needs no equivalent
+/// (NTFS metadata journaling covers the rename).
+#[cfg(unix)]
+fn fsync_parent_dir_best_effort(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir_best_effort(_path: &Path) {}
 
 /// Applies the sender's POSIX mode bits to the committed target (§16.9,
 /// tree mode only, BEFORE the mtime write — the D15 index must record the
