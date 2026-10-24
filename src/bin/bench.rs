@@ -17,6 +17,7 @@ use ffsync::chunking::{
     process_file,
 };
 use ffsync::index::FileIndex;
+use ffsync::protocol::sync::SyncOutcome;
 use ffsync::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 use std::collections::{HashMap, HashSet};
@@ -97,6 +98,9 @@ struct BenchConfig {
     disconnect: bool,
     /// Run the warm-start index simulation on the identical scenario (D15).
     warm: bool,
+    /// Eager-diff simulation (D8/§9.2): paired lazy-vs-eager single-file
+    /// sessions over the RTT-modeled duplex.
+    eager: bool,
     /// Run the tree-sync simulation (D17): multi-file fixture, both sides
     /// through the real scan + triage, per-file delta and warm/cold starts.
     tree: bool,
@@ -214,6 +218,9 @@ Options:
   --tree           simulate a directory-tree session (D17): generate a
                    multi-file tree, run both sides' scan + triage, measure
                    per-file delta, session-level fast path, and warm starts
+  --eager          eager-diff simulation (D8/§9.2): paired lazy-vs-eager
+                   single-file sessions over RTT-modeled duplex, reporting
+                   wall time and over-send bytes (use with --rtt-ms)
   --latency        run real in-process duplex tree sessions (the send/
                    receive state machines over in-memory links) and time
                    them per --parallel level
@@ -297,6 +304,7 @@ fn parse_args() -> BenchConfig {
         gen_tree: false,
         rtt_ms: 30,
         parallel_counts: Vec::new(),
+        eager: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -345,6 +353,7 @@ fn parse_args() -> BenchConfig {
             "--warm" => cfg.warm = true,
             "--tree" => cfg.tree = true,
             "--latency" => cfg.latency = true,
+            "--eager" => cfg.eager = true,
             "--gen-tree" => cfg.gen_tree = true,
             "--rtt-ms" => {
                 let value = args
@@ -1518,6 +1527,124 @@ fn run_latency_simulation(cfg: &BenchConfig, _pipeline: &PipelineConfig) -> io::
     Ok(())
 }
 
+/// The D8/§9.2 measurement: paired lazy-vs-eager single-file sessions over
+/// the RTT-modeled duplex (same model as the latency simulation — the point
+/// is the ratio at the same simulated RTT). The receiver starts at the
+/// source state; the sender's desired state is the modified variant, so the
+/// plan has Remote entries and the eager gate has real decisions to make.
+/// Reports: wall time per mode, wire bytes per mode, and over-send
+/// (eager wire bytes - planned minimum).
+fn run_eager_simulation(cfg: &BenchConfig, pipeline: &PipelineConfig) -> io::Result<()> {
+    println!();
+    println!("==== eager diff simulation (D8/§9.2): lazy vs eager ====");
+    let source = cfg.out_dir.join("source_A.bin");
+    let variant = cfg.out_dir.join("variant_modified.bin");
+    if !source.exists() || !variant.exists() {
+        return Err(io::Error::other(
+            "eager simulation needs the fixtures (run without --eager once, or check --out-dir)",
+        ));
+    }
+    let cdc = cdc_params_for_size(fs::metadata(&variant)?.len());
+    let (_, source_chunks) = scan_file(&source, pipeline, cdc)?;
+    let (_, variant_chunks) = scan_file(&variant, pipeline, cdc)?;
+    let delta = compute_delta(&source_chunks, &variant_chunks);
+    let minimum = delta.missing_bytes;
+
+    println!(
+        "fixture: modified variant, {} planned minimum wire bytes, RTT = {} ms",
+        fmt_bytes(minimum),
+        cfg.rtt_ms
+    );
+    println!();
+    println!(
+        "  {:>8} {:>14} {:>12} {:>14}",
+        "mode", "wire bytes", "over-send", "wall time"
+    );
+
+    for (label, eager) in [("lazy", false), ("eager", true)] {
+        let (elapsed, wire) = run_one_eager_session(&source, &variant, cfg.rtt_ms, eager)?;
+        let over = wire.saturating_sub(minimum);
+        println!(
+            "  {:>8} {:>14} {:>12} {:>14}",
+            label,
+            fmt_bytes(wire),
+            fmt_bytes(over),
+            fmt_ms(elapsed)
+        );
+    }
+    Ok(())
+}
+
+/// One single-file session (real send/receive state machines) over the
+/// RTT-modeled duplex. Returns (wall time, total DATA wire bytes).
+fn run_one_eager_session(
+    source: &Path,
+    variant: &Path,
+    rtt_ms: u64,
+    eager: bool,
+) -> io::Result<(Duration, u64)> {
+    use ffsync::protocol::sync::{ReceiveRequest, SendRequest, receive, send};
+
+    let target = variant.with_file_name(format!("eager_target_{}.bin", usize::from(eager)));
+    let _ = fs::remove_file(&target);
+    fs::copy(source, &target)?;
+
+    let (mut s_end, mut r_end) = latency_pair(Duration::from_millis(rtt_ms) / 2);
+
+    let variant_p = variant.to_path_buf();
+    let target_r = target.clone();
+    let target_cleanup = target.clone();
+    let recv_thread = std::thread::spawn(
+        move || -> Result<SyncOutcome, ffsync::protocol::sync::SyncError> {
+            let request = ReceiveRequest {
+                path: target_r.clone(),
+                local_source: target_r.clone(),
+                force_checksum: false,
+                tree: false,
+                eager,
+                apply_mode: None,
+                apply_mtime: None,
+            };
+            receive(
+                &mut r_end,
+                &request,
+                &PipelineConfig::default(),
+                &mut |_p| {},
+            )
+        },
+    );
+
+    let t = Instant::now();
+    let send_req = SendRequest {
+        path: variant_p,
+        display_path: "eager_sim.bin".into(),
+        mtime: None,
+        force_checksum: false,
+        tree: false,
+        eager,
+        dry_run: false,
+    };
+    let send_res = send(
+        &mut s_end,
+        &send_req,
+        &PipelineConfig::default(),
+        &mut |_p| {},
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    let elapsed = t.elapsed();
+    let bytes = match send_res {
+        SyncOutcome::Transferred { bytes, .. } => bytes,
+        SyncOutcome::InSync => 0,
+        SyncOutcome::WouldChange => 0,
+    };
+    recv_thread
+        .join()
+        .unwrap()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let _ = fs::remove_file(&target_cleanup);
+    Ok((elapsed, bytes))
+}
+
 fn print_tree_stats(label: &str, s: &TreeStats) {
     println!();
     println!("---- {} ----", label);
@@ -2330,6 +2457,11 @@ fn main() -> io::Result<()> {
 
     if cfg.latency {
         run_latency_simulation(&cfg, &pipeline)?;
+    }
+
+    if cfg.eager {
+        run_eager_simulation(&cfg, &pipeline)?;
+        return Ok(());
     }
 
     let rsync = if cfg.rsync {

@@ -296,6 +296,7 @@ where
         force_checksum: checksum,
         tree: true,
         dry_run: false, // per-file conversations never preview (§16.10 gates the session)
+        eager: false,
     };
     // The sender's mode needs no wire field of its own: the receiver reads
     // it from the TREE_BEGIN manifest entry for this rel_path (§16.9) —
@@ -927,6 +928,7 @@ where
                 // None (apply nothing) when the session has no metadata section
                 // or the entry is absent — the lookup is by rel_path.
                 apply_mode: sender_mode,
+                eager: false,
             };
             let rel_c = rel.to_string();
             let outcome = match sync::receive(stream, &recv_req, pipeline, &mut |p| {

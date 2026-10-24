@@ -206,6 +206,7 @@ mod tests {
                 force_checksum: true, // keep the test deterministic
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -214,6 +215,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
 
@@ -248,6 +250,7 @@ mod tests {
             force_checksum: false, // warm start needs the default mode
             tree: false,
             dry_run: false,
+            eager: false,
         };
         let mk_recv = || ReceiveRequest {
             path: target.clone(),
@@ -256,6 +259,7 @@ mod tests {
             tree: false,
             apply_mode: None,
             apply_mtime: None,
+            eager: false,
         };
 
         // Sync 1 (cold): full scan both sides, index files written at commit.
@@ -367,6 +371,7 @@ mod tests {
                 force_checksum: false,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -375,6 +380,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
         assert!(
@@ -396,6 +402,7 @@ mod tests {
                 force_checksum: false,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -404,6 +411,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
         s2.expect("attempt 2 sender converges");
@@ -435,6 +443,7 @@ mod tests {
                 force_checksum: true,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -443,6 +452,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
         s.expect("sender ok");
@@ -470,6 +480,7 @@ mod tests {
                 force_checksum: true,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -478,6 +489,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
 
@@ -512,6 +524,7 @@ mod tests {
                 force_checksum: false,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -520,6 +533,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
 
@@ -554,6 +568,7 @@ mod tests {
                 force_checksum: true,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -562,6 +577,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
 
@@ -670,6 +686,7 @@ mod tests {
                 force_checksum: true,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -678,6 +695,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
             64 * 1024,
         );
@@ -697,6 +715,7 @@ mod tests {
                 force_checksum: true,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -705,6 +724,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
         let _ = s2.expect("resumed sender ok");
@@ -735,6 +755,7 @@ mod tests {
                 force_checksum: false,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -743,6 +764,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
 
@@ -824,6 +846,7 @@ mod tests {
             tree: false,
             apply_mode: None,
             apply_mtime: None,
+            eager: false,
         };
         let pipeline = PipelineConfig::default();
         let mut progress = |_p: Progress| {};
@@ -866,6 +889,7 @@ mod tests {
                 force_checksum: true,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -874,6 +898,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
         let _s = s.expect("sender ok");
@@ -964,6 +989,7 @@ mod tests {
             force_checksum: false,
             tree: false,
             dry_run: false,
+            eager: false,
         };
         let mk_recv = || ReceiveRequest {
             path: target.clone(),
@@ -972,6 +998,7 @@ mod tests {
             tree: false,
             apply_mode: None,
             apply_mtime: None,
+            eager: false,
         };
 
         // Sync 1: converges; both indexes record the small-file parameters.
@@ -1044,6 +1071,7 @@ mod tests {
                 force_checksum: false,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -1052,6 +1080,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
         s.expect("sender ok");
@@ -1111,6 +1140,7 @@ mod tests {
                 force_checksum: false,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -1119,6 +1149,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
         s.expect("sender ok");
@@ -1175,6 +1206,7 @@ mod tests {
                 force_checksum: false,
                 tree: false,
                 dry_run: false,
+                eager: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -1183,6 +1215,7 @@ mod tests {
                 tree: false,
                 apply_mode: None,
                 apply_mtime: None,
+                eager: false,
             },
         );
         let s = s.expect("sender ok");
@@ -1227,6 +1260,7 @@ mod tests {
             force_checksum: false,
             tree: false,
             dry_run: true,
+            eager: false,
         };
         let r = ReceiveRequest {
             path: target.clone(),
@@ -1235,6 +1269,7 @@ mod tests {
             tree: false,
             apply_mtime: None,
             apply_mode: None,
+            eager: false,
         };
         let (s_out, r_out) = run_sync(s, r);
         assert!(
@@ -1274,6 +1309,7 @@ mod tests {
             force_checksum: true, // defeat the fast path so a plan is built
             tree: false,
             dry_run: true,
+            eager: false,
         };
         let r = ReceiveRequest {
             path: target.clone(),
@@ -1282,6 +1318,7 @@ mod tests {
             tree: false,
             apply_mtime: None,
             apply_mode: None,
+            eager: false,
         };
         let (s_out, r_out) = run_sync(s, r);
         assert!(
@@ -1322,5 +1359,82 @@ mod tests {
         hello.flags = 0;
         let frame = hello.into_frame().unwrap();
         assert!(Hello::from_frame(frame).is_ok());
+    }
+    #[test]
+    fn eager_mode_converges_and_starts_early() {
+        let fx = Fixture::new("eager_converge");
+        let src_data = vec![7u8; 2 * 1024 * 1024];
+        create_file(fx.source(), &src_data);
+        // Receiver differs in size AND content: real Remote entries.
+        let old_data = vec![9u8; 1024 * 1024];
+        let target = fx.path("target.bin");
+        create_file(&target, &old_data);
+
+        let s = SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "src.bin".into(),
+            mtime: None,
+            force_checksum: false,
+            tree: false,
+            eager: true,
+            dry_run: false,
+        };
+        let r = ReceiveRequest {
+            path: target.clone(),
+            local_source: target.clone(),
+            force_checksum: false,
+            tree: false,
+            eager: true,
+            apply_mtime: None,
+            apply_mode: None,
+        };
+        let (s_out, r_out) = run_sync(s, r);
+        assert!(
+            matches!(s_out, Ok(SyncOutcome::Transferred { .. })),
+            "sender: {:?}",
+            s_out
+        );
+        assert!(
+            matches!(r_out, Ok(SyncOutcome::Transferred { .. })),
+            "receiver: {:?}",
+            r_out
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), src_data);
+    }
+
+    #[test]
+    fn eager_sender_fails_loudly_when_receiver_declines() {
+        // The receiver did NOT opt in: its HELLO lacks the bit. The eager
+        // sender must fail loudly (session-level Version error), never
+        // deadlock or silently degrade.
+        let fx = Fixture::new("eager_decline");
+        let src_data = vec![7u8; 512 * 1024];
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data.clone());
+
+        let s = SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "src.bin".into(),
+            mtime: None,
+            force_checksum: false,
+            tree: false,
+            eager: true, // sender offers
+            dry_run: false,
+        };
+        let r = ReceiveRequest {
+            path: target.clone(),
+            local_source: target.clone(),
+            force_checksum: false,
+            tree: false,
+            eager: false, // receiver declines
+            apply_mtime: None,
+            apply_mode: None,
+        };
+        let (s_out, r_out) = run_sync(s, r);
+        match (&s_out, &r_out) {
+            (Err(SyncError::Peer(ErrorCode::Version, _)), _) => {}
+            (s, r) => panic!("expected loud decline, got sender={s:?} receiver={r:?}"),
+        }
     }
 }

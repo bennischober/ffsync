@@ -378,6 +378,7 @@ fn tree_v2_flow_rejects_tree_frames() {
             tree: false,
             apply_mode: None,
             apply_mtime: None,
+            eager: false,
         };
         ffsync::protocol::sync::receive(&mut &tcp, &req, &PipelineConfig::default(), &mut |_p| {})
     });
