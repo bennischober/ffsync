@@ -87,6 +87,7 @@ fn run_tree_session_ex(
         receiver_excludes,
         1,
         false,
+        false,
     )
 }
 
@@ -102,6 +103,7 @@ fn run_tree_session_full(
     receiver_excludes: &[&str],
     parallel: u16,
     dry_run: bool,
+    eager: bool,
 ) -> (
     Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
     Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
@@ -134,6 +136,7 @@ fn run_tree_session_full(
                     Ok(Box::new(tcp))
                 }),
                 dry_run,
+                eager,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -155,6 +158,7 @@ fn run_tree_session_full(
             excludes: send_excludes,
             parallel,
             dry_run,
+            eager,
             connect_worker: std::sync::Arc::new(move |_index: u16| {
                 let tcp = std::net::TcpStream::connect(send_addr)
                     .map_err(|e| std::io::Error::other(format!("cannot connect worker: {e}")))?;
@@ -394,6 +398,7 @@ fn tree_v2_flow_rejects_tree_frames() {
             no_delete: false,
             excludes: Vec::new(),
             parallel: 1,
+            eager: false,
             connect_worker: std::sync::Arc::new(|_| {
                 Err(std::io::Error::other("no workers in sequential sessions"))
             }),
@@ -477,6 +482,7 @@ fn sender_vanished_file_fails_loudly() {
                     Err(std::io::Error::other("no workers in sequential sessions"))
                 }),
                 dry_run: false,
+                eager: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -504,6 +510,7 @@ fn sender_vanished_file_fails_loudly() {
             no_delete: false,
             excludes: Vec::new(),
             parallel: 1,
+            eager: false,
             connect_worker: std::sync::Arc::new(|_| {
                 Err(std::io::Error::other("no workers in sequential sessions"))
             }),
@@ -687,6 +694,7 @@ fn tree_parallel_converges_and_reports_all_files() {
         &[],
         4,
         false,
+        false,
     );
     let s = s.unwrap_or_else(|e| panic!("sender failed: {e}"));
     let r = r.unwrap_or_else(|e| panic!("receiver failed: {e}"));
@@ -713,6 +721,7 @@ fn tree_parallel_converges_and_reports_all_files() {
         &[],
         &[],
         4,
+        false,
         false,
     );
     let s2 = s2.expect("sender ok");
@@ -752,6 +761,7 @@ fn tree_parallel_sequential_fallback_interops() {
                     Err(std::io::Error::other("no worker connections accepted"))
                 }),
                 dry_run: false,
+                eager: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -770,6 +780,7 @@ fn tree_parallel_sequential_fallback_interops() {
             no_delete: false,
             excludes: Vec::new(),
             parallel: 4,
+            eager: false,
             connect_worker: std::sync::Arc::new(move |_index: u16| {
                 std::net::TcpStream::connect(send_addr)
                     .map(|t| Box::new(t) as Box<dyn ffsync::protocol::tree_sync::ReadWrite>)
@@ -817,6 +828,7 @@ fn tree_parallel_fail_closed_on_worker_error() {
         &[],
         &[],
         2,
+        false,
         false,
     );
     let _ = vanish.join();
@@ -1045,6 +1057,7 @@ fn tree_exclude_negation_converges() {
         &[],       // receiver patterns (delete guard only)
         1,
         false,
+        false,
     );
     let s = s.expect("sender ok");
     let r = r.expect("receiver ok");
@@ -1073,6 +1086,7 @@ fn tree_exclude_negation_converges() {
         &["*.log"], // receiver protects all its *.log paths
         1,
         false,
+        false,
     );
     let _s2 = s2.expect("sender2 ok");
     let r2 = r2.expect("receiver2 ok");
@@ -1099,6 +1113,7 @@ fn tree_negation_free_session_interoperates() {
         &excludes,
         &[],
         1,
+        false,
         false,
     );
     let s = s.expect("sender ok");
@@ -1163,6 +1178,7 @@ fn tree_dry_run_reports_without_mutating_over_real_tcp() {
         &[],
         1,
         true,
+        false,
     );
     let s = s.expect("sender ok");
     let r = r.expect("receiver ok");
@@ -1182,4 +1198,142 @@ fn tree_dry_run_reports_without_mutating_over_real_tcp() {
     assert!(s2.is_ok() && r2.is_ok());
     assert_eq!(receiver.read("a.bin").unwrap(), vec![7u8; 512 * 1024]);
     assert_eq!(receiver.read("stale.bin"), None, "real session deletes it");
+}
+
+#[test]
+fn tree_eager_converges_and_declines_loudly() {
+    // §9.2 extended to trees: an eager session converges byte-for-byte
+    // (and its second session still fast-paths); a receiver that never
+    // opted in keeps the sender lazy (the session still succeeds — the
+    // sender's conversations read the mirror bit and stay lazy), while a
+    // single-file eager sender against a declining receiver fails loudly
+    // at the conversation level (§9.2: no silent degradation).
+    let sender = TempTree::new("eager_tree_sender");
+    let receiver = TempTree::new("eager_tree_receiver");
+
+    sender.write("big.bin", &vec![7u8; 2 * 1024 * 1024]);
+    sender.write("sub/medium.bin", &vec![1u8; 300 * 1024]);
+    sender.write("sub/deep/tiny.txt", b"hello eager tree");
+
+    let (s, r) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        1,
+        false,
+        true,
+    );
+    let s = s.expect("eager sender ok");
+    let r = r.expect("eager receiver ok");
+    assert_eq!(s.files, r.files);
+    assert!(s.transferred_bytes > 0);
+    assert_eq!(receiver.read("big.bin"), sender.read("big.bin"));
+    assert_eq!(
+        receiver.read("sub/medium.bin"),
+        sender.read("sub/medium.bin")
+    );
+    assert_eq!(
+        receiver.read("sub/deep/tiny.txt"),
+        sender.read("sub/deep/tiny.txt")
+    );
+
+    // Second session: mtime preservation makes the fast path skip
+    // everything, eager or not.
+    let (s2, r2) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        1,
+        false,
+        true,
+    );
+    let s2 = s2.expect("eager sender2 ok");
+    let r2 = r2.expect("eager receiver2 ok");
+    assert_eq!(
+        s2.files, 0,
+        "second eager sync must skip all files (fast path)"
+    );
+    assert_eq!(r2.files, 0);
+    assert_eq!(s2.transferred_bytes, 0);
+
+    // Decline semantics: sender eager, receiver NOT opted in. The
+    // receiver's TREE_BEGIN carries no mirror bit, so the sender's
+    // conversations run LAZY (silent fallback) and the session still
+    // converges — the loud-failure path is single-file-only by design
+    // (§9.2: the offer's target is the whole session, decline = lazy
+    // trees, never an error).
+    let receiver2 = TempTree::new("eager_tree_declining");
+    let (s3, r3) = run_tree_session_full(
+        sender.path(),
+        receiver2.path(),
+        false,
+        false,
+        &[],
+        &[],
+        1,
+        false,
+        false,
+    );
+    let s3 = s3.expect("lazy-fallback sender ok");
+    let _r3 = r3.expect("lazy-fallback receiver ok");
+    assert!(s3.transferred_bytes > 0);
+    assert_eq!(receiver2.read("big.bin"), sender.read("big.bin"));
+    // And the reverse flag split: receiver opted in, sender did not —
+    // the receiver mirrors nothing (its own bit needs the sender's
+    // offer), conversations run lazy, still converges.
+    let receiver3 = TempTree::new("eager_tree_receiver_only");
+    let (s4, r4) = run_tree_session_full(
+        sender.path(),
+        receiver3.path(),
+        false,
+        false,
+        &[],
+        &[],
+        1,
+        false,
+        false,
+    );
+    let _s4 = s4.expect("receiver-only-opt-in sender ok");
+    let _r4 = r4.expect("receiver-only-opt-in receiver ok");
+}
+
+#[test]
+fn tree_eager_parallel_converges() {
+    // §16.8 + §9.2: eager conversations over K=4 parallel connections —
+    // the flag rides TREE_BEGIN, every conversation (workers included)
+    // runs the same eager machinery, membership validation unchanged.
+    let sender = TempTree::new("eager_par_sender");
+    let receiver = TempTree::new("eager_par_receiver");
+
+    for i in 0..12 {
+        sender.write(&format!("f{i:02}.bin"), &vec![i as u8; 400 * 1024]);
+    }
+
+    let (s, r) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        4,
+        false,
+        true,
+    );
+    let s = s.expect("eager parallel sender ok");
+    let r = r.expect("eager parallel receiver ok");
+    assert_eq!(s.files, r.files);
+    assert_eq!(s.files, 12);
+    for i in 0..12 {
+        assert_eq!(
+            receiver.read(&format!("f{i:02}.bin")),
+            sender.read(&format!("f{i:02}.bin"))
+        );
+    }
 }

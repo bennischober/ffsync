@@ -275,6 +275,23 @@ treated as a cache (get, not take) — otherwise duplicate DATA frames
 desync the frame stream at VERIFY. Correctness tests: eager convergence,
 loud decline on a non-opt-in receiver, in `tests/loopback.rs`.
 
+**Amendment (2026-10-24, trees):** eager extends to tree sessions
+(§16.11): TREE_BEGIN flag bit 7 announced by the sender, mirrored by the
+receiver only on its own opt-in (an offer is not a session property —
+the receiver must never buffer pre-plan DATA it did not agree to), and
+every per-file conversation (sequential and §16.8 parallel workers
+alike) runs the single-file machinery unchanged. A declining receiver
+converges lazily; old peers reject the bit loudly. Tests: eager tree
+convergence + fast-path second session, lazy fallback on decline (both
+directions), eager parallel K=4 convergence, eager single-file
+mid-transfer crash → eager resume (the crash lands during the manifest
+exchange, before the temp exists — legal; attempt 2 converges). Found
+while writing the resume test: eager DATA emitted no Transferring
+progress, so the CLI display and any kill-by-bytes logic sat at zero
+during the pre-plan stream — fixed (the offer closure now emits the
+same progress as the plan's data phase, total = the source chunk
+bytes).
+
 ## D9 — Scope discipline: what ffsync deliberately does not build
 
 **Decision:** v0.1 target is a single file pair between two peers over TCP with

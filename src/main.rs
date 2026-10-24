@@ -355,6 +355,7 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
             excludes,
             parallel,
             dry_run,
+            eager,
         });
     }
     if !excludes.is_empty() {
@@ -508,6 +509,7 @@ fn run_receive(
             listener,
             bound,
             dry_run,
+            eager,
         });
     }
     if !excludes.is_empty() {
@@ -617,6 +619,7 @@ struct TreeSendOpts {
     excludes: Vec<String>,
     parallel: u16,
     dry_run: bool,
+    eager: bool,
 }
 
 /// Tree mode (v0.3): send a directory's contents. TLS setup is shared with
@@ -632,6 +635,7 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
         excludes,
         parallel,
         dry_run,
+        eager,
     } = opts;
     let (host, port) = parse_host_port(&addr);
 
@@ -702,6 +706,7 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
         excludes,
         parallel,
         dry_run,
+        eager,
         connect_worker: std::sync::Arc::new(connect_worker),
     };
     let pipeline = PipelineConfig::default();
@@ -739,6 +744,7 @@ struct TreeReceiveOpts {
     listener: Listener,
     bound: u16,
     dry_run: bool,
+    eager: bool,
 }
 
 /// The receiver's listening socket: TCP (default) or a QUIC endpoint
@@ -762,6 +768,7 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
         listener,
         bound,
         dry_run,
+        eager,
     } = opts;
     if !root.exists() {
         std::fs::create_dir_all(&root)?;
@@ -851,6 +858,7 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
         excludes,
         accept_worker: std::sync::Arc::new(accept_worker),
         dry_run,
+        eager,
     };
     let pipeline = PipelineConfig::default();
     let outcome = match tree_receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {

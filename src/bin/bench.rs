@@ -1430,6 +1430,7 @@ fn run_one_latency_session(
                     })
                 },
                 dry_run: false,
+                eager: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -1446,6 +1447,7 @@ fn run_one_latency_session(
             excludes: Vec::new(),
             parallel,
             dry_run: false,
+            eager: false,
             connect_worker: {
                 let ends = std::sync::Mutex::new(sender_ends);
                 std::sync::Arc::new(move |_| {

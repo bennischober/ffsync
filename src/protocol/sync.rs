@@ -504,10 +504,18 @@ where
     let mut eager_sent: u64 = 0;
     let mut eager_scan: usize = 0; // next un-offered source chunk (offset-sorted)
     let mut eager_offered: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    // §9.2: the eager DATA rides the same Transferring progress as the plan
+    // loop's data phase (total = the plan's remote bytes; the CLI's
+    // display/kill logic counts eager bytes too). The total is unknown
+    // before the plan exists — the sender's own chunk list IS the upper
+    // bound (every source chunk could be remote), so use its byte size.
+    // Emitted by the offer closure below; 0 bytes when the session stays lazy.
+    let remote_total_hint: u64 = source_chunks.iter().map(|c| c.length as u64).sum();
     let mut offer_eager_chunk = |chunk: &Chunk,
                                  manifest: &HashMap<Hash, u64>,
                                  consumed_upto: u64,
                                  manifest_done: bool,
+                                 eager_sent: u64,
                                  stream: &mut dyn Write|
      -> Result<u64, SyncError> {
         if !eager_active {
@@ -532,6 +540,8 @@ where
         message::encode_data(chunk.hash, &compressed)?.encode(stream)?;
         stream.flush()?;
         eager_offered.insert(chunk.hash);
+        let sent_now = eager_sent + chunk.length as u64;
+        progress(Progress::Transferring(sent_now, remote_total_hint));
         Ok(chunk.length as u64)
     };
     loop {
@@ -547,7 +557,9 @@ where
                     .iter()
                     .take_while(|c| c.offset < consumed)
                 {
-                    eager_sent += offer_eager_chunk(chunk, &manifest, consumed, false, stream)?;
+                    let offered =
+                        offer_eager_chunk(chunk, &manifest, consumed, false, eager_sent, stream)?;
+                    eager_sent += offered;
                 }
                 eager_scan = eager_scan
                     + source_chunks[eager_scan..]
@@ -557,7 +569,8 @@ where
             }
             framing::T_MANIFEST_DONE => {
                 for chunk in &source_chunks[eager_scan..] {
-                    eager_sent += offer_eager_chunk(chunk, &manifest, 0, true, stream)?;
+                    let offered = offer_eager_chunk(chunk, &manifest, 0, true, eager_sent, stream)?;
+                    eager_sent += offered;
                 }
                 break;
             }

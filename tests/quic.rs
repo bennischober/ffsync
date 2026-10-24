@@ -244,6 +244,7 @@ fn run_tree_session(
                     }
                 }),
                 dry_run: false,
+                eager: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -269,6 +270,7 @@ fn run_tree_session(
             excludes: Vec::new(),
             parallel,
             dry_run: false,
+            eager: false,
             connect_worker: std::sync::Arc::new({
                 let session = session.clone();
                 move |_index: u16| {

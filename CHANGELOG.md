@@ -8,6 +8,12 @@ All notable changes to ffsync are documented here. The format follows
 
 ### Added
 
+- **Eager diff in tree sessions (D8, §16.11):** `--eager` now extends to
+  tree sync: TREE_BEGIN flag bit 7, mirrored only on the receiver's own
+  opt-in; sequential and `--parallel` conversations all run eager, a
+  declining receiver converges lazily. Fixed on the way: eager DATA now
+  emits Transferring progress (the display/kill logic saw 0 bytes during
+  the pre-plan stream).
 - **Eager diff (D8, §9.2):** `--eager` (single-file, both peers) streams
   chunk DATA during the manifest exchange, bounded by the §6.2 position
   gate: over-send 0 bytes in every paired bench run, wall time −18–33% at
