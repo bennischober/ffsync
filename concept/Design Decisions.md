@@ -223,6 +223,20 @@ barrier: a retry needs a mechanism whose cost is below the syscall
 saving (e.g. vectored/batched I/O) or parallelizes disjoint-offset
 writes across threads instead.
 
+**Amendment (2026-10-24, evidence recorded):** the default bench cell
+now quantifies flaw 2's ceiling at 128 MiB (seeded): reconstruction
+207–233 ms across scenarios (write half + the §8.2 verify re-scan,
+roughly equal halves), scans ~100 ms each, the modified fixture's
+3.16 MiB delta ≈ 3 ms at 10 Gbit/s. Reconstruction is ~two-thirds of
+the modified scenario's cost on the fat-pipe end of the niche — the
+scan is no longer the only bottleneck, as this decision predicted. But
+only the write half (~100 ms) is attackable (parallel disjoint-offset
+writes; coalescing stays rejected above), the verify re-scan is
+protocol-mandated, and the absolute win (~20–30% of fat-pipe e2e)
+exists only for localhost-class repeated syncs. Verdict: flaw 2 stays
+open, deferred with evidence; implement when a fat-pipe workload
+appears.
+
 ## D8 — The link speed is a protocol parameter
 
 **Decision:** the diff strategy must adapt to the link, not be fixed.

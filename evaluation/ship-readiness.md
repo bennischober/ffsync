@@ -157,22 +157,37 @@ by data (the D8 doctrine), not a commitment:
    model, (b) give the README honest WAN numbers, (c) possibly reorder
    the next items. Cheapest high-information item; blocked only on the
    four-tunnel setup.
-2. **Batched/parallel reconstruction (D7 flaw 2).** Evaluated 2026-10-23
-   and rejected on data (coalescing loses on chunk locality); the retry
-   shape is vectored I/O or parallel disjoint-offset writes. Only matters
-   on fat pipes (≥10 GbE / localhost-class); revisit when a real workload
-   shows reconstruction as the bottleneck (the bench already separates
-   the phase, so the evidence will show up by itself).
+2. **Batched/parallel reconstruction (D7 flaw 2) — evidence now in
+   (2026-10-24).** The default bench cell at 128 MiB separates the
+   phases: scans ~100 ms each, reconstruction 207–233 ms (write half +
+   the §8.2 verify re-scan, roughly equal halves), transfer of the
+   modified fixture's 3.16 MiB delta ≈ 3 ms at 10 Gbit/s. On the
+   fat-pipe end of the niche, reconstruction is ~two-thirds of the
+   modified-scenario cost — the scan is no longer the only bottleneck
+   (as D7 predicted). Refinement: only the write half (~100 ms) is
+   attackable by parallel disjoint-offset writes (coalescing stays
+   rejected); the verify re-scan is protocol-mandated. Expected win
+   ~20–30% of fat-pipe e2e — real, but it buys nothing on typical
+   1–10 Gbit/s LANs until transfer itself drops below ~200 ms, i.e.
+   only for repeated syncs of huge trees over localhost-class links.
+   Verdict: KEEP DEFERRED, with the evidence recorded; implement when
+   a fat-pipe workload shows up (the bench will show it).
 3. **macOS release legs + a Homebrew tap.** The only distribution gap
    that maps to a real user group (macOS has no static-binary story
    today; `cargo install` works but needs a toolchain). Two matrix legs
    (`aarch64-apple-darwin`, `x86_64-apple-darwin`) + a tap repo.
    Add when the first macOS user shows up — not before.
-4. **Directory-level mtime fast path.** Trees re-triage on every run
-   (cheap, but it walks every path); a directory-mtime short-circuit
-   ("no file in this subtree changed" is common in real trees) could make
-   huge read-only subtrees O(1). Risky (mtime semantics on dirs differ
-   per platform); needs a bench cell first — same doctrine as D8.
+4. **~~Directory-level mtime fast path~~ REJECTED (2026-10-24, on
+   measurement + analysis).** The bench cell timed the metadata-only
+   rescan: 4.9 ms at 50 entries, 24.5 ms at 410, 218.7 ms at 4010 —
+   linear, ~55 µs/entry, and that per-entry stat IS the cost a dir-mtime
+   short-circuit would need to skip. Analysis kills the rest: an
+   NTFS/ext4 directory mtime updates on child create/delete/rename but
+   NOT on child content edits, so unchanged-dir mtimes cannot vouch for
+   file content — every file still needs its stat. The prunable
+   fraction (create/delete-only subtrees) is the wrong target, and the
+   absolute cost (7.4 ms for the 51-file real tree) is noise next to
+   any network round trip.
 5. **Chunk-index reuse ACROSS trees (warm-start second-order).** The D15
    index is per-file; a receiver that synced a tree once has per-file
    indexes, but a NEW receiver (fresh machine) starts cold. A
