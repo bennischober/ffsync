@@ -1016,6 +1016,148 @@ mod tests {
     }
 
     #[test]
+    fn from_sync_writes_old_file_index_and_repeat_warm_starts() {
+        // D21: the receiver-side --from sync indexes the OLD file at commit
+        // (its own identity: its size, its mtime, its chunks). A repeated
+        // --from sync against the same old file then warm-starts the
+        // receiver's scan — the old code re-scanned it on every run.
+        let fx = Fixture::new("from_warm");
+        // Old file (the --from source): 2 MiB pattern.
+        let mut old_data = vec![0u8; 2 * 1024 * 1024];
+        for (i, b) in old_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(43).wrapping_add((i / 65536) as u8);
+        }
+        let from_file = fx.path("from.bin");
+        create_file(&from_file, &old_data);
+        // Backdate the from-file NOW: sync 1's commit records this mtime in
+        // its index, and sync 2 must NOT change it (validation is
+        // mtime-exact) — the fast path is defeated via the TARGET's mtime
+        // instead (below).
+        let t_from = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        filetime::set_file_mtime(&from_file, filetime::FileTime::from_system_time(t_from)).unwrap();
+        // Sender's new content: same but middle 256 KiB modified — a real
+        // delta through the from-file's chunks.
+        let mut new_data = old_data.clone();
+        let mid = 1024 * 1024;
+        for b in &mut new_data[mid..mid + 256 * 1024] {
+            *b ^= 0xFF;
+        }
+        create_file(fx.source(), &new_data);
+
+        let mk_send = || SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "new.bin".into(),
+            mtime: None,
+            force_checksum: true, // deterministic; also defeats the fast path
+            tree: false,
+            dry_run: false,
+            eager: false,
+        };
+        let mk_recv = || ReceiveRequest {
+            path: fx.path("target.bin"),
+            local_source: from_file.clone(),
+            force_checksum: true,
+            tree: false,
+            apply_mode: None,
+            apply_mtime: None,
+            eager: false,
+        };
+
+        // Sync 1: converges via the from-file's chunks (mostly Local).
+        let (s1, r1) = run_sync(mk_send(), mk_recv());
+        s1.expect("sync 1 sender ok");
+        r1.expect("sync 1 receiver ok");
+        assert_eq!(read_file(&fx.path("target.bin")), new_data);
+
+        // The from-file got its OWN index (its identity), the target did NOT
+        // get one derived from the from-file's content.
+        let from_idx = ffsync::index::load_index(&from_file);
+        assert!(
+            from_idx.is_some(),
+            "the --from old file must be indexed at commit (D21)"
+        );
+        let idx = from_idx.unwrap();
+        assert_eq!(idx.file_size, old_data.len() as u64);
+        assert_eq!(
+            idx.root,
+            ffsync::chunking::chunk_root(
+                &ffsync::chunking::scan_file_ordered(
+                    &from_file,
+                    &PipelineConfig::default(),
+                    ffsync::chunking::cdc_params_for_size(old_data.len() as u64),
+                )
+                .expect("from-file scan")
+                .1,
+            ),
+            "the from-file index describes the from-file"
+        );
+        // The TARGET's index (written at the executed-plan commit) must
+        // describe the TARGET's new content — never a copy of the from-file's
+        // state (D15 ownership rule).
+        let tgt_idx = ffsync::index::load_index(&fx.path("target.bin"))
+            .expect("executed-plan commit indexes the target");
+        assert_eq!(
+            tgt_idx.root,
+            ffsync::chunking::chunk_root(
+                &ffsync::chunking::scan_file_ordered(
+                    &fx.path("target.bin"),
+                    &PipelineConfig::default(),
+                    ffsync::chunking::cdc_params_for_size(new_data.len() as u64),
+                )
+                .expect("target scan")
+                .1,
+            ),
+            "the target index describes the target's own content"
+        );
+
+        // Sync 2: run again — the receiver's scan must warm-start from the
+        // from-file's index (WarmStart event, no full re-scan).
+        // force_checksum defeats the warm start by design (D15) — this test
+        // needs the DEFAULT mode so the receiver's index is consulted. The
+        // from-file's mtime is untouched since sync 1 (its index validates);
+        // the TARGET gets a DIFFERENT backdated mtime so the size+mtime
+        // fast path cannot fire (target 2 MiB == sender 2 MiB, but mtimes
+        // differ).
+        let _ = std::fs::remove_file(fx.path("target.bin"));
+        create_file(&fx.path("target.bin"), &old_data);
+        let t_tgt = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        filetime::set_file_mtime(
+            fx.path("target.bin"),
+            filetime::FileTime::from_system_time(t_tgt),
+        )
+        .unwrap();
+        // Sender's source == old file content now (no changes), so the sync
+        // is InSync relative to the from-file — the warm start still ran.
+        let (_s2_events, r2_events) = run_sync_recording(
+            SendRequest {
+                path: from_file.clone(),
+                display_path: "from.bin".into(),
+                mtime: None,
+                force_checksum: false,
+                tree: false,
+                dry_run: false,
+                eager: false,
+            },
+            ReceiveRequest {
+                path: fx.path("target.bin"),
+                local_source: from_file.clone(),
+                force_checksum: false,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager: false,
+            },
+        );
+        assert!(
+            r2_events
+                .iter()
+                .any(|p| matches!(p, Progress::WarmStart(_))),
+            "the repeated --from sync must warm-start the old file's scan: {:?}",
+            r2_events
+        );
+    }
+
+    #[test]
     fn cdc_policy_boundary_and_sanity() {
         // D19: params are a pure function of the file size.
         use ffsync::chunking::{

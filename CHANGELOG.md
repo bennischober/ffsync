@@ -4,6 +4,18 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Warm-started --from syncs (D21):** the receiver now indexes the old
+  file (--from <file>) at commit — a repeated --from sync against the
+  same old file skips the receiver's full scan (measured 238.6x on the
+  128 MiB fixture: 116.5 ms cold scan -> 0.5 ms warm load). The "index
+  snapshot for fresh machines" idea was analyzed and rejected (an index
+  carries no bytes; see D21 in the design ledger). Rename detection
+  (cross-file chunk manifests) is recorded as a future wire feature.
+
 ## [1.1.0] - 2026-10-24
 
 ### Added
