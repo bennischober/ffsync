@@ -160,6 +160,7 @@ fn run_send_over(
         mtime: None,
         force_checksum: true,
         tree: false,
+        dry_run: false,
     };
     let pipeline = PipelineConfig::default();
     let out = send(stream, &req, &pipeline, &mut |_p| {});
@@ -240,6 +241,7 @@ fn run_tree_session(
                         Ok(Box::new(s))
                     }
                 }),
+                dry_run: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -264,6 +266,7 @@ fn run_tree_session(
             no_delete,
             excludes: Vec::new(),
             parallel,
+            dry_run: false,
             connect_worker: std::sync::Arc::new({
                 let session = session.clone();
                 move |_index: u16| {

@@ -50,6 +50,12 @@ pub const T_TREE_WORKER: u8 = 0x0F;
 /// order.
 pub const T_TREE_FILE: u8 = 0x10;
 
+/// Dry-run (§7.1): sent by the receiver to accept a sender's dry-run
+/// offer, and as the post-VERIFY "this file would change" report. Empty
+/// payload. v0.8 work, additive (no VERSION bump, same precedent as
+/// TREE_WORKER/TREE_FILE).
+pub const T_DRY_RUN_ACK: u8 = 0x11;
+
 /// A raw frame: type byte plus payload. Typed frames are built on top of
 /// this in [`super::message`]; the codec layer only knows the envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]

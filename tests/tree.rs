@@ -131,6 +131,7 @@ fn run_tree_session_full(
                     tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
                     Ok(Box::new(tcp))
                 }),
+                dry_run: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -151,6 +152,7 @@ fn run_tree_session_full(
             no_delete,
             excludes: send_excludes,
             parallel,
+            dry_run: false,
             connect_worker: std::sync::Arc::new(move |_index: u16| {
                 let tcp = std::net::TcpStream::connect(send_addr)
                     .map_err(|e| std::io::Error::other(format!("cannot connect worker: {e}")))?;
@@ -392,6 +394,7 @@ fn tree_v2_flow_rejects_tree_frames() {
             connect_worker: std::sync::Arc::new(|_| {
                 Err(std::io::Error::other("no workers in sequential sessions"))
             }),
+            dry_run: false,
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -470,6 +473,7 @@ fn sender_vanished_file_fails_loudly() {
                 accept_worker: std::sync::Arc::new(|| {
                     Err(std::io::Error::other("no workers in sequential sessions"))
                 }),
+                dry_run: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -500,6 +504,7 @@ fn sender_vanished_file_fails_loudly() {
             connect_worker: std::sync::Arc::new(|_| {
                 Err(std::io::Error::other("no workers in sequential sessions"))
             }),
+            dry_run: false,
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -725,6 +730,7 @@ fn tree_parallel_sequential_fallback_interops() {
                     // Sequential receiver: refuses extra connections.
                     Err(std::io::Error::other("no worker connections accepted"))
                 }),
+                dry_run: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -748,6 +754,7 @@ fn tree_parallel_sequential_fallback_interops() {
                     .map(|t| Box::new(t) as Box<dyn ffsync::protocol::tree_sync::ReadWrite>)
                     .map_err(std::io::Error::other)
             }),
+            dry_run: false,
         },
         &PipelineConfig::default(),
         &mut |_p| {},

@@ -78,6 +78,15 @@ impl Reconstructor {
         target_path.with_extension("ffsync-tmp")
     }
 
+    /// Durability (§8.3): flush the temp file's data before the atomic
+    /// rename. The rename is journaled, the data pages are not — without
+    /// this a crash between rename and page-cache flush can leave the
+    /// target renamed-but-empty on some filesystems. Cost is one flush of
+    /// already-written pages.
+    pub fn sync_temp(&self) -> io::Result<()> {
+        self.temp_file.sync_all()
+    }
+
     /// Process a single chunk whose bytes are already in memory.
     ///
     /// This is the path the sync state machines use: the receiver has
@@ -159,6 +168,8 @@ impl Reconstructor {
             ));
         }
 
+        // Durability (§8.3): flush before the rename.
+        self.temp_file.sync_all()?;
         drop(self.temp_file);
         std::fs::rename(temp_path, final_path)?;
         Ok(())
@@ -187,6 +198,8 @@ impl Reconstructor {
             ));
         }
 
+        // Durability (§8.3): flush before the rename.
+        self.temp_file.sync_all()?;
         drop(self.temp_file);
 
         std::fs::rename(final_path.with_extension("ffsync-tmp"), final_path)?;

@@ -257,6 +257,13 @@ nothing. For scripts, pass `--trust <fingerprint>` instead of the prompt;
 directory - no usernames, no passwords, no secrets on disk). Use
 `--plaintext` for trusted LANs or inside an SSH tunnel.
 
+**Dry run** (`--dry-run`, send side): preview a session with zero
+mutation - the receiver runs triage only, reports what would transfer and
+what would be deleted, and never writes (rsync `-n` semantics). The first
+sync to a new peer can be rehearsed on real data; both peers print
+"WOULD CHANGE (dry run - nothing was written)" and the would-delete
+counts. Old ffsync peers reject the flag loudly instead of syncing.
+
 Flags: `--checksum` disables the mtime/size fast path *and* the warm-start
 index (rsync `-c` semantics - always compare chunk roots; in tree mode it
 applies to every file); receiver-side (single-file) `--from <old-file>`

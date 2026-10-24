@@ -160,6 +160,7 @@ impl ProgressDisplay {
 
         let elapsed = now - self.start;
         let line = match p {
+            Progress::WouldChange => "would change (dry run)".into(),
             Progress::Scanning(hashed, total) => {
                 let pct = hashed.checked_mul(100).map_or(1000, |v| v / total.max(1));
                 format!(
@@ -268,6 +269,9 @@ fn report_outcome(role: &str, outcome: SyncOutcome, display: &mut ProgressDispla
     display.finish();
     match outcome {
         SyncOutcome::InSync => println!("{}: already up to date", role),
+        SyncOutcome::WouldChange => {
+            println!("{}: WOULD CHANGE (dry run — nothing was written)", role)
+        }
         SyncOutcome::Transferred { bytes, chunks } => {
             let elapsed = display.elapsed();
             let throughput = if elapsed.as_secs_f64() > 0.0 {
@@ -311,6 +315,9 @@ struct CliOptions {
     excludes: Vec<String>,
     /// Parallel session width (§16.8); 1 = sequential (default).
     parallel: u16,
+    /// §16.10 dry-run: preview session — the peer executes nothing and
+    /// reports what would happen. Sender-side only.
+    dry_run: bool,
 }
 
 fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()> {
@@ -322,6 +329,7 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
         no_delete,
         excludes,
         parallel,
+        dry_run,
     } = opts;
     let tree = file.is_dir();
     if tree {
@@ -339,6 +347,7 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
             trust_flag,
             excludes,
             parallel,
+            dry_run,
         });
     }
     if !excludes.is_empty() {
@@ -420,6 +429,7 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
         mtime: None,
         force_checksum: opts.force_checksum,
         tree: false,
+        dry_run,
     };
     let pipeline = PipelineConfig::default();
     let outcome = match send(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -451,6 +461,7 @@ fn run_receive(
         no_delete,
         excludes,
         parallel: _parallel, // single-file receive has no parallel sessions
+        dry_run,             // §16.10: meaningless for single-file, used by tree mode
     } = opts;
     let listener = if quic {
         let (identity, created) = ffsync::transport::Identity::load_or_create()?;
@@ -487,6 +498,7 @@ fn run_receive(
             excludes,
             listener,
             bound,
+            dry_run,
         });
     }
     if !excludes.is_empty() {
@@ -594,6 +606,7 @@ struct TreeSendOpts {
     trust_flag: Option<String>,
     excludes: Vec<String>,
     parallel: u16,
+    dry_run: bool,
 }
 
 /// Tree mode (v0.3): send a directory's contents. TLS setup is shared with
@@ -608,6 +621,7 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
         trust_flag,
         excludes,
         parallel,
+        dry_run,
     } = opts;
     let (host, port) = parse_host_port(&addr);
 
@@ -677,6 +691,7 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
         no_delete: false, // the sender never deletes; the flag is receiver-side
         excludes,
         parallel,
+        dry_run,
         connect_worker: std::sync::Arc::new(connect_worker),
     };
     let pipeline = PipelineConfig::default();
@@ -687,6 +702,9 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
             return Err(io_err(&e));
         }
     };
+    if dry_run {
+        println!("(dry run — nothing was written; the numbers below are a preview)");
+    }
     report_tree_outcome("send", &outcome, display);
     // §17.6 (QUIC): delivery of our final frames is proven by *reading the
     // receiver's TREE_END report* — done inside tree_send, stream order
@@ -710,6 +728,7 @@ struct TreeReceiveOpts {
     excludes: Vec<String>,
     listener: Listener,
     bound: u16,
+    dry_run: bool,
 }
 
 /// The receiver's listening socket: TCP (default) or a QUIC endpoint
@@ -732,6 +751,7 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
         excludes,
         listener,
         bound,
+        dry_run,
     } = opts;
     if !root.exists() {
         std::fs::create_dir_all(&root)?;
@@ -820,6 +840,7 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
         no_delete,
         excludes,
         accept_worker: std::sync::Arc::new(accept_worker),
+        dry_run,
     };
     let pipeline = PipelineConfig::default();
     let outcome = match tree_receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -829,6 +850,9 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
             return Err(io_err(&e));
         }
     };
+    if dry_run {
+        println!("(dry run — nothing was written; the numbers below are a preview)");
+    }
     report_tree_outcome("receive", &outcome, display);
     // §17.6: the sender's last frames (TREE_END report path) are only
     // provably delivered when the sender closes; hold the connection
@@ -933,6 +957,8 @@ impl TreeDisplay {
                 let pct = hashed.checked_mul(100).map_or(1000, |v| v / total.max(1));
                 format!("hashing {:.1}% ({})", pct as f64 / 10.0, fmt_bytes(hashed))
             }
+
+            Progress::WouldChange => "would change (dry run)".into(),
             Progress::WarmStart(chunks) => format!("warm ({} chunks from index)", chunks),
             Progress::Diffing => "diffing".to_string(),
             Progress::Transferring(sent, total) => {
@@ -1081,6 +1107,7 @@ fn main() {
             let mut no_delete = false;
             let mut excludes: Vec<String> = Vec::new();
             let mut parallel: u16 = 1;
+            let mut dry_run = false;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -1094,6 +1121,7 @@ fn main() {
                         trust_flag = Some(v.to_string());
                     }
                     "--no-delete" => no_delete = true,
+                    "--dry-run" => dry_run = true,
                     "--exclude" => {
                         let v = it
                             .next()
@@ -1149,6 +1177,7 @@ fn main() {
                     no_delete,
                     excludes,
                     parallel,
+                    dry_run,
                 },
             )
             .unwrap_or_else(|e| {
@@ -1166,6 +1195,7 @@ fn main() {
             let mut no_delete = false;
             let mut excludes: Vec<String> = Vec::new();
             let mut parallel: u16 = 1;
+            let mut dry_run = false;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -1182,6 +1212,7 @@ fn main() {
                         let v = it.next().unwrap_or_else(|| die("--from requires a path"));
                         from = Some(PathBuf::from(v));
                     }
+                    "--dry-run" => dry_run = true,
                     "--no-delete" => no_delete = true,
                     "--exclude" => {
                         let v = it
@@ -1241,6 +1272,7 @@ fn main() {
                     no_delete,
                     excludes,
                     parallel,
+                    dry_run,
                 },
             )
             .unwrap_or_else(|e| {

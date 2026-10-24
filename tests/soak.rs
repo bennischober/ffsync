@@ -152,6 +152,7 @@ fn hundred_sessions_do_not_accumulate_memory() {
             mtime: None,
             force_checksum: false,
             tree: false,
+            dry_run: false,
         };
         let recv_req = ReceiveRequest {
             path: target.clone(),
@@ -239,6 +240,7 @@ fn hundred_sessions_alternating_deltas_and_full_transfers() {
             mtime: None,
             force_checksum: false,
             tree: false,
+            dry_run: false,
         };
         let recv_req = ReceiveRequest {
             path: target.clone(),

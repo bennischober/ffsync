@@ -205,6 +205,38 @@ compressed with zstd (level 3 default). Because the wire is ordered, the
 receiver has already seen the PLAN_REMOTE entry for every DATA hash when it
 arrives — it can write immediately to `target_offset`, no buffering needed.
 
+### 7.1 Dry-run preview (v0.8 work, additive)
+
+`--dry-run` (send side) asks for a preview: the receiver executes nothing,
+writes nothing, deletes nothing, and reports what WOULD happen. The wire
+contract (no VERSION bump — additive frame + flag, same precedent as
+TREE_WORKER/TREE_FILE):
+
+1. The sender's HELLO carries flag bit 3 (`FLAG_DRY_RUN`).
+2. A receiver implementing the mode sends an empty `DRY_RUN_ACK` (0x11)
+   marker immediately after reading the HELLO — before any manifest or plan
+   traffic.
+3. **Old-peer contract:** a peer that ignores the bit on decode never reads
+   the marker — it waits for a manifest, so the marker buffers and the
+   receiver's manifest streams on normally; its plan loop then sees the
+   marker as an unexpected frame and fails LOUDLY (strict decode). Nothing
+   is transferred or written at any point.
+4. A dry-run sender reads the marker, then the flow is normal through the
+   plan. The receiver answers the PLAN itself:
+   - would-change (any PLAN_REMOTE entry, or a non-layout-identical Local
+     plan, or a zero-size sender file) → `NOT_MODIFIED` + `DRY_RUN_ACK`
+     (would-change report). The sender skips DATA and VERIFY entirely,
+     reads the report, returns `WouldChange`.
+   - nothing-would-change (empty plan with matching state, or an all-Local
+     plan reproducing the receiver's layout exactly) → `COMMIT_ACK` as
+     usual; the sender returns `InSync`. No index is written in dry-run.
+5. Tree sessions (§16.10) carry the preview as a TREE_BEGIN flag bit; the
+   delete pass counts instead of removing.
+
+The preview's zero-mutation guarantee is structural: no temp file is
+created on the receiver in the would-change path, and the sender requests
+no DATA.
+
 **Receiver write order (D10, empirically decided):** the receiver executes
 plan entries in order, resolving each PLAN_LOCAL chunk per hash from its union
 manifest (temp file before old file) and writing it *before* receiving the
@@ -766,6 +798,30 @@ no async runtime enters the tree (the D13 amendment's constraint). QUIC
 (D13 step 2) can later substitute the transport: a QUIC stream is
 `Read + Write`, so worker connections map onto streams without touching
 this layer again. That substitution is specified in §17.
+
+### 16.10 Dry-run preview (v0.8 work)
+
+`--dry-run` in tree mode is a TREE_BEGIN flag bit (bit 6,
+`TREE_FLAG_DRY_RUN`), mirrored by the receiver like every session flag:
+the sender announces it, the receiver mirrors it, and both run the normal
+TREE_BEGIN exchange and triage. Then:
+
+- The sender skips the per-file conversations entirely and goes straight
+  to its TREE_END barrier; the receiver skips its conversation loop and
+  its TREE_END barrier read consumes the sender's frame as usual (§16.8
+  membership discipline is untouched).
+- The receiver's delete pass runs in count-only mode: excluded and
+  protected paths are skipped exactly as in a real session, everything
+  else is counted (deepest-first order preserved), and the TREE_END
+  delete report carries the WOULD-delete numbers. Nothing is removed,
+  no directories are created, no kind-conflict cleanup happens.
+- The sender's preview outcome reports the conversation count from its
+  own triage (files that WOULD transfer), a sender-side byte estimate,
+  and the receiver's would-delete report.
+
+Old peers reject the unknown bit loudly at TREE_BEGIN decode (§16.2
+strict flag policy) — the same failure shape as every other flag-gated
+feature.
 
 ### 16.9 File metadata: POSIX mode bits (v4, D9 amendment)
 
