@@ -388,6 +388,7 @@ src/
                  (transport/quic.rs: quinn streams as sync Read + Write)
   main.rs         the CLI
   bin/bench.rs    the benchmark harness
+fuzz/             cargo-fuzz targets over the wire decoders (hostile input)
 concept/          design docs (positioning, decisions, protocol spec, research)
 evaluation/       measured results (chunking, rsync, parallel, tool comparison, memory)
 ```

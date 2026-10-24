@@ -93,6 +93,9 @@ Design documents (read before making architectural changes):
 | `cargo clippy` | Lint (no `clippy.toml`) |
 | `cargo audit` | Check `Cargo.lock` against RustSec advisories (see D14 in `concept/Design Decisions.md`) |
 | `cargo test --test soak -- --ignored` | Run the leak-guard soak test (100 sessions under a counting allocator; excluded from normal runs and CI) |
+| `cargo test --test fuzz_corpus` | Regenerate the fuzz corpus seeds under `fuzz/corpus/` (checked-in generator) |
+| `cargo fuzz run <target>` | Fuzz a wire decoder (needs nightly + a C toolchain locally; `.github/workflows/fuzz.yml` runs all six on a Monday schedule) |
+| `cargo test --test decoder_smoke` | Adversarial decoder smoke: truncations, garbage, bombs — runs in normal CI (no sanitizer) |
 
 CI (`.github/workflows/`) runs on push to `main` and on PRs, on
 Windows **and** Linux: `cargo fmt --check`, `cargo clippy --all-targets
@@ -370,7 +373,12 @@ pre-existing.
   may connect in either role.
 - Never commit generated artifacts. `.gitignore` covers `*.bin` and
   `/bench_tmp/` (bench fixtures); `.opencode/` holds local-only configuration
-  and credentials.
+  and credentials. `fuzz/corpus/`, `fuzz/target/` and `fuzz/artifacts/`
+  are fuzz working state (gitignored via `fuzz/.gitignore`); the targets
+  (`fuzz/fuzz_targets/`), `fuzz/Cargo.toml` and the corpus-generator test
+  (`tests/fuzz_corpus.rs`) are tracked. The `fuzz/` workspace is excluded
+  from the crate's package and workspace; wire-codec changes should re-run
+  the fuzz targets (CI schedule covers the rest).
 
 ## Roadmap (from the concept docs)
 
