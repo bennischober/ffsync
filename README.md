@@ -12,7 +12,9 @@ commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue)](CHANGELOG.md)
+[![Crates.io](https://img.shields.io/crates/v/ffsync)](https://crates.io/crates/ffsync)
+[![docs.rs](https://img.shields.io/docsrs/ffsync)](https://docs.rs/ffsync)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
 
 </div>
@@ -140,7 +142,7 @@ Design decisions and their alternatives are recorded in
 
 ## Using it
 
-Install (three routes, fastest first for most users):
+Install (fastest routes first for most users):
 
 ```bash
 # 1. Download a prebuilt executable from the releases page (Windows zip,
@@ -153,6 +155,12 @@ cargo install ffsync
 # 3. From the repository (tracks main):
 cargo install --git https://github.com/bennischober/ffsync
 ```
+
+Package-manager routes (winget, Homebrew) are not set up yet — the
+prebuilt executables and `cargo install` are the supported paths.
+A Homebrew tap or a winget manifest can be added once there is demand;
+the release artifacts (zip/tar.gz with SHA-256 sidecars) are already
+shaped for both.
 
 Binaries do not auto-update; new releases are announced on the releases
 page. Verify a download against the attached `.sha256` sidecar
@@ -471,6 +479,17 @@ The reasoning is the product; it is all recorded:
   recorded reasoning (see D9 in `concept/Design Decisions.md`); the
   follow-or-warn symlink policy and POSIX mode bits are the shipped
   metadata story. D9's deferred metadata list is now empty.
+- **Done (1.0.0, post-release) - hardening regressions in CI (PR #15):**
+  Windows long-path tree sync (>260 chars) and a real-socket dry-run E2E
+  now run on every push; unix commits fsync the parent directory after
+  the rename.
+- **Done (post-1.0) - eager diff (D8, §9.2/§16.11):** `--eager` streams
+  chunk DATA during the manifest exchange, bounded by the position gate
+  (over-send 0 bytes in every paired run; 18–33% faster at 0 ms RTT,
+  12–18% at 30 ms). Landed for single-file first (PR #16), then tree
+  sessions including `--parallel` (PR #18): TREE_BEGIN bit 7, receiver
+  mirrors only on its own opt-in, a declining tree receiver converges
+  lazily.
 
 ## License
 
