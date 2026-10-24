@@ -1,0 +1,59 @@
+[package]
+name = "ffsync-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ffsync]
+path = ".."
+
+[[bin]]
+name = "fuzz_frame"
+path = "fuzz_targets/fuzz_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_hello"
+path = "fuzz_targets/fuzz_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_manifest_chunk"
+path = "fuzz_targets/fuzz_manifest_chunk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_plan_entry"
+path = "fuzz_targets/fuzz_plan_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tree_begin"
+path = "fuzz_targets/fuzz_tree_begin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tree_small"
+path = "fuzz_targets/fuzz_tree_small.rs"
+test = false
+doc = false
+bench = false
+
+# Prevent the workspace's profile/lint settings from leaking in.
+[workspace]

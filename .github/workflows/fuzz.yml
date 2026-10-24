@@ -1,0 +1,61 @@
+name: Fuzz (scheduled short run)
+
+# Runs the wire-codec fuzz targets on a schedule (cheap: 2 min per target
+# on CI hardware, ASAN build). Findings (crashes/OOM/hangs) upload the
+# artifacts. The decoders are pure functions over bytes — no network, no
+# filesystem state — so CI is the natural host; local runs need a C
+# toolchain this repo's primary machine does not have.
+#
+# Manual dispatch: run one target longer via the `minutes` input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "seconds per target (default 120)"
+        default: "120"
+  schedule:
+    # Mondays 04:07 UTC — catches regressions between pushes without
+    # burning minutes on every PR (the codecs change rarely).
+    - cron: "7 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_frame
+          - fuzz_hello
+          - fuzz_manifest_chunk
+          - fuzz_plan_entry
+          - fuzz_tree_begin
+          - fuzz_tree_small
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed corpus (the checked-in generator emits well-formed frames)
+        run: cargo test --test fuzz_corpus
+      - name: Fuzz
+        run: |
+          cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event.inputs.minutes || '120' }} -print_final_stats=1
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
