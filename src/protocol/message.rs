@@ -4,7 +4,7 @@
 //! of the [`framing`] envelope. Encoding is hand-rolled (D1: no protobuf).
 
 use blake3::Hash;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 
 use super::MAGIC;
 use super::framing::{self, Frame};
@@ -493,12 +493,6 @@ pub fn read_data(inp: &mut impl Read) -> Result<(Hash, Vec<u8>), MessageError> {
     let mut h = [0u8; 32];
     h.copy_from_slice(&frame.payload[..32]);
     Ok((Hash::from_bytes(h), frame.payload[32..].to_vec()))
-}
-
-/// Writes a frame and returns the wire length (for progress accounting).
-pub fn write_frame(out: &mut impl Write, frame: &Frame) -> io::Result<usize> {
-    frame.encode(out)?;
-    Ok(frame.encoded_len())
 }
 
 // ---------------------------------------------------------------------------
