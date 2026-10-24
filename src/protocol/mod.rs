@@ -1,4 +1,4 @@
-//! ffsync wire protocol v0.1 (`concept/Protocol v0.1.md`).
+//! ffsync wire protocol v0.1 (`concept/Protocol.md`).
 //!
 //! Layered as:
 //! - [`framing`]: the raw frame envelope (type byte + length + payload)

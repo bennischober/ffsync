@@ -3,7 +3,7 @@
 Protocol v4 (`MAGIC` + `VERSION` in `mod.rs`). Length-prefixed framing, typed
 message codecs, and the sender/receiver state machines for single-file sync
 (v2 flow) and tree sessions (v3 sequential, v4 parallel). Spec:
-`concept/Protocol v0.1.md` — implementation deviations are protocol bugs
+`concept/Protocol.md` — implementation deviations are protocol bugs
 unless the spec is amended first.
 
 ## STRUCTURE

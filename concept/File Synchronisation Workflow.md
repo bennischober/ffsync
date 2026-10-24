@@ -1,7 +1,7 @@
 The `ffsync` synchronisation process is a multi-phase pipeline designed to eliminate redundant work at every step. It uses a series of progressively deeper "diffs" to ensure that the expensive work of chunk-level analysis is only performed on the absolute minimum set of files required.
 
 > **Status (v0.3):** Phase 1 is implemented as the tree manifest exchange and
-> triage (`Design Decisions.md` D17, wire spec §16 of `Protocol v0.1.md`).
+> triage (`Design Decisions.md` D17, wire spec §16 of `concept/Protocol.md`).
 > Phase 2 is **absorbed into Phase 3**: the per-file conversation's VERIFY
 > (chunk-tree root comparison) is a strictly stronger identity check than a
 > per-file root exchange, and with warm indexes (D15) it costs no extra scan.

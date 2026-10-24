@@ -1,17 +1,17 @@
 # Deep Research Digest
 
 Provenance: two Gemini deep-research runs from the project's inception phase
-(November 2025), saved as markdown in this folder:
+(November 2025), digested here into the current decision framework: what
+they validate, what they challenge, and what we adopt / defer / reject.
 
-- `Designing a High-Performance, Resilient File Synchronization Protocol in
-  Rust_ A QUIC, BLAKE3, and CDC Approach.md` — overall architecture
-  ("RustSync"): transport, hashing, chunking, index structures, workflow.
-- `P2P Connection Challenge Resolution.md` — P2P connectivity: NAT traversal,
-  signaling, relay fallback.
-
-This document digests them into the current decision framework: what they
-validate, what they challenge, and what we adopt / defer / reject. The two
-source documents remain the primary sources; this digest is the working copy.
+The two raw source documents ("Designing a High-Performance, Resilient File
+Synchronization Protocol in Rust_ A QUIC, BLAKE3, and CDC Approach.md" —
+overall architecture, "RustSync" — and "P2P Connection Challenge
+Resolution.md" — NAT traversal, signaling, relay fallback) were removed
+from the repository on 2026-10-24: every decision-relevant claim and
+verdict lives in this digest, and the originals remain recoverable
+byte-for-byte from git history (tracked since commit `a16b4e9`). This
+digest is the working copy.
 
 ## Document 1: Architecture ("RustSync")
 
@@ -38,7 +38,7 @@ we have. Convergent points:
 | **gRPC/protobuf framing** (schema safety, streaming, cross-language) | **Reject for v0.1.** Our frame table is 11 fixed types over a length-prefixed stream — protobuf adds two heavy dependencies (tonic/prost) for a contract we can hold in one Rust enum. Revisit only if a third-party client ever matters. |
 | **Chunk sizes 32–256 KiB average** ("larger" by their framing, balancing metadata volume vs. dedup) | **Open empirical question — they challenge our 1 MiB.** Their concern is metadata volume for archival-scale dedup; ours is different: with avg 1 MiB / max 4 MiB, the boundary-shift over-send bound (D12, ~2×max = 8 MiB per modification region) is coarse. Smaller chunks tighten it at the cost of ~4× more chunks (hash-finalize overhead, plan frames, manifest bytes — all still tiny at single-file scale). Needs a bench parameter sweep, not an opinion. Registered as follow-up F1. |
 | **SeqCDC** (hashless CDC, 1.5–3.1× throughput vs. FastCDC, Waterloo Middleware '24) | **Note for later.** No mature Rust implementation; our `Chunker` trait makes swapping cheap when one appears. Follow-up F2. |
-| **Prolly-tree index sync** (Merkle traversal to localize divergence) | **Adopt the idea for tree sync (Phase 1 / protocol §14.6), not now.** Their design leads with directory trees; we deliberately scoped single-file first (D9). When tree sync arrives, a Merkle index over per-file trees is the right shape and the root-hash fast path (D11) generalizes to it naturally. |
+| **Prolly-tree index sync** (Merkle traversal to localize divergence) | **Adopted in spirit; the full mechanism rejected (D17).** Tree sync shipped (v0.3, D17) with per-file conversations instead — the per-file root-hash fast path (D11) is the divergence localizer. A prolly-tree/Merkle index over the whole tree is the structured version of D17's rejected "one mega-manifest of all chunks": it collapses per-file identity (verification is per-file root) and recreates the large-tree memory problem, plus a new persistent per-tree index to maintain and validate. The RTT win matters only on high-RTT links with huge trees, which `--parallel` (§16.8) already serves. Revisit as a spec §14 extension point only if such sessions ever dominate. |
 | **Mid-chunk resume** (`StreamChunkRequest` with start byte offset) | **Reject for v0.1.** Requires the sender to keep per-chunk stream state. Our chunk-granularity resume (§10) wastes at most one partially sent chunk (~avg chunk size) per interruption — negligible at our chunk sizes. |
 | **0-RTT session resumption** | **Adopt with a caveat for v0.2.** 0-RTT data is replayable; fine for read-only/idempotent sync steps, must not carry mutating commands without anti-replay handling. |
 

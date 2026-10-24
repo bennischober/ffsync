@@ -5,7 +5,7 @@ strong design culture; this document is the short path into it.
 
 ## The big rules
 
-1. **The spec is the contract.** `concept/Protocol v0.1.md` defines the
+1. **The spec is the contract.** `concept/Protocol.md` defines the
    wire protocol. Implementation deviations from it are bugs — if the spec
    is wrong, amend the spec FIRST (in the same PR), never the code alone.
 2. **Decisions are recorded.** Substantive design choices go into

@@ -113,7 +113,7 @@ flowchart LR
    last, after every transfer succeeded (`--no-delete` keeps them).
 
 The wire protocol is specified in
-[`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md): 17 frame types,
+[`concept/Protocol.md`](concept/Protocol.md): 17 frame types,
 length-prefixed, no protobuf.
 
 ## Built on
@@ -393,10 +393,11 @@ The reasoning is the product; it is all recorded:
   niche, why "build around rsync" does not work
 - [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D22 with
   alternatives and rejected options
-- [`concept/Protocol v0.1.md`](concept/Protocol%20v0.1.md) — the wire protocol
+- [`concept/Protocol.md`](concept/Protocol.md) — the wire protocol
   (tracks all versions; currently v4), frame by frame
 - [`concept/Deep Research Digest.md`](concept/Deep%20Research%20Digest.md) —
-  what the two deep-research runs got right, and what was rejected
+  what the two inception-phase deep-research runs got right, and what was
+  rejected (raw documents in git history)
 - [`evaluation/chunking.md`](evaluation/chunking.md),
   [`evaluation/rsync.md`](evaluation/rsync.md),
   [`evaluation/parallel.md`](evaluation/parallel.md),
