@@ -47,7 +47,11 @@ Design documents (read before making architectural changes):
   tree sync §16, v4 added the metadata/mode section §16.9): framing,
   handshake, manifest/plan/data flow, verification, resume, tree sync,
   QUIC. The implementation follows it; deviations are protocol bugs unless
-  the spec is amended first
+  the spec is amended first. Commit durability (§8.3): the temp file is
+  flushed before every rename (`Reconstructor::sync_temp`, 2026-10-23).
+  Dry-run (D20, §7.1/§16.10): zero-mutation preview — HELLO flag bit 3,
+  DRY_RUN_ACK (0x11) marker, tree would-delete report; HELLO flag decode
+  rejects unknown bits (strict codec).
 - `concept/Deep Research Digest.md` — what the two deep-research runs
   (architecture + P2P connectivity, saved alongside as markdown) got right,
   and what we rejected; its follow-ups F1–F4 are all closed
@@ -124,7 +128,11 @@ pre-existing.
   `fingerprints`): argument parsing, progress display, TCP/TLS/QUIC setup,
   the TOFU decision (prompt or `--trust`), and error reporting (~1300
   lines — tree glue lives here too, but the sync logic itself stays in
-  `protocol::sync` / `protocol::tree_sync`).
+  `protocol::sync` / `protocol::tree_sync`). `--dry-run` (D20, §7.1/§16.10)
+  previews a session with zero mutation: receiver answers the plan with
+  NOT_MODIFIED + DRY_RUN_ACK (would-change) or COMMIT_ACK (nothing would
+  change), no temp file, no index; tree mode runs triage-only with a
+  would-delete report.
 - `src/bin/bench.rs` — the benchmark harness: generates fixture variants
   (identical / modified / appended / fresh), scans both sides through the real
   pipeline, simulates the delta against a hash set, reconstructs the target

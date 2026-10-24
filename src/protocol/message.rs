@@ -34,6 +34,15 @@ impl Role {
 pub const FLAG_TRUST_TIMES: u16 = 1 << 0;
 pub const FLAG_EAGER: u16 = 1 << 1; // §9.2 (designed, unimplemented): must be 0 on the wire; rejected loudly
 pub const FLAG_RESUMING: u16 = 1 << 2;
+/// Dry-run offer (§7.1): the sender asks for a preview session — the
+/// receiver executes nothing, writes nothing, deletes nothing, and reports
+/// what WOULD happen. Sender-side flag; the receiver mirrors it internally.
+pub const FLAG_DRY_RUN: u16 = 1 << 3;
+
+/// All HELLO flag bits this build knows. Unknown bits are rejected at
+/// decode (strict-codec doctrine): two peers that interpret the same bit
+/// differently would desync the session.
+const HELLO_FLAG_KNOWN: u16 = FLAG_TRUST_TIMES | FLAG_EAGER | FLAG_RESUMING | FLAG_DRY_RUN;
 
 /// Protocol errors carried by the ERROR frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +244,9 @@ impl Message for Hello {
         }
         let version = read_u16_le(p, &mut pos)?;
         let flags = read_u16_le(p, &mut pos)?;
+        if flags & !HELLO_FLAG_KNOWN != 0 {
+            return Err(MessageError::Malformed("HELLO has unknown flag bits"));
+        }
         let role_byte = read_bytes(p, &mut pos, 1)?[0];
         let role = Role::from_u8(role_byte).ok_or(MessageError::Malformed("invalid role"))?;
         let cdc_min = read_u32_le(p, &mut pos)?;
@@ -549,7 +561,8 @@ const TREE_FLAG_KNOWN: u16 = crate::tree::TREE_FLAG_CHECKSUM
     | TREE_FLAG_EXCLUDES
     | TREE_FLAG_PARALLEL
     | TREE_FLAG_METADATA
-    | TREE_FLAG_NEGATION;
+    | TREE_FLAG_NEGATION
+    | crate::tree::TREE_FLAG_DRY_RUN;
 
 impl TreeBegin {
     pub fn into_frame(self) -> io::Result<Frame> {

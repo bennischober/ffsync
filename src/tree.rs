@@ -267,6 +267,9 @@ impl TreeManifest {
 /// the layout it gates.
 pub const TREE_FLAG_CHECKSUM: u16 = 1 << 0; // D11 tree-wide: no fast path
 pub const TREE_FLAG_NO_DELETE: u16 = 1 << 1; // §16.5 opt-out
+/// §16.10 dry-run: preview session — triage runs, conversations and
+/// deletions do not; the receiver reports what WOULD happen.
+pub const TREE_FLAG_DRY_RUN: u16 = 1 << 6;
 
 // ---- Exclude patterns (§16.7) ----
 //

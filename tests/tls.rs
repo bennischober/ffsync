@@ -110,6 +110,7 @@ mod tests {
                     mtime: None,
                     force_checksum: true,
                     tree: false,
+                    dry_run: false,
                 };
                 let recv_req = ffsync::protocol::sync::ReceiveRequest {
                     path: path.clone(),

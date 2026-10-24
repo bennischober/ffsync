@@ -205,6 +205,7 @@ mod tests {
                 mtime: None,
                 force_checksum: true, // keep the test deterministic
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -246,6 +247,7 @@ mod tests {
             mtime: None,
             force_checksum: false, // warm start needs the default mode
             tree: false,
+            dry_run: false,
         };
         let mk_recv = || ReceiveRequest {
             path: target.clone(),
@@ -364,6 +366,7 @@ mod tests {
                 mtime: None,
                 force_checksum: false,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -392,6 +395,7 @@ mod tests {
                 mtime: None,
                 force_checksum: false,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -430,6 +434,7 @@ mod tests {
                 mtime: None,
                 force_checksum: true,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -464,6 +469,7 @@ mod tests {
                 mtime: None,
                 force_checksum: true,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -505,6 +511,7 @@ mod tests {
                 mtime: None,
                 force_checksum: false,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -546,6 +553,7 @@ mod tests {
                 mtime: None,
                 force_checksum: true,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -661,6 +669,7 @@ mod tests {
                 mtime: None,
                 force_checksum: true,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -687,6 +696,7 @@ mod tests {
                 mtime: None,
                 force_checksum: true,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -724,6 +734,7 @@ mod tests {
                 mtime: Some(t),
                 force_checksum: false,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -854,6 +865,7 @@ mod tests {
                 mtime: None,
                 force_checksum: true,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -951,6 +963,7 @@ mod tests {
             mtime: None,
             force_checksum: false,
             tree: false,
+            dry_run: false,
         };
         let mk_recv = || ReceiveRequest {
             path: target.clone(),
@@ -1030,6 +1043,7 @@ mod tests {
                 mtime: None,
                 force_checksum: false,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -1096,6 +1110,7 @@ mod tests {
                 mtime: None,
                 force_checksum: false,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -1159,6 +1174,7 @@ mod tests {
                 mtime: None,
                 force_checksum: false,
                 tree: false,
+                dry_run: false,
             },
             ReceiveRequest {
                 path: target.clone(),
@@ -1186,5 +1202,120 @@ mod tests {
             idx.validate(&target, idx.cdc).is_some(),
             "and it validates against the target"
         );
+    }
+
+    #[test]
+    fn dry_run_reports_would_change_without_writing() {
+        let fx = Fixture::new("dry_run_change");
+        let src_data = vec![7u8; 2 * 1024 * 1024];
+        create_file(fx.source(), &src_data);
+        // Receiver's old file differs entirely.
+        let old_data = vec![9u8; 2 * 1024 * 1024];
+        let target = fx.path("target.bin");
+        create_file(&target, &old_data);
+        let before = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+        let s = SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "src.bin".into(),
+            mtime: None,
+            force_checksum: false,
+            tree: false,
+            dry_run: true,
+        };
+        let r = ReceiveRequest {
+            path: target.clone(),
+            local_source: target.clone(),
+            force_checksum: false,
+            tree: false,
+            apply_mtime: None,
+            apply_mode: None,
+        };
+        let (s_out, r_out) = run_sync(s, r);
+        assert!(
+            matches!(s_out, Ok(SyncOutcome::WouldChange)),
+            "sender: {:?}",
+            s_out
+        );
+        assert!(
+            matches!(r_out, Ok(SyncOutcome::WouldChange)),
+            "receiver: {:?}",
+            r_out
+        );
+        // Nothing was written: content identical, no temp file, mtime intact.
+        assert_eq!(std::fs::read(&target).unwrap(), old_data);
+        assert!(!target.with_extension("ffsync-tmp").exists());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            before,
+            "mtime must be untouched by a dry run"
+        );
+        // And no index sidecar was created.
+        assert!(!target.with_extension("ffsync-index").exists());
+    }
+
+    #[test]
+    fn dry_run_reports_nothing_to_do_when_identical() {
+        let fx = Fixture::new("dry_run_same");
+        let src_data = vec![3u8; 512 * 1024];
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data.clone());
+
+        let s = SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "src.bin".into(),
+            mtime: None,
+            force_checksum: true, // defeat the fast path so a plan is built
+            tree: false,
+            dry_run: true,
+        };
+        let r = ReceiveRequest {
+            path: target.clone(),
+            local_source: target.clone(),
+            force_checksum: true,
+            tree: false,
+            apply_mtime: None,
+            apply_mode: None,
+        };
+        let (s_out, r_out) = run_sync(s, r);
+        assert!(
+            matches!(s_out, Ok(SyncOutcome::InSync)),
+            "sender: {:?}",
+            s_out
+        );
+        assert!(
+            matches!(r_out, Ok(SyncOutcome::InSync)),
+            "receiver: {:?}",
+            r_out
+        );
+    }
+
+    #[test]
+    fn hello_with_unknown_flag_bit_is_rejected() {
+        // Strict-codec doctrine: a HELLO with bits this build does not know
+        // must fail at decode (TREE_BEGIN already did this; HELLO did not).
+        use ffsync::protocol::message::{Hello, Message, Role};
+        let mut hello = Hello {
+            version: ffsync::protocol::VERSION,
+            flags: 0x8000, // not a known bit
+            role: Role::Sender,
+            cdc_min: 16384,
+            cdc_avg: 65536,
+            cdc_max: 262144,
+            file_size: 1,
+            file_mtime: 0,
+            file_mtime_nanos: 0,
+            path: "x".into(),
+        };
+        let frame = hello.clone().into_frame().unwrap();
+        let err = Hello::from_frame(frame).unwrap_err();
+        assert!(
+            matches!(err, ffsync::protocol::message::MessageError::Malformed(_)),
+            "unknown bit must be Malformed, got {err:?}"
+        );
+        hello.flags = 0;
+        let frame = hello.into_frame().unwrap();
+        assert!(Hello::from_frame(frame).is_ok());
     }
 }

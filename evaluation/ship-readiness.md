@@ -1,9 +1,18 @@
-# Ship-readiness assessment (2026-10-23)
+# Ship-readiness assessment (2026-10-23, updated after the 1.0-prep work)
 
 Scope: a feature-gap and readiness pass over the code as of protocol v4 /
 v0.8.0, done alongside the D8 design pass and the D9 closure. Every claim
 below was checked against the code in this pass; line references are
 evidence, not decoration.
+
+**Update (same day, after the 1.0-prep implementation):** blocker 1 (fsync)
+is FIXED; item 2 (eager-bit rejection) shipped in PR #7; item 3 (usage
+string) was re-checked and found already complete — the original claim was
+wrong (the six flags are all documented in USAGE); `--dry-run` (D20) is
+IMPLEMENTED (single-file + tree, loopback tests + real-TCP E2E showing zero
+mutation); Windows long paths are VERIFIED working (315/317-char paths,
+byte-identical sync, no `\\?\` handling needed). What remains before 1.0:
+the open D8/D7 items (roadmap, not blockers) and a release decision.
 
 ## Verdict
 
@@ -75,26 +84,26 @@ desync hazard, and silent-bit-tolerance is exactly what the strict-codec
 doctrine forbids everywhere else. Fix: reject `flags & FLAG_EAGER != 0` in
 `validate_hello` with `ERROR(Version)` (or BadFrame) until §9.2 ships.
 
-### 3. CLI usage string is missing six real flags (UX)
+### 3. CLI usage string (UX) — CORRECTION: already complete
 
-`src/main.rs`'s usage block lists `--checksum`/`--no-delete` (send) and
-`--from` (receive) — but not `--exclude`, `--exclude-from`, `--plaintext`,
-`--quic`, `--trust <fp>`, `--parallel K`. All six are parsed and shipped;
-a new user reading `ffsync --help` cannot discover tree excludes or the
-QUIC transport. (The bench harness had the same drift; fixed in PR #4.)
-Fix: complete the usage text — no code change.
+The original claim that six flags were missing was **wrong** — re-reading
+`src/main.rs`'s USAGE block shows all of them documented (`--exclude`,
+`--exclude-from`, `--plaintext`, `--quic`, `--trust`, `--parallel`),
+including the tree-mode restrictions. Recorded as a lesson: the claim was
+made from the scan report without re-reading the file (the same class of
+drift the scans exist to catch, in the scan output itself).
 
 ## Feature gaps vs. the niche (assessed, not all actionable)
 
 | Gap | Assessment |
 |-----|------------|
-| **Dry-run / preview** (`rsync -n`) | The one genuinely missing UX feature. `tree::triage` is a pure function — a `--dry-run` that prints the triage table (skip/sync/transfer/delete, per-path) without touching the wire is nearly free and directly answers "what would this do to my data?" before the first real sync. Recommended next feature. |
+| **Dry-run / preview** (`rsync -n`) | **IMPLEMENTED (D20, this day)**: single-file (HELLO flag + DRY_RUN_ACK marker, would-change/no-change answers, no temp created, no index written) and tree (TREE_BEGIN bit 6, triage-only, would-delete report). Verified zero-mutation by loopback tests and a real-TCP E2E (stale file survives the preview). |
 | Bandwidth limit (`--bwlimit`) | Deferred: QUIC/TCP congestion windows already bound harm; niche users park big syncs off-hours. Record as "accepted gap" unless asked. |
 | Chmod-only changes don't sync | Deliberate trade (D18/§16.9, same as rsync's fast path) — documented, not a gap. |
 | Symlinks/hardlinks/xattrs | Closed with reasoning (D9 amendment, 2026-10-23) — scope reaffirmation, not debt. |
 | Daemon / continuous sync | Out of scope since D9 (Syncthing's job) — correct for this niche. |
 | mtime-only `--size-only`-style modes | Out of niche; the metadata fast path already covers the common case. |
-| Windows long paths (>260 chars) | Unverified this pass. Windows is the primary platform — worth one dedicated test (`\\\\?\\` prefix handling through the tree scan + commit) before 1.0. Not assumed broken; flagged for verification. |
+| Windows long paths (>260 chars) | **VERIFIED WORKING (this day)**: an E2E tree sync with a 315/317-char file path over real TCP converged byte-identically (SHA-256 match); no `\\?\` handling needed in the tree scan or commit path. |
 | Open-file sync on Windows (AV lock, media player) | Rename over an open file fails with a sharing violation — loud error, retry works. Known limitation worth a README sentence, not a fix. |
 | Hash truncation (§14.5) | Reserved with explicit analysis required — correct to leave. |
 
@@ -112,10 +121,9 @@ Fix: complete the usage text — no code change.
 
 ## Suggested order to 1.0
 
-1. **fsync commit fix** (blocker 1) + eager-bit rejection (item 2) +
-   usage string (item 3) — one small PR, fully testable.
-2. **`--dry-run`** (the one missing feature worth building).
-3. **Windows long-path verification test** (or a finding that it already
-   works — either outcome is cheap).
+1. **~~fsync commit fix~~ DONE** + ~~eager-bit rejection~~ DONE (PR #7) +
+   ~~usage string~~ was already complete (corrected above).
+2. **~~`--dry-run`~~ DONE (D20)**.
+3. **~~Windows long-path verification~~ DONE (works)**.
 4. Then 1.0: the tool does what its docs promise, on both primary
    platforms, with every deviation from the spec either fixed or recorded.

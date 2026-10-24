@@ -116,6 +116,9 @@ pub enum Progress {
     Verifying,
     /// Sync completed without any transfer (fast path or empty plan).
     NothingToDo,
+    /// Dry-run (§7.1): the sync would change the target; nothing was
+    /// written. Reported to the sender as NOT_MODIFIED + DRY_RUN_ACK.
+    WouldChange,
     /// An empty file was created (or truncated to empty) and committed —
     /// real work (a state change on disk) even though no bytes moved.
     /// Distinguished from `NothingToDo` so the display never calls a
@@ -132,6 +135,12 @@ pub struct SendRequest {
     pub mtime: Option<SystemTime>,
     /// Disable the size+mtime fast path (rsync `--checksum` semantics, D11).
     pub force_checksum: bool,
+    /// Dry-run (§7.1): preview only — the receiver executes nothing, writes
+    /// nothing, deletes nothing, and reports what would happen. The sender
+    /// offers the mode in HELLO; a peer that does not implement it fails
+    /// the session loudly (old peers stream their manifest after the plan,
+    /// which the dry-run sender detects before any DATA is requested).
+    pub dry_run: bool,
     /// Tree mode (v3, D17): the sync runs inside a tree session. Changes
     /// stream-positional behavior — the fast path does NOT close the
     /// connection after NOT_MODIFIED (the tree session continues with the
@@ -169,6 +178,9 @@ pub enum SyncOutcome {
     InSync,
     /// Receiver converged; delta bytes were transferred.
     Transferred { bytes: u64, chunks: usize },
+    /// Dry-run (§7.1): the sync WOULD have changed the target; nothing was
+    /// written. Sender and receiver both report it for the same session.
+    WouldChange,
 }
 
 fn unix_secs(t: Option<SystemTime>) -> u64 {
@@ -336,10 +348,14 @@ where
     progress(Progress::Diffing);
 
     // ---- HELLO ----
-    let hello_flags = if request.force_checksum {
+    let hello_flags = (if request.force_checksum {
         0
     } else {
         FLAG_TRUST_TIMES
+    }) | if request.dry_run {
+        message::FLAG_DRY_RUN
+    } else {
+        0
     };
     let hello = Hello {
         version: super::VERSION,
@@ -374,6 +390,35 @@ where
     };
 
     // ---- Fast path (§4): size+mtime equal and trust_times agreed ----
+    // §7.1 dry-run: the receiver accepts the preview with a marker frame
+    // before the manifest exchange. An old peer streams manifest frames
+    // here instead — abort before any plan exists; nothing can be mutated.
+    if request.dry_run {
+        let marker = framing::read_frame(stream)?;
+        match marker.ftype {
+            framing::T_DRY_RUN_ACK => {}
+            framing::T_MANIFEST_CHUNK | framing::T_MANIFEST_DONE => {
+                let _ = send_error_and_finish(
+                    stream,
+                    ErrorCode::Aborted,
+                    "peer does not support --dry-run (no DRY_RUN_ACK after HELLO); aborted before any transfer",
+                );
+                return Err(SyncError::Protocol(
+                    "peer does not support --dry-run (old ffsync?)".into(),
+                ));
+            }
+            framing::T_ERROR => {
+                let (code, msg) = message::read_error_payload(&marker)?;
+                return Err(SyncError::Peer(code, msg));
+            }
+            other => {
+                return Err(SyncError::Protocol(format!(
+                    "expected DRY_RUN_ACK or manifest, got 0x{:02X}",
+                    other
+                )));
+            }
+        }
+    }
     // Sub-second mtime matters (v0.2, D11/D15): whole-second comparison let a
     // same-second rewrite with unchanged size fast-path as "in sync" — a
     // silent wrong-content success (found by the warm-start tests). rsync
@@ -505,9 +550,11 @@ where
     // ---- Data transfer (§7) ----
     // Chunks are hashed from the mmap'd pipeline, but for v0.1 we re-read the
     // chunk bytes from the file. zstd-compress each chunk payload.
+    // §7.1: in dry-run mode the receiver has already answered (NOT_MODIFIED
+    // + DRY_RUN_ACK) — skip DATA and VERIFY entirely; read the report.
     let mut sent: u64 = 0;
     let mut sent_chunks: usize = 0;
-    if remote_total > 0 {
+    if remote_total > 0 && !request.dry_run {
         let mut file = File::open(&request.path)?;
         let mut chunk_buf = Vec::new();
         // One zstd context reused across all chunks: bulk::compress would
@@ -538,24 +585,35 @@ where
     }
 
     // ---- VERIFY + COMMIT_ACK (§8) ----
-    message::encode_verify(root)?.encode(stream)?;
-    stream.flush()?;
+    // §7.1: in dry-run mode VERIFY is skipped with the data phase — the
+    // receiver answers the plan itself (NOT_MODIFIED + DRY_RUN_ACK when
+    // the sync would change something, COMMIT_ACK when it would not).
+    if !request.dry_run {
+        message::encode_verify(root)?.encode(stream)?;
+        stream.flush()?;
+    }
 
-    // The receiver answers COMMIT_ACK or NOT_MODIFIED (empty plan) or ERROR.
+    // The receiver answers COMMIT_ACK (committed), or in dry-run mode
+    // (§7.1) NOT_MODIFIED + DRY_RUN_ACK (would change — nothing was
+    // written), or ERROR.
     let frame = framing::read_frame(stream)?;
     match frame.ftype {
         framing::T_COMMIT_ACK => {
-            // Commit succeeded: persist our chunk list for the next warm
-            // start (D15). The source is verified content at this point —
-            // the receiver hash-verified the reconstruction against this
-            // exact chunk list.
-            let index = FileIndex::from_scan(
-                source_chunks,
-                file_size,
-                crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
-                cdc_u32,
-            );
-            let _ = crate::index::write_index(&request.path, &index);
+            // §7.1: in dry-run mode COMMIT_ACK is the receiver's "nothing
+            // would change" report (no temp was created, no index is
+            // written). Normal mode: commit succeeded — persist our chunk
+            // list for the next warm start (D15). The source is verified
+            // content at this point — the receiver hash-verified the
+            // reconstruction against this exact chunk list.
+            if !request.dry_run {
+                let index = FileIndex::from_scan(
+                    source_chunks,
+                    file_size,
+                    crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                    cdc_u32,
+                );
+                let _ = crate::index::write_index(&request.path, &index);
+            }
             // InSync is for plans that changed nothing on the receiver: the
             // zero-entry plan, or an all-Local plan that reproduced the
             // receiver's chunk layout (no rewrite). Any executed plan —
@@ -569,6 +627,26 @@ where
                     chunks: sent_chunks,
                 })
             }
+        }
+        framing::T_NOT_MODIFIED => {
+            // §7.1: the receiver accepted the dry-run offer and reports a
+            // would-change; the DRY_RUN_ACK frame is the formal accept.
+            let ack = framing::read_frame(stream)?;
+            if ack.ftype != framing::T_DRY_RUN_ACK {
+                return Err(SyncError::Protocol(format!(
+                    "expected DRY_RUN_ACK after NOT_MODIFIED, got 0x{:02X}",
+                    ack.ftype
+                )));
+            }
+            if request.dry_run {
+                progress(Progress::WouldChange);
+                return Ok(SyncOutcome::WouldChange);
+            }
+            // Not our request: a receiver that should have committed sent
+            // NOT_MODIFIED instead (old-peer contract violation).
+            Err(SyncError::Protocol(
+                "receiver sent NOT_MODIFIED where a commit was expected".into(),
+            ))
         }
         framing::T_ERROR => {
             let (code, msg) = message::read_error_payload(&frame)?;
@@ -650,6 +728,9 @@ where
     if resuming {
         flags |= FLAG_RESUMING;
     }
+    // §7.1: dry-run acceptance is a marker frame (T_DRY_RUN_ACK) sent
+    // right after the peer's HELLO is validated — not a HELLO bit (both
+    // HELLOs are on the wire before either is read).
     let hello = Hello {
         version: super::VERSION,
         flags,
@@ -686,6 +767,16 @@ where
         }
         Err(other) => return Err(other),
     };
+    // §7.1: accept the dry-run offer with a marker frame, before manifest
+    // or plan traffic. An old peer (bit ignored on decode) never reads it
+    // here — it waits for our manifest, so the marker buffers and our
+    // manifest streams on; its plan loop then sees the marker as an
+    // unexpected frame and fails loudly BEFORE any transfer. A peer that
+    // implements §7.1 consumes the marker before its manifest read.
+    if peer.flags & message::FLAG_DRY_RUN != 0 {
+        message::encode_empty(framing::T_DRY_RUN_ACK)?.encode(stream)?;
+        stream.flush()?;
+    }
     // Tree mode (§16.6): the sender's HELLO mtime is what the receiver must
     // carry after commit — fill the per-conversation apply_mtime here.
     let peer_mtime = if request.tree {
@@ -892,6 +983,56 @@ where
             }
         }
     }
+    // §7.1 dry-run: accept the offer only in the hoisted preview branch
+    // below (which never writes anything). Plans with entries are answered
+    // there — a preview that streams the whole file first would defeat the
+    // point. A non-dry-run peer never sees this branch.
+    let dry_run = peer.flags & message::FLAG_DRY_RUN != 0;
+
+    // §7.1 dry-run (hoisted, before any temp preparation): decide whether
+    // the sync WOULD change the target, answer, and return — nothing is
+    // written, no temp is created, and the sender (which offered the mode)
+    // skips its DATA/VERIFY phases and reads the report. Answers:
+    // would-change → NOT_MODIFIED + DRY_RUN_ACK; nothing-would-change →
+    // COMMIT_ACK (same frame the normal empty-plan path answers).
+    // Would-change cases: a plan that would execute (any Remote, or an
+    // all-Local plan that does not reproduce the receiver's layout —
+    // those reposition bytes), or a zero-size sender file (truncate or
+    // create — both are state changes; an identical empty file would have
+    // taken the §4 fast path before any plan existed). Old peers were
+    // already detected at the marker: they stream a manifest where a §7.1
+    // peer sends DRY_RUN_ACK, so nothing reaches this branch unless both
+    // peers implement the mode.
+    let plan_reproduces_local_layout = !plan.is_empty()
+        && plan.iter().all(|e| matches!(e, PlanEntry::Local { .. }))
+        && plan.len() == local_chunks.len()
+        && plan.iter().zip(local_chunks.iter()).all(|(e, c)| match e {
+            PlanEntry::Local {
+                target_offset,
+                length,
+                ..
+            } => *target_offset == c.offset && *length as usize == c.length,
+            _ => false,
+        });
+    if dry_run {
+        let would_change =
+            peer.file_size == 0 || (!plan.is_empty() && !plan_reproduces_local_layout);
+        if would_change {
+            message::encode_empty(framing::T_NOT_MODIFIED)?.encode(stream)?;
+            stream.flush()?;
+            message::encode_empty(framing::T_DRY_RUN_ACK)?.encode(stream)?;
+            stream.flush()?;
+            progress(Progress::WouldChange);
+            return Ok(SyncOutcome::WouldChange);
+        }
+        // Would NOT change (empty plan, or an all-Local plan that already
+        // reproduces the receiver's layout): answer COMMIT_ACK like the
+        // normal empty-plan path — the dry-run sender reads it as InSync.
+        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        stream.flush()?;
+        progress(Progress::NothingToDo);
+        return Ok(SyncOutcome::InSync);
+    }
 
     // ---- Prepare the temp file (§8.1) ----
     let target_size = peer.file_size;
@@ -1096,8 +1237,13 @@ where
             ));
         }
         // Hash verified; commit. Reconstruct the Reconstructor state: the
-        // temp file exists and is verified — rename atomically. Order is
-        // load-bearing (§16.9): rename → mode → mtime → stat → index.
+        // temp file exists and is verified — flush it (§8.3 durability:
+        // the rename is journaled, the data pages are not; renaming
+        // without fsync can leave a renamed-but-empty target after a
+        // crash on some filesystems) and rename atomically. Order is
+        // load-bearing (§16.9): sync → rename → mode → mtime → stat →
+        // index.
+        reconstructor.sync_temp()?;
         clear_readonly_best_effort(&request.path);
         std::fs::rename(&temp_path, &request.path)?;
         apply_commit_mode(&request.path, request.apply_mode)?;
@@ -1128,7 +1274,9 @@ where
     // ---- Zero-entry plan (§8) or an all-Local plan that already reproduces
     // the receiver's chunk layout: nothing to write. The sender still sends
     // VERIFY; compare against the root of our current state (temp when
-    // resuming, else the old file). ----
+    // resuming, else the old file). In dry-run mode (§7.1) a would-change
+    // plan is answered NOT_MODIFIED + DRY_RUN_ACK instead of executing —
+    // nothing is ever written. ----
     let verify_root = message::read_verify(stream)?;
     // v3 (§16): a zero-size sender file means "converge to empty" — truncate
     // (or drop a resume temp) and verify the empty root. Must be checked
@@ -1187,6 +1335,15 @@ where
         Some(root) if root == verify_root => {
             if resuming {
                 // The previous attempt actually completed the data; commit it.
+                // Durability (§8.3): flush before the rename (see the
+                // executed-plan commit above).
+                let reconstructor = Reconstructor::open_existing(
+                    &request.path,
+                    &request.local_source,
+                    target_size,
+                )?;
+                reconstructor.sync_temp()?;
+                drop(reconstructor);
                 clear_readonly_best_effort(&request.path);
                 std::fs::rename(&temp_path, &request.path)?;
                 apply_commit_mode(&request.path, request.apply_mode)?;

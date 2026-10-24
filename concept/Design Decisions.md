@@ -299,6 +299,36 @@ metadata axis is now empty. Remaining genuinely-open D9-adjacent work: none
 on metadata; the roadmap's open items are performance (D7 flaw 2 barrier,
 D8 eager), not scope.
 
+## D20 — Dry-run preview: triage answers before anything moves (v0.8 work)
+
+**Decision:** `--dry-run` (send side) previews a session with zero
+mutation: the receiver executes nothing, writes nothing, deletes nothing,
+and reports what would happen. rsync `-n` semantics for ffsync.
+
+**Reasoning:** `tree::triage` is already a pure function with exactly the
+right outputs (skip/sync/transfer/create-dir/delete/kind-conflict), so the
+preview is a wire discipline around an existing capability, not new sync
+logic. The motivating use is trust: the first real sync to a new peer is a
+scary operation (deletes! overwrites!); a preview that provably cannot
+mutate makes the tool safe to try on real data.
+
+**Wire shape:** HELLO flag bit 3 offers the mode; the receiver accepts
+with a `DRY_RUN_ACK` (0x11) marker right after the HELLO, before any
+manifest/plan traffic — old peers reveal themselves by streaming a
+manifest there instead, and the sender aborts before anything moves
+(strict HELLO flag decode — added in this change; HELLO previously lacked
+the unknown-bit check TREE_BEGIN always had). The receiver answers the
+PLAN: would-change → NOT_MODIFIED + DRY_RUN_ACK (sender skips DATA and
+VERIFY); nothing-would-change → COMMIT_ACK. No temp file is created on
+the would-change path, no index is written. Tree mode carries the preview
+as TREE_BEGIN flag bit 6: triage runs, conversations and deletes do not,
+and the delete report counts instead of removing (§16.10).
+
+**Accepted cost:** the preview's byte numbers are sender-side estimates
+(real conversations measure actual transferred bytes; the preview cannot).
+Verify the no-mutation property in the loopback tests (mtime + content
+assertions) and the E2E (stale file survives the preview).
+
 ## D10 — Resume state: receiver-authoritative, locals-first write order
 
 **Status:** decided on simulation data (2026-10-22).

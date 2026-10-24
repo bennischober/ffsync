@@ -1420,6 +1420,7 @@ fn run_one_latency_session(
                         Ok(Box::new(ends.lock().unwrap().remove(0)) as Box<dyn ReadWrite>)
                     })
                 },
+                dry_run: false,
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -1435,6 +1436,7 @@ fn run_one_latency_session(
             no_delete: false,
             excludes: Vec::new(),
             parallel,
+            dry_run: false,
             connect_worker: {
                 let ends = std::sync::Mutex::new(sender_ends);
                 std::sync::Arc::new(move |_| {

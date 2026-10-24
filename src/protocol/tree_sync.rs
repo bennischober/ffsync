@@ -104,6 +104,11 @@ pub struct TreeSendRequest {
     /// connections through `connect_worker` after TREE_BEGIN. Values >16
     /// are rejected (§16.8 range).
     pub parallel: u16,
+    /// §16.10 dry-run: preview session — the receiver runs triage only,
+    /// reports what would change (conversation count, transfer bytes,
+    /// deletion count), and never writes. Old peers reject the unknown
+    /// TREE_BEGIN flag bit loudly (strict decode, §16.2).
+    pub dry_run: bool,
     /// Opens worker connection `index` (1..K−1) to the peer. The CLI
     /// supplies the closure (TCP connect + TLS); the state machine stays
     /// transport-agnostic. Called from multiple worker threads — Arc-shared,
@@ -127,6 +132,10 @@ pub struct TreeReceiveRequest {
     /// placed by its announced TREE_WORKER index, so any arrival order is
     /// valid. Arc-shared with the session's worker threads.
     pub accept_worker: std::sync::Arc<dyn Fn() -> io::Result<Box<dyn ReadWrite>> + Send + Sync>,
+    /// §16.10 dry-run (mirrored from the sender's TREE_BEGIN): the receiver
+    /// runs triage only — no conversations, no deletes, no writes; it
+    /// reports what would happen instead.
+    pub dry_run: bool,
 }
 
 /// Object-safe read+write stream (worker connections come back as these).
@@ -286,6 +295,7 @@ where
         mtime,
         force_checksum: checksum,
         tree: true,
+        dry_run: false, // per-file conversations never preview (§16.10 gates the session)
     };
     // The sender's mode needs no wire field of its own: the receiver reads
     // it from the TREE_BEGIN manifest entry for this rel_path (§16.9) —
@@ -362,6 +372,10 @@ where
         message::TREE_FLAG_NEGATION
     } else {
         0
+    } | if request.dry_run {
+        crate::tree::TREE_FLAG_DRY_RUN
+    } else {
+        0
     };
 
     // ---- TREE_BEGIN exchange ----
@@ -407,6 +421,56 @@ where
     // Sort by rel_path for deterministic order (§16.4).
     actions.sort();
 
+    // ---- §16.10 dry-run: triage-only preview. The receiver mirrors the
+    // flag, so it runs no conversations and deletes nothing; the sender
+    // skips its conversation phase and goes straight to TREE_END, whose
+    // reply carries the receiver's would-delete report. The preview's
+    // would-change numbers come from the local triage: |actions|
+    // conversations would run, and the bytes they would move are the
+    // sender-side estimate (transferred_bytes stays 0 — no conversation
+    // ran to measure real bytes).
+    if request.dry_run {
+        let would_transfer: u64 = actions
+            .iter()
+            .filter_map(|rel| {
+                manifest.get(rel).map(|e| {
+                    peer_manifest.get(rel).map_or(e.size, |p| {
+                        if p.size == e.size && p.mtime_secs == e.mtime_secs {
+                            0
+                        } else {
+                            e.size
+                        }
+                    })
+                })
+            })
+            .sum();
+        message::TreeEnd::default().into_frame()?.encode(stream)?;
+        stream.flush()?;
+        let frame = framing::read_frame(stream)?;
+        match frame.ftype {
+            framing::T_TREE_END => {
+                let report = TreeEnd::from_frame(frame)?;
+                return Ok(TreeOutcome {
+                    files: actions.len(),
+                    transferred_bytes: would_transfer,
+                    in_sync: 0,
+                    deleted: report.deleted_count,
+                    deleted_bytes: report.deleted_bytes,
+                });
+            }
+            framing::T_ERROR => {
+                let (code, msg) = message::read_error_payload(&frame)?;
+                return Err(SyncError::Peer(code, msg));
+            }
+            other => {
+                return Err(SyncError::Protocol(format!(
+                    "expected TREE_END, got 0x{:02X}",
+                    other
+                )));
+            }
+        }
+    }
+
     let total = actions.len();
     let mut transferred_bytes = 0u64;
     let mut in_sync = 0usize;
@@ -431,6 +495,7 @@ where
             match outcome {
                 SyncOutcome::InSync => in_sync += 1,
                 SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
+                SyncOutcome::WouldChange => {} // unreachable: dry-run sessions skip the conversation phase
             }
             progress(TreeProgress::FileDone(idx, total));
         }
@@ -559,6 +624,7 @@ where
             match outcome {
                 SyncOutcome::InSync => in_sync += 1,
                 SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
+                SyncOutcome::WouldChange => {} // unreachable: dry-run sessions skip the conversation phase
             }
             progress(TreeProgress::FileDone(idx, total));
         }
@@ -574,6 +640,7 @@ where
                 match o {
                     SyncOutcome::InSync => in_sync += 1,
                     SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
+                    SyncOutcome::WouldChange => {} // unreachable: dry-run sessions skip the conversation phase
                 }
             }
             worker_errors[w] = err;
@@ -664,6 +731,9 @@ where
     // announced and agreed, not inferred.
     let metadata = (peer_begin.flags & message::TREE_FLAG_METADATA) != 0;
     let negation = (peer_begin.flags & message::TREE_FLAG_NEGATION) != 0;
+    // §16.10: mirror the sender's dry-run bit — the session is a preview
+    // or it is not, on both peers.
+    let dry_run = (peer_begin.flags & crate::tree::TREE_FLAG_DRY_RUN) != 0;
     let flags = if request.force_checksum {
         TREE_FLAG_CHECKSUM
     } else {
@@ -682,6 +752,10 @@ where
         0
     } | if negation {
         message::TREE_FLAG_NEGATION
+    } else {
+        0
+    } | if dry_run {
+        crate::tree::TREE_FLAG_DRY_RUN
     } else {
         0
     };
@@ -722,7 +796,11 @@ where
             Triage::Sync | Triage::Transfer => conversation_paths.push(rel.clone()),
             Triage::CreateDir => {
                 // Sender-only dir: create it now (before conversations — a
-                // conversation file may land inside it).
+                // conversation file may land inside it). §16.10: counted,
+                // not created, in dry-run.
+                if dry_run {
+                    continue;
+                }
                 let p = abs_path(&request.root, rel);
                 if let Err(e) = std::fs::create_dir_all(&p) {
                     announce!(SyncError::Protocol(format!("cannot create dir {rel}: {e}")));
@@ -750,28 +828,36 @@ where
                 match sender_kind {
                     EntryKind::File => {
                         // Remove the receiver's dir at that path before the
-                        // conversation can write the file there.
-                        let p = abs_path(&request.root, rel);
-                        if p.is_dir()
-                            && let Err(e) = std::fs::remove_dir_all(&p)
-                        {
-                            announce!(SyncError::Protocol(format!(
-                                "cannot replace dir {rel} with file: {e}"
-                            )));
+                        // conversation can write the file there. §16.10:
+                        // nothing is removed in dry-run.
+                        if !dry_run {
+                            let p = abs_path(&request.root, rel);
+                            if p.is_dir()
+                                && let Err(e) = std::fs::remove_dir_all(&p)
+                            {
+                                announce!(SyncError::Protocol(format!(
+                                    "cannot replace dir {rel} with file: {e}"
+                                )));
+                            }
                         }
                         conversation_paths.push(rel.clone());
                     }
                     EntryKind::Dir => {
-                        let p = abs_path(&request.root, rel);
-                        if p.is_file()
-                            && let Err(e) = std::fs::remove_file(&p)
-                        {
-                            announce!(SyncError::Protocol(format!(
-                                "cannot replace file {rel} with dir: {e}"
-                            )));
-                        }
-                        if let Err(e) = std::fs::create_dir_all(&p) {
-                            announce!(SyncError::Protocol(format!("cannot create dir {rel}: {e}")));
+                        // §16.10: nothing is removed or created in dry-run.
+                        if !dry_run {
+                            let p = abs_path(&request.root, rel);
+                            if p.is_file()
+                                && let Err(e) = std::fs::remove_file(&p)
+                            {
+                                announce!(SyncError::Protocol(format!(
+                                    "cannot replace file {rel} with dir: {e}"
+                                )));
+                            }
+                            if let Err(e) = std::fs::create_dir_all(&p) {
+                                announce!(SyncError::Protocol(format!(
+                                    "cannot create dir {rel}: {e}"
+                                )));
+                            }
                         }
                     }
                 }
@@ -780,6 +866,10 @@ where
     }
 
     // ---- Per-file conversations (§16.4 sequential, §16.8 parallel) ----
+    // §16.10 dry-run: the receiver runs triage only. No conversations run,
+    // no deletes apply; the sender (mirrored flag) skips its conversation
+    // phase and sends TREE_END directly, whose reply reports what would be
+    // deleted. The dry-run conversation count is the preview.
     // True when the parallel control loop already consumed the sender's
     // TREE_END (§16.8): the §16.5 barrier read below must then be skipped.
     let mut sender_end_consumed = false;
@@ -787,292 +877,424 @@ where
     let total = conversation_paths.len();
     let mut transferred_bytes = 0u64;
     let mut in_sync = 0usize;
+    if !dry_run {
+        // The expected-conversation set for parallel sessions: each TREE_FILE
+        // must name a path from here, exactly once (§16.8 membership-not-order).
+        let mut remaining: std::collections::HashSet<String> =
+            conversation_paths.iter().cloned().collect();
 
-    // The expected-conversation set for parallel sessions: each TREE_FILE
-    // must name a path from here, exactly once (§16.8 membership-not-order).
-    let mut remaining: std::collections::HashSet<String> =
-        conversation_paths.iter().cloned().collect();
-
-    // Runs one receiver-side conversation on the given stream. Shared by
-    // the sequential loop and worker threads (§16.8). Grouped args struct
-    // (clippy too_many_arguments) — a plain data bundle.
-    struct ConvCtx<'a> {
-        root: &'a Path,
-        checksum: bool,
-        pipeline: &'a crate::chunking::PipelineConfig,
-    }
-    fn run_one<S: Read + Write>(
-        ctx: &ConvCtx<'_>,
-        stream: &mut S,
-        rel: &str,
-        idx: usize,
-        total: usize,
-        sender_mode: Option<u32>,
-        progress: &mut dyn FnMut(TreeProgress),
-    ) -> Result<(SyncOutcome, String), SyncError> {
-        let ConvCtx {
-            root,
-            checksum,
-            pipeline,
-        } = *ctx;
-        progress(TreeProgress::FileStart(idx, total));
-        let path = abs_path(root, rel);
-        if let Err(e) = ensure_parent_dir(&path) {
-            let err = SyncError::Protocol(format!("cannot create parent dirs for {rel}: {e}"));
-            let _ = send_error_and_finish(stream, ErrorCode::Aborted, &err.to_string());
-            return Err(err);
-        }
-
-        // The per-file HELLO must arrive now (the sender initiates).
-        // We answer with our own HELLO inside sync::receive; our request
-        // points at the file's local state (target path; local_source is
-        // the same file — tree mode has no --from concept).
-        let recv_req = ReceiveRequest {
-            path: path.clone(),
-            local_source: path.clone(),
-            force_checksum: checksum,
-            tree: true,
-            apply_mtime: None, // filled by sync::receive from the sender's HELLO
-            // §16.9: the sender's mode from the TREE_BEGIN manifest entry.
-            // None (apply nothing) when the session has no metadata section
-            // or the entry is absent — the lookup is by rel_path.
-            apply_mode: sender_mode,
-        };
-        let rel_c = rel.to_string();
-        let outcome = match sync::receive(stream, &recv_req, pipeline, &mut |p| {
-            progress(TreeProgress::FileProgress {
-                rel_path: rel_c.clone(),
-                progress: p,
-            });
-        }) {
-            Ok(o) => o,
-            Err(e) => {
-                // Announce the abort (best effort): the sender may still be
-                // reading its next conversation's reply and must fail fast
-                // instead of timing out.
-                let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
-                return Err(e);
-            }
-        };
-        progress(TreeProgress::FileDone(idx, total));
-        Ok((outcome, rel.to_string()))
-    }
-
-    if k <= 1 {
-        let ctx = ConvCtx {
-            root: &request.root,
-            checksum,
-            pipeline,
-        };
-        for (idx, rel) in conversation_paths.iter().enumerate() {
-            let sender_mode = sender_mode_of(&peer_manifest, rel, metadata);
-            let (outcome, _) = run_one(&ctx, stream, rel, idx, total, sender_mode, progress)?;
-            match outcome {
-                SyncOutcome::InSync => in_sync += 1,
-                SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
-            }
-            remaining.remove(rel);
-        }
-    } else {
-        // Parallel (§16.8): accept K−1 workers (any order), each announces
-        // itself with TREE_WORKER and is ACKed. Then every connection runs
-        // its own service loop — read TREE_FILE, validate membership
-        // (expected set, exactly once), run that conversation to
-        // completion, repeat — one native thread per connection, so an
-        // idle connection never blocks another (blocking I/O, no async
-        // runtime, per D13's constraint). The control connection's loop is
-        // the control thread itself: it reads TREE_FILEs (serving each)
-        // until the sender's TREE_END arrives there, joins the workers,
-        // then decides success/failure for the whole session.
-        let mut worker_streams: Vec<Option<Box<dyn ReadWrite>>> =
-            (0..k as usize).map(|_| None).collect();
-        // Workers connect in ARBITRARY order (the sender's threads race):
-        // accept any connection, read its TREE_WORKER, and place it by the
-        // ANNOUNCED index — then verify the set is exactly {1..K−1} (§16.8:
-        // "expects exactly the set {1..K−1}, in any arrival order").
-        for _ in 1..k {
-            let (mut s, announced) = {
-                let s = (request.accept_worker)().map_err(|e| {
-                    let err = SyncError::Io(e);
-                    let _ = send_error_and_finish(
-                        stream,
-                        ErrorCode::Aborted,
-                        &format!("cannot accept worker: {err}"),
-                    );
-                    err
-                })?;
-                let mut s = s;
-                let frame = framing::read_frame(&mut *s)?;
-                let announced = message::TreeWorker::from_frame(frame).map_err(|e| match e {
-                    MessageError::PeerError(code, msg) => SyncError::Peer(code, msg),
-                    other => SyncError::Protocol(format!("bad TREE_WORKER: {other}")),
-                })?;
-                (s, announced)
-            };
-            let w = announced.worker_index;
-            if w == 0 || w >= k {
-                let err =
-                    SyncError::Protocol(format!("worker announced index {w} (valid: 1..{k})"));
-                let _ = send_error_and_finish(&mut *s, ErrorCode::Aborted, &err.to_string());
-                return Err(err);
-            }
-            if worker_streams[w as usize].is_some() {
-                let err =
-                    SyncError::Protocol(format!("duplicate worker announcement for index {w}"));
-                let _ = send_error_and_finish(&mut *s, ErrorCode::Aborted, &err.to_string());
-                return Err(err);
-            }
-            message::TreeWorker { worker_index: w }
-                .into_frame()?
-                .encode(&mut *s)?;
-            s.flush()?;
-            worker_streams[w as usize] = Some(s);
-        }
-
-        // Shared coordination state:
-        // - `remaining`: the expected conversation set (membership check,
-        //   exactly once per path).
-        // - `first_error` + `cancel`: any thread's failure stops the others
-        //   before their NEXT conversation (§16.8 failure semantics).
-        // - events: (Start/Progress/Done) funnel to the control thread,
-        //   which owns the progress callback (it is not Send).
-        let remaining = std::sync::Arc::new(std::sync::Mutex::new(remaining));
-        let first_error = std::sync::Arc::new(std::sync::Mutex::new(None::<SyncError>));
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (event_tx, event_rx) = std::sync::mpsc::channel::<ConvEvent>();
-
-        // Serves one connection end-to-end. Used for worker threads; the
-        // control connection runs the same loop inline (it must also read
-        // the sender's TREE_END there, and one stream = one reader).
-        struct Shared {
-            remaining: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-            cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-            first_error: std::sync::Arc<std::sync::Mutex<Option<SyncError>>>,
-            root: PathBuf,
+        // Runs one receiver-side conversation on the given stream. Shared by
+        // the sequential loop and worker threads (§16.8). Grouped args struct
+        // (clippy too_many_arguments) — a plain data bundle.
+        struct ConvCtx<'a> {
+            root: &'a Path,
             checksum: bool,
-            /// §16.9: the sender's per-entry modes (empty when the session
-            /// has no metadata section).
-            sender_modes: std::collections::HashMap<String, u32>,
-            pipeline: crate::chunking::PipelineConfig,
+            pipeline: &'a crate::chunking::PipelineConfig,
         }
-        impl Shared {
-            fn record_error(&self, err: SyncError) {
-                let mut first = self.first_error.lock().unwrap();
-                if first.is_none() {
-                    *first = Some(err);
-                }
-                self.cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+        fn run_one<S: Read + Write>(
+            ctx: &ConvCtx<'_>,
+            stream: &mut S,
+            rel: &str,
+            idx: usize,
+            total: usize,
+            sender_mode: Option<u32>,
+            progress: &mut dyn FnMut(TreeProgress),
+        ) -> Result<(SyncOutcome, String), SyncError> {
+            let ConvCtx {
+                root,
+                checksum,
+                pipeline,
+            } = *ctx;
+            progress(TreeProgress::FileStart(idx, total));
+            let path = abs_path(root, rel);
+            if let Err(e) = ensure_parent_dir(&path) {
+                let err = SyncError::Protocol(format!("cannot create parent dirs for {rel}: {e}"));
+                let _ = send_error_and_finish(stream, ErrorCode::Aborted, &err.to_string());
+                return Err(err);
             }
+
+            // The per-file HELLO must arrive now (the sender initiates).
+            // We answer with our own HELLO inside sync::receive; our request
+            // points at the file's local state (target path; local_source is
+            // the same file — tree mode has no --from concept).
+            let recv_req = ReceiveRequest {
+                path: path.clone(),
+                local_source: path.clone(),
+                force_checksum: checksum,
+                tree: true,
+                apply_mtime: None, // filled by sync::receive from the sender's HELLO
+                // §16.9: the sender's mode from the TREE_BEGIN manifest entry.
+                // None (apply nothing) when the session has no metadata section
+                // or the entry is absent — the lookup is by rel_path.
+                apply_mode: sender_mode,
+            };
+            let rel_c = rel.to_string();
+            let outcome = match sync::receive(stream, &recv_req, pipeline, &mut |p| {
+                progress(TreeProgress::FileProgress {
+                    rel_path: rel_c.clone(),
+                    progress: p,
+                });
+            }) {
+                Ok(o) => o,
+                Err(e) => {
+                    // Announce the abort (best effort): the sender may still be
+                    // reading its next conversation's reply and must fail fast
+                    // instead of timing out.
+                    let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
+                    return Err(e);
+                }
+            };
+            progress(TreeProgress::FileDone(idx, total));
+            Ok((outcome, rel.to_string()))
         }
-        let shared = std::sync::Arc::new(Shared {
-            remaining: std::sync::Arc::clone(&remaining),
-            cancel: std::sync::Arc::clone(&cancel),
-            first_error: std::sync::Arc::clone(&first_error),
-            root: request.root.clone(),
-            checksum,
-            sender_modes: sender_modes_of(&peer_manifest, metadata),
-            pipeline: pipeline_clone(pipeline),
-        });
-        let serve_connection = {
-            let shared = std::sync::Arc::clone(&shared);
-            move |mut s: Box<dyn ReadWrite>, event_tx: std::sync::mpsc::Sender<ConvEvent>| {
-                loop {
-                    if shared.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        return; // some connection failed; stop before the next conversation
+
+        if k <= 1 {
+            let ctx = ConvCtx {
+                root: &request.root,
+                checksum,
+                pipeline,
+            };
+            for (idx, rel) in conversation_paths.iter().enumerate() {
+                let sender_mode = sender_mode_of(&peer_manifest, rel, metadata);
+                let (outcome, _) = run_one(&ctx, stream, rel, idx, total, sender_mode, progress)?;
+                match outcome {
+                    SyncOutcome::InSync => in_sync += 1,
+                    SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
+                    SyncOutcome::WouldChange => {} // unreachable: dry-run sessions skip the conversation phase
+                }
+                remaining.remove(rel);
+            }
+        } else {
+            // Parallel (§16.8): accept K−1 workers (any order), each announces
+            // itself with TREE_WORKER and is ACKed. Then every connection runs
+            // its own service loop — read TREE_FILE, validate membership
+            // (expected set, exactly once), run that conversation to
+            // completion, repeat — one native thread per connection, so an
+            // idle connection never blocks another (blocking I/O, no async
+            // runtime, per D13's constraint). The control connection's loop is
+            // the control thread itself: it reads TREE_FILEs (serving each)
+            // until the sender's TREE_END arrives there, joins the workers,
+            // then decides success/failure for the whole session.
+            let mut worker_streams: Vec<Option<Box<dyn ReadWrite>>> =
+                (0..k as usize).map(|_| None).collect();
+            // Workers connect in ARBITRARY order (the sender's threads race):
+            // accept any connection, read its TREE_WORKER, and place it by the
+            // ANNOUNCED index — then verify the set is exactly {1..K−1} (§16.8:
+            // "expects exactly the set {1..K−1}, in any arrival order").
+            for _ in 1..k {
+                let (mut s, announced) = {
+                    let s = (request.accept_worker)().map_err(|e| {
+                        let err = SyncError::Io(e);
+                        let _ = send_error_and_finish(
+                            stream,
+                            ErrorCode::Aborted,
+                            &format!("cannot accept worker: {err}"),
+                        );
+                        err
+                    })?;
+                    let mut s = s;
+                    let frame = framing::read_frame(&mut *s)?;
+                    let announced =
+                        message::TreeWorker::from_frame(frame).map_err(|e| match e {
+                            MessageError::PeerError(code, msg) => SyncError::Peer(code, msg),
+                            other => SyncError::Protocol(format!("bad TREE_WORKER: {other}")),
+                        })?;
+                    (s, announced)
+                };
+                let w = announced.worker_index;
+                if w == 0 || w >= k {
+                    let err =
+                        SyncError::Protocol(format!("worker announced index {w} (valid: 1..{k})"));
+                    let _ = send_error_and_finish(&mut *s, ErrorCode::Aborted, &err.to_string());
+                    return Err(err);
+                }
+                if worker_streams[w as usize].is_some() {
+                    let err =
+                        SyncError::Protocol(format!("duplicate worker announcement for index {w}"));
+                    let _ = send_error_and_finish(&mut *s, ErrorCode::Aborted, &err.to_string());
+                    return Err(err);
+                }
+                message::TreeWorker { worker_index: w }
+                    .into_frame()?
+                    .encode(&mut *s)?;
+                s.flush()?;
+                worker_streams[w as usize] = Some(s);
+            }
+
+            // Shared coordination state:
+            // - `remaining`: the expected conversation set (membership check,
+            //   exactly once per path).
+            // - `first_error` + `cancel`: any thread's failure stops the others
+            //   before their NEXT conversation (§16.8 failure semantics).
+            // - events: (Start/Progress/Done) funnel to the control thread,
+            //   which owns the progress callback (it is not Send).
+            let remaining = std::sync::Arc::new(std::sync::Mutex::new(remaining));
+            let first_error = std::sync::Arc::new(std::sync::Mutex::new(None::<SyncError>));
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (event_tx, event_rx) = std::sync::mpsc::channel::<ConvEvent>();
+
+            // Serves one connection end-to-end. Used for worker threads; the
+            // control connection runs the same loop inline (it must also read
+            // the sender's TREE_END there, and one stream = one reader).
+            struct Shared {
+                remaining: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+                cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+                first_error: std::sync::Arc<std::sync::Mutex<Option<SyncError>>>,
+                root: PathBuf,
+                checksum: bool,
+                /// §16.9: the sender's per-entry modes (empty when the session
+                /// has no metadata section).
+                sender_modes: std::collections::HashMap<String, u32>,
+                pipeline: crate::chunking::PipelineConfig,
+            }
+            impl Shared {
+                fn record_error(&self, err: SyncError) {
+                    let mut first = self.first_error.lock().unwrap();
+                    if first.is_none() {
+                        *first = Some(err);
                     }
-                    let frame = match framing::read_frame(&mut *s) {
-                        Ok(f) => f,
-                        // The sender closed this connection: its partition is
-                        // over (success or failure decided via first_error and
-                        // the remaining set after the joins).
-                        Err(framing::FrameError::Eof) => return,
-                        Err(e) => {
-                            shared.record_error(SyncError::from(e));
-                            return;
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let shared = std::sync::Arc::new(Shared {
+                remaining: std::sync::Arc::clone(&remaining),
+                cancel: std::sync::Arc::clone(&cancel),
+                first_error: std::sync::Arc::clone(&first_error),
+                root: request.root.clone(),
+                checksum,
+                sender_modes: sender_modes_of(&peer_manifest, metadata),
+                pipeline: pipeline_clone(pipeline),
+            });
+            let serve_connection = {
+                let shared = std::sync::Arc::clone(&shared);
+                move |mut s: Box<dyn ReadWrite>, event_tx: std::sync::mpsc::Sender<ConvEvent>| {
+                    loop {
+                        if shared.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return; // some connection failed; stop before the next conversation
                         }
-                    };
-                    let named = match message::TreeFile::from_frame(frame) {
-                        Ok(n) => n,
-                        Err(MessageError::PeerError(code, msg)) => {
-                            shared.record_error(SyncError::Peer(code, msg));
-                            return;
-                        }
-                        Err(other) => {
-                            shared.record_error(SyncError::Protocol(format!(
-                                "bad TREE_FILE: {other}"
-                            )));
-                            return;
-                        }
-                    };
-                    // Membership check (§16.8): exactly once, from the set.
-                    let taken = shared.remaining.lock().unwrap().remove(&named.rel_path);
-                    if !taken {
-                        let err = SyncError::Protocol(format!(
-                            "unexpected conversation: {} (not in the expected set, or already done)",
-                            named.rel_path
-                        ));
-                        let _ =
-                            send_error_and_finish(&mut *s, ErrorCode::Aborted, &err.to_string());
-                        shared.record_error(err);
-                        return;
-                    }
-                    let rel = named.rel_path.clone();
-                    let _ = event_tx.send(ConvEvent::Start(rel.clone()));
-                    let sender_mode = shared.sender_modes.get(&rel).copied();
-                    let outcome = run_one(
-                        &ConvCtx {
-                            root: &shared.root,
-                            checksum: shared.checksum,
-                            pipeline: &shared.pipeline,
-                        },
-                        &mut s,
-                        &rel,
-                        0,
-                        0,
-                        sender_mode,
-                        &mut |p| {
-                            if let TreeProgress::FileProgress { rel_path, progress } = p {
-                                let _ = event_tx.send(ConvEvent::Progress(rel_path, progress));
+                        let frame = match framing::read_frame(&mut *s) {
+                            Ok(f) => f,
+                            // The sender closed this connection: its partition is
+                            // over (success or failure decided via first_error and
+                            // the remaining set after the joins).
+                            Err(framing::FrameError::Eof) => return,
+                            Err(e) => {
+                                shared.record_error(SyncError::from(e));
+                                return;
                             }
-                        },
-                    );
-                    match outcome {
-                        Ok((o, _)) => {
-                            let _ = event_tx.send(ConvEvent::Done(rel, o));
-                        }
-                        Err(e) => {
-                            let _ =
-                                send_error_and_finish(&mut *s, ErrorCode::Aborted, &e.to_string());
-                            shared.record_error(e);
+                        };
+                        let named = match message::TreeFile::from_frame(frame) {
+                            Ok(n) => n,
+                            Err(MessageError::PeerError(code, msg)) => {
+                                shared.record_error(SyncError::Peer(code, msg));
+                                return;
+                            }
+                            Err(other) => {
+                                shared.record_error(SyncError::Protocol(format!(
+                                    "bad TREE_FILE: {other}"
+                                )));
+                                return;
+                            }
+                        };
+                        // Membership check (§16.8): exactly once, from the set.
+                        let taken = shared.remaining.lock().unwrap().remove(&named.rel_path);
+                        if !taken {
+                            let err = SyncError::Protocol(format!(
+                                "unexpected conversation: {} (not in the expected set, or already done)",
+                                named.rel_path
+                            ));
+                            let _ = send_error_and_finish(
+                                &mut *s,
+                                ErrorCode::Aborted,
+                                &err.to_string(),
+                            );
+                            shared.record_error(err);
                             return;
+                        }
+                        let rel = named.rel_path.clone();
+                        let _ = event_tx.send(ConvEvent::Start(rel.clone()));
+                        let sender_mode = shared.sender_modes.get(&rel).copied();
+                        let outcome = run_one(
+                            &ConvCtx {
+                                root: &shared.root,
+                                checksum: shared.checksum,
+                                pipeline: &shared.pipeline,
+                            },
+                            &mut s,
+                            &rel,
+                            0,
+                            0,
+                            sender_mode,
+                            &mut |p| {
+                                if let TreeProgress::FileProgress { rel_path, progress } = p {
+                                    let _ = event_tx.send(ConvEvent::Progress(rel_path, progress));
+                                }
+                            },
+                        );
+                        match outcome {
+                            Ok((o, _)) => {
+                                let _ = event_tx.send(ConvEvent::Done(rel, o));
+                            }
+                            Err(e) => {
+                                let _ = send_error_and_finish(
+                                    &mut *s,
+                                    ErrorCode::Aborted,
+                                    &e.to_string(),
+                                );
+                                shared.record_error(e);
+                                return;
+                            }
                         }
                     }
                 }
+            };
+
+            // Worker service threads.
+            let mut handles = Vec::new();
+            for slot in worker_streams.into_iter().flatten() {
+                let serve = serve_connection.clone();
+                let tx = event_tx.clone();
+                handles.push(std::thread::spawn(move || {
+                    serve(slot, tx);
+                }));
             }
-        };
+            drop(event_tx); // the control thread's copy; Done events keep flowing from workers
 
-        // Worker service threads.
-        let mut handles = Vec::new();
-        for slot in worker_streams.into_iter().flatten() {
-            let serve = serve_connection.clone();
-            let tx = event_tx.clone();
-            handles.push(std::thread::spawn(move || {
-                serve(slot, tx);
-            }));
-        }
-        drop(event_tx); // the control thread's copy; Done events keep flowing from workers
+            // Control connection: the same service loop inline. The loop ends
+            // when the sender's TREE_END arrives here — which the sender sends
+            // only after ALL its conversations (partitions + joined workers)
+            // succeeded, so reaching TREE_END means every conversation it knows
+            // of finished; the membership set must be empty then.
+            let mut idx = 0usize;
+            let mut session_error: Option<SyncError> = None;
+            let mut saw_tree_end = false;
+            loop {
+                // Forward whatever workers reported while we were blocked.
+                while let Ok(ev) = event_rx.try_recv() {
+                    match ev {
+                        ConvEvent::Start(_) => {
+                            progress(TreeProgress::FileStart(idx, total));
+                        }
+                        ConvEvent::Progress(rel_path, p) => {
+                            progress(TreeProgress::FileProgress {
+                                rel_path,
+                                progress: p,
+                            });
+                        }
+                        ConvEvent::Done(_, o) => {
+                            progress(TreeProgress::FileDone(idx, total));
+                            idx += 1;
+                            match o {
+                                SyncOutcome::InSync => in_sync += 1,
+                                SyncOutcome::Transferred { bytes, .. } => {
+                                    transferred_bytes += bytes
+                                }
+                                SyncOutcome::WouldChange => {} // unreachable: dry-run sessions skip the conversation phase
+                            }
+                        }
+                    }
+                }
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break; // a worker failed; stop serving (the error read below)
+                }
+                let frame = match framing::read_frame(stream) {
+                    Ok(f) => f,
+                    Err(framing::FrameError::Eof) => {
+                        // Sender dropped the control stream without TREE_END:
+                        // it saw a failure (its ERROR frame is either already
+                        // consumed above or the connection reset first).
+                        break;
+                    }
+                    Err(e) => {
+                        session_error = Some(SyncError::from(e));
+                        break;
+                    }
+                };
+                match frame.ftype {
+                    framing::T_TREE_FILE => {
+                        let named = match message::TreeFile::from_frame(frame) {
+                            Ok(n) => n,
+                            Err(MessageError::PeerError(code, msg)) => {
+                                session_error = Some(SyncError::Peer(code, msg));
+                                break;
+                            }
+                            Err(other) => {
+                                session_error =
+                                    Some(SyncError::Protocol(format!("bad TREE_FILE: {other}")));
+                                break;
+                            }
+                        };
+                        let taken = remaining.lock().unwrap().remove(&named.rel_path);
+                        if !taken {
+                            session_error = Some(SyncError::Protocol(format!(
+                                "unexpected conversation: {} (not in the expected set, or already done)",
+                                named.rel_path
+                            )));
+                            break;
+                        }
+                        let rel = named.rel_path.clone();
+                        let sender_mode =
+                            peer_manifest.get(&rel).filter(|_| metadata).map(|e| e.mode);
+                        let outcome = run_one(
+                            &ConvCtx {
+                                root: &request.root,
+                                checksum,
+                                pipeline,
+                            },
+                            stream,
+                            &rel,
+                            idx,
+                            total,
+                            sender_mode,
+                            &mut |tp| progress(tp),
+                        );
+                        idx += 1;
+                        match outcome {
+                            Ok((SyncOutcome::InSync, _)) => in_sync += 1,
+                            Ok((SyncOutcome::Transferred { bytes, .. }, _)) => {
+                                transferred_bytes += bytes
+                            }
 
-        // Control connection: the same service loop inline. The loop ends
-        // when the sender's TREE_END arrives here — which the sender sends
-        // only after ALL its conversations (partitions + joined workers)
-        // succeeded, so reaching TREE_END means every conversation it knows
-        // of finished; the membership set must be empty then.
-        let mut idx = 0usize;
-        let mut session_error: Option<SyncError> = None;
-        let mut saw_tree_end = false;
-        loop {
-            // Forward whatever workers reported while we were blocked.
+                            Ok((SyncOutcome::WouldChange, _)) => {}
+                            Err(e) => {
+                                let _ = send_error_and_finish(
+                                    stream,
+                                    ErrorCode::Aborted,
+                                    &e.to_string(),
+                                );
+                                session_error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    framing::T_TREE_END => {
+                        saw_tree_end = true;
+                        break;
+                    }
+                    framing::T_ERROR => {
+                        session_error = Some(match message::read_error_payload(&frame) {
+                            Ok((code, msg)) => SyncError::Peer(code, msg),
+                            Err(e) => SyncError::Protocol(format!("bad ERROR frame: {e}")),
+                        });
+                        break;
+                    }
+                    other => {
+                        session_error = Some(SyncError::Protocol(format!(
+                            "expected TREE_FILE or TREE_END on the control connection, got 0x{:02X}",
+                            other
+                        )));
+                        break;
+                    }
+                }
+            }
+
+            // Join worker threads, then drain the rest of the event stream.
+            for h in handles {
+                if h.join().is_err() && session_error.is_none() {
+                    session_error = Some(SyncError::Protocol("worker thread panicked".into()));
+                }
+            }
             while let Ok(ev) = event_rx.try_recv() {
                 match ev {
                     ConvEvent::Start(_) => {
@@ -1090,154 +1312,43 @@ where
                         match o {
                             SyncOutcome::InSync => in_sync += 1,
                             SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
+                            SyncOutcome::WouldChange => {} // unreachable: dry-run sessions skip the conversation phase
                         }
                     }
                 }
             }
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                break; // a worker failed; stop serving (the error read below)
-            }
-            let frame = match framing::read_frame(stream) {
-                Ok(f) => f,
-                Err(framing::FrameError::Eof) => {
-                    // Sender dropped the control stream without TREE_END:
-                    // it saw a failure (its ERROR frame is either already
-                    // consumed above or the connection reset first).
-                    break;
+
+            // Decide the session: error recorded anywhere wins; then TREE_END
+            // must have arrived AND every expected conversation must have run.
+            let recorded = first_error.lock().unwrap().take();
+            let has_error = session_error.is_some() || recorded.is_some();
+            if !has_error {
+                if !saw_tree_end {
+                    return Err(SyncError::Protocol(
+                        "sender ended the control connection without TREE_END".to_string(),
+                    ));
                 }
-                Err(e) => {
-                    session_error = Some(SyncError::from(e));
-                    break;
-                }
-            };
-            match frame.ftype {
-                framing::T_TREE_FILE => {
-                    let named = match message::TreeFile::from_frame(frame) {
-                        Ok(n) => n,
-                        Err(MessageError::PeerError(code, msg)) => {
-                            session_error = Some(SyncError::Peer(code, msg));
-                            break;
-                        }
-                        Err(other) => {
-                            session_error =
-                                Some(SyncError::Protocol(format!("bad TREE_FILE: {other}")));
-                            break;
-                        }
-                    };
-                    let taken = remaining.lock().unwrap().remove(&named.rel_path);
-                    if !taken {
-                        session_error = Some(SyncError::Protocol(format!(
-                            "unexpected conversation: {} (not in the expected set, or already done)",
-                            named.rel_path
-                        )));
-                        break;
-                    }
-                    let rel = named.rel_path.clone();
-                    let sender_mode = peer_manifest.get(&rel).filter(|_| metadata).map(|e| e.mode);
-                    let outcome = run_one(
-                        &ConvCtx {
-                            root: &request.root,
-                            checksum,
-                            pipeline,
-                        },
-                        stream,
-                        &rel,
-                        idx,
-                        total,
-                        sender_mode,
-                        &mut |tp| progress(tp),
-                    );
-                    idx += 1;
-                    match outcome {
-                        Ok((SyncOutcome::InSync, _)) => in_sync += 1,
-                        Ok((SyncOutcome::Transferred { bytes, .. }, _)) => {
-                            transferred_bytes += bytes
-                        }
-                        Err(e) => {
-                            let _ =
-                                send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
-                            session_error = Some(e);
-                            break;
-                        }
-                    }
-                }
-                framing::T_TREE_END => {
-                    saw_tree_end = true;
-                    break;
-                }
-                framing::T_ERROR => {
-                    session_error = Some(match message::read_error_payload(&frame) {
-                        Ok((code, msg)) => SyncError::Peer(code, msg),
-                        Err(e) => SyncError::Protocol(format!("bad ERROR frame: {e}")),
-                    });
-                    break;
-                }
-                other => {
-                    session_error = Some(SyncError::Protocol(format!(
-                        "expected TREE_FILE or TREE_END on the control connection, got 0x{:02X}",
-                        other
+                let pending = remaining.lock().unwrap().len();
+                if pending > 0 {
+                    return Err(SyncError::Protocol(format!(
+                        "sender's TREE_END arrived with {pending} expected conversations never announced"
                     )));
-                    break;
                 }
+                // Success. The control loop already consumed the sender's
+                // TREE_END (that is how it knew to stop serving), so the §16.5
+                // barrier read below must be skipped — the delete report is
+                // still sent from here. Gate the barrier read on a flag.
+                sender_end_consumed = true;
+            } else {
+                let err = session_error
+                    .or(recorded)
+                    .unwrap_or_else(|| SyncError::Protocol("session failed".to_string()));
+                return Err(err);
             }
         }
-
-        // Join worker threads, then drain the rest of the event stream.
-        for h in handles {
-            if h.join().is_err() && session_error.is_none() {
-                session_error = Some(SyncError::Protocol("worker thread panicked".into()));
-            }
-        }
-        while let Ok(ev) = event_rx.try_recv() {
-            match ev {
-                ConvEvent::Start(_) => {
-                    progress(TreeProgress::FileStart(idx, total));
-                }
-                ConvEvent::Progress(rel_path, p) => {
-                    progress(TreeProgress::FileProgress {
-                        rel_path,
-                        progress: p,
-                    });
-                }
-                ConvEvent::Done(_, o) => {
-                    progress(TreeProgress::FileDone(idx, total));
-                    idx += 1;
-                    match o {
-                        SyncOutcome::InSync => in_sync += 1,
-                        SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
-                    }
-                }
-            }
-        }
-
-        // Decide the session: error recorded anywhere wins; then TREE_END
-        // must have arrived AND every expected conversation must have run.
-        let recorded = first_error.lock().unwrap().take();
-        let has_error = session_error.is_some() || recorded.is_some();
-        if !has_error {
-            if !saw_tree_end {
-                return Err(SyncError::Protocol(
-                    "sender ended the control connection without TREE_END".to_string(),
-                ));
-            }
-            let pending = remaining.lock().unwrap().len();
-            if pending > 0 {
-                return Err(SyncError::Protocol(format!(
-                    "sender's TREE_END arrived with {pending} expected conversations never announced"
-                )));
-            }
-            // Success. The control loop already consumed the sender's
-            // TREE_END (that is how it knew to stop serving), so the §16.5
-            // barrier read below must be skipped — the delete report is
-            // still sent from here. Gate the barrier read on a flag.
-            sender_end_consumed = true;
-        } else {
-            let err = session_error
-                .or(recorded)
-                .unwrap_or_else(|| SyncError::Protocol("session failed".to_string()));
-            return Err(err);
-        }
-    }
+    } // end of the §16.10 dry-run gate: the conversation phase runs only
+    // when !dry_run; in dry-run the delete pass below becomes the
+    // would-delete report.
 
     // ---- TREE_END (§16.5): the sender's empty TREE_END is the "transfers
     // done" barrier. Read it BEFORE applying deletions (a sender aborting
@@ -1276,6 +1387,8 @@ where
     // Exclude protection (§16.7): paths matching the receiver's own patterns
     // — directly or via an excluded ancestor — are never deleted, even
     // though the (sender-filtered) manifests marked them receiver-only.
+    // §16.10 dry-run: nothing is removed — the counts below become the
+    // would-delete report.
     let mut deleted_count: u32 = 0;
     let mut deleted_bytes: u64 = 0;
     if !no_delete && !deletions.is_empty() {
@@ -1284,6 +1397,12 @@ where
         for (i, (rel, size)) in deletions.iter().enumerate() {
             let kind = manifest.get(rel).map(|e| e.kind).unwrap_or(EntryKind::File);
             if own_excludes.matches_path_or_ancestor(rel, kind) {
+                continue;
+            }
+            if dry_run {
+                deleted_count += 1;
+                deleted_bytes += size;
+                progress(TreeProgress::Deleting(i + 1, deleted_bytes));
                 continue;
             }
             let p = abs_path(&request.root, rel);
