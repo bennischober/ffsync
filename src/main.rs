@@ -2,8 +2,8 @@
 //! chunk-level delta sync.
 //!
 //! Usage:
-//!   ffsync send <file|dir> <host:port>   [--checksum] [--no-delete]
-//!   ffsync receive <file|dir> <port>     [--checksum] [--from <old-file>]
+//!   ffsync send <file|dir> <host:port>   [--checksum] [--no-delete] [--eager] [--dry-run]
+//!   ffsync receive <file|dir> <port>     [--checksum] [--from <old-file>] [--eager]
 //!
 //! The sender connects to a receiver that is listening. A directory path
 //! switches to tree sync (v0.3): the CONTENTS of the directory are synced
@@ -44,6 +44,9 @@ Usage:
   ffsync --help | --version
 
 Options:
+  --eager          eager diff (D8/§9.2, single-file): stream chunk DATA during
+                   the manifest exchange instead of after the plan; both peers
+                   need the flag; a declining peer fails the session loudly
   --checksum         skip no metadata shortcuts; always compare chunk roots
                      (rsync -c semantics). Also disables the warm-start index.
                      In tree mode this applies to every file in the tree.
@@ -318,6 +321,9 @@ struct CliOptions {
     /// §16.10 dry-run: preview session — the peer executes nothing and
     /// reports what would happen. Sender-side only.
     dry_run: bool,
+    /// §9.2 eager diff (single-file only): stream DATA during the manifest
+    /// exchange, bounded by the position gate. Both peers must pass --eager.
+    eager: bool,
 }
 
 fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()> {
@@ -330,6 +336,7 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
         excludes,
         parallel,
         dry_run,
+        eager,
     } = opts;
     let tree = file.is_dir();
     if tree {
@@ -429,6 +436,7 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
         mtime: None,
         force_checksum: opts.force_checksum,
         tree: false,
+        eager,
         dry_run,
     };
     let pipeline = PipelineConfig::default();
@@ -462,6 +470,7 @@ fn run_receive(
         excludes,
         parallel: _parallel, // single-file receive has no parallel sessions
         dry_run,             // §16.10: meaningless for single-file, used by tree mode
+        eager,
     } = opts;
     let listener = if quic {
         let (identity, created) = ffsync::transport::Identity::load_or_create()?;
@@ -575,6 +584,7 @@ fn run_receive(
         local_source,
         force_checksum,
         tree: false,
+        eager,
         apply_mode: None,
         apply_mtime: None,
     };
@@ -1108,6 +1118,7 @@ fn main() {
             let mut excludes: Vec<String> = Vec::new();
             let mut parallel: u16 = 1;
             let mut dry_run = false;
+            let mut eager = false;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -1122,6 +1133,7 @@ fn main() {
                     }
                     "--no-delete" => no_delete = true,
                     "--dry-run" => dry_run = true,
+                    "--eager" => eager = true,
                     "--exclude" => {
                         let v = it
                             .next()
@@ -1178,6 +1190,7 @@ fn main() {
                     excludes,
                     parallel,
                     dry_run,
+                    eager,
                 },
             )
             .unwrap_or_else(|e| {
@@ -1196,6 +1209,7 @@ fn main() {
             let mut excludes: Vec<String> = Vec::new();
             let mut parallel: u16 = 1;
             let mut dry_run = false;
+            let mut eager = false;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -1212,6 +1226,7 @@ fn main() {
                         let v = it.next().unwrap_or_else(|| die("--from requires a path"));
                         from = Some(PathBuf::from(v));
                     }
+                    "--eager" => eager = true,
                     "--dry-run" => dry_run = true,
                     "--no-delete" => no_delete = true,
                     "--exclude" => {
@@ -1273,6 +1288,7 @@ fn main() {
                     excludes,
                     parallel,
                     dry_run,
+                    eager,
                 },
             )
             .unwrap_or_else(|e| {

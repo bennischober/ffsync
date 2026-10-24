@@ -111,6 +111,7 @@ mod tests {
                     force_checksum: true,
                     tree: false,
                     dry_run: false,
+                    eager: false,
                 };
                 let recv_req = ffsync::protocol::sync::ReceiveRequest {
                     path: path.clone(),
@@ -119,6 +120,7 @@ mod tests {
                     tree: false,
                     apply_mode: None,
                     apply_mtime: None,
+                    eager: false,
                 };
                 let pipeline = ffsync::chunking::PipelineConfig::default();
                 let pipeline_recv = ffsync::chunking::PipelineConfig::default();

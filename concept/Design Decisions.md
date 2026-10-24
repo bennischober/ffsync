@@ -259,6 +259,22 @@ the temp re-scan is content-addressed). Full design: `Protocol v0.1.md`
 an eager-mode simulation cell — D8's own doctrine: decided on data, and the
 cell will measure over-send and wall-time against lazy at 0/30 ms RTT.
 
+**Amendment (2026-10-24): implemented; the data justified it.** The cell
+(`bench --eager --rtt-ms {0,30} --seed 42`) ran 3 paired lazy/eager sessions
+per RTT on the 128 MiB modified fixture: over-send 0 bytes in every run (the
+position gate works), eager wall time −18–33% at 0 ms RTT (median 455→368
+ms) and −12–18% at 30 ms RTT (median 596→488 ms). Implementation notes the
+debugging surfaced: (1) the sender's HELLO must carry the offer bit and the
+receiver must mirror it only on ITS own opt-in — the original
+validate_hello rejection (pre-1.0 strictness) moved to a session-level loud
+error when the peers disagree; (2) a request rebind in `sync::receive`
+(tree-mode mtime fill) silently dropped the receiver's eager opt-in —
+caught by the loopback test, fixed by propagating the field; (3) repeated
+content hashes need the offer deduped by hash and the receiver's buffer
+treated as a cache (get, not take) — otherwise duplicate DATA frames
+desync the frame stream at VERIFY. Correctness tests: eager convergence,
+loud decline on a non-opt-in receiver, in `tests/loopback.rs`.
+
 ## D9 — Scope discipline: what ffsync deliberately does not build
 
 **Decision:** v0.1 target is a single file pair between two peers over TCP with

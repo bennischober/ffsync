@@ -153,6 +153,7 @@ fn hundred_sessions_do_not_accumulate_memory() {
             force_checksum: false,
             tree: false,
             dry_run: false,
+            eager: false,
         };
         let recv_req = ReceiveRequest {
             path: target.clone(),
@@ -161,6 +162,7 @@ fn hundred_sessions_do_not_accumulate_memory() {
             tree: false,
             apply_mode: None,
             apply_mtime: None,
+            eager: false,
         };
         run_session(send_req, recv_req);
 
@@ -241,6 +243,7 @@ fn hundred_sessions_alternating_deltas_and_full_transfers() {
             force_checksum: false,
             tree: false,
             dry_run: false,
+            eager: false,
         };
         let recv_req = ReceiveRequest {
             path: target.clone(),
@@ -249,6 +252,7 @@ fn hundred_sessions_alternating_deltas_and_full_transfers() {
             tree: false,
             apply_mode: None,
             apply_mtime: None,
+            eager: false,
         };
         run_session(send_req, recv_req);
         assert_eq!(read_file(&target), data, "session {i}: no convergence");

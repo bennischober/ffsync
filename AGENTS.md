@@ -50,8 +50,11 @@ Design documents (read before making architectural changes):
   the spec is amended first. Commit durability (§8.3): the temp file is
   flushed before every rename (`Reconstructor::sync_temp`, 2026-10-23).
   Dry-run (D20, §7.1/§16.10): zero-mutation preview — HELLO flag bit 3,
-  DRY_RUN_ACK (0x11) marker, tree would-delete report; HELLO flag decode
-  rejects unknown bits (strict codec).
+  DRY_RUN_ACK (0x11) marker, tree would-delete report. Eager diff (D8,
+  §9.2): --eager streams DATA during the manifest exchange behind the
+  §6.2 position gate (over-send 0 in paired runs; both peers opt in,
+  decline fails loudly). HELLO flag decode rejects unknown bits (strict
+  codec).
 - `concept/Deep Research Digest.md` — what the two deep-research runs
   (architecture + P2P connectivity, saved alongside as markdown) got right,
   and what we rejected; its follow-ups F1–F4 are all closed

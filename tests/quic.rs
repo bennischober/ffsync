@@ -161,6 +161,7 @@ fn run_send_over(
         force_checksum: true,
         tree: false,
         dry_run: false,
+        eager: false,
     };
     let pipeline = PipelineConfig::default();
     let out = send(stream, &req, &pipeline, &mut |_p| {});
@@ -187,6 +188,7 @@ fn run_receive_over(
         tree: false,
         apply_mode: None,
         apply_mtime: None,
+        eager: false,
     };
     let pipeline = PipelineConfig::default();
     let out = receive(stream, &req, &pipeline, &mut |_p| {});

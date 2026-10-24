@@ -135,6 +135,9 @@ pub struct SendRequest {
     pub mtime: Option<SystemTime>,
     /// Disable the size+mtime fast path (rsync `--checksum` semantics, D11).
     pub force_checksum: bool,
+    /// Eager diff (§9.2, D8): accept pre-plan DATA buffering. Both peers
+    /// must opt in; the sender fails loudly when the receiver declines.
+    pub eager: bool,
     /// Dry-run (§7.1): preview only — the receiver executes nothing, writes
     /// nothing, deletes nothing, and reports what would happen. The sender
     /// offers the mode in HELLO; a peer that does not implement it fails
@@ -169,6 +172,9 @@ pub struct ReceiveRequest {
     /// the sender had no metadata section or no mode concept on its
     /// platform (the 0 = absent convention, same as mtime (0, 0)).
     pub apply_mode: Option<u32>,
+    /// Eager diff (§9.2, D8): accept pre-plan DATA buffering (64 MiB cap).
+    /// Both peers must opt in; the sender fails loudly on decline.
+    pub eager: bool,
 }
 
 /// Outcome of a completed sync.
@@ -253,16 +259,12 @@ fn validate_hello(peer: &Hello, ours_role: Role) -> Result<Hello, SyncError> {
             ours_role
         )));
     }
-    if peer.flags & message::FLAG_EAGER != 0 {
-        // §9.2 is designed but unimplemented; a peer offering eager mode
-        // would disagree with us on DATA timing, which is a desync hazard.
-        // Classified as Peer(Version) so callers send ERROR(Version) on
-        // the wire (same treatment as a version mismatch).
-        return Err(SyncError::Peer(
-            ErrorCode::Version,
-            "peer offered eager diff (HELLO flag bit 1), which this build does not implement; omit it for lazy mode (spec §9.2)".into(),
-        ));
-    }
+    // §9.2: the eager bit is now KNOWN (D8 implemented this build); whether
+    // the session runs eager is decided per-side after validation — the
+    // sender compares its own offer against the receiver's mirror (a
+    // receiver that did not opt in fails the session loudly there), and
+    // the receiver buffers pre-plan DATA only when IT opted in. An unknown
+    // bit would still be rejected at decode (strict codec).
     Ok(peer.clone())
 }
 
@@ -352,7 +354,11 @@ where
         0
     } else {
         FLAG_TRUST_TIMES
-    }) | if request.dry_run {
+    }) | if request.eager {
+        message::FLAG_EAGER
+    } else {
+        0
+    } | if request.dry_run {
         message::FLAG_DRY_RUN
     } else {
         0
@@ -419,6 +425,25 @@ where
             }
         }
     }
+    // §9.2: eager mode is active iff the receiver mirrored the offer. A
+    // receiver that implements it consumes interleaved DATA during the
+    // manifest exchange; one that does not (old peer, or a receiver that
+    // declined) never would — proceeding eagerly would deadlock it at
+    // PLAN_DONE (its data loop starts only after the plan), so the
+    // session fails loudly instead of silently degrading.
+    let eager_active = request.eager && peer.flags & message::FLAG_EAGER != 0;
+    if request.eager && !eager_active {
+        let _ = send_error_and_finish(
+            stream,
+            ErrorCode::Version,
+            "peer did not accept eager diff (its HELLO lacks flag bit 1)",
+        );
+        return Err(SyncError::Peer(
+            ErrorCode::Version,
+            "peer did not accept eager diff (its HELLO lacks flag bit 1); upgrade the peer or drop --eager".into(),
+        ));
+    }
+
     // Sub-second mtime matters (v0.2, D11/D15): whole-second comparison let a
     // same-second rewrite with unchanged size fast-path as "in sync" — a
     // silent wrong-content success (found by the warm-start tests). rsync
@@ -469,6 +494,46 @@ where
     // layout-reproduction check below.
     let mut manifest: HashMap<Hash, u64> = HashMap::new();
     let mut manifest_chunks: Vec<(Hash, u64, u32)> = Vec::new();
+    // §9.2 eager state: the sender's position gate (§6.2) — a chunk is
+    // offered once manifest consumption has passed chunk.offset + 2*cdc_avg
+    // without a match (or the manifest is done); elsewhere a late match
+    // still rescues the chunk. Over-send is bounded near modification
+    // regions, exactly like the boundary-shift fallback.
+    let mut eager_file: Option<File> = None;
+    let mut eager_compressor: Option<zstd::bulk::Compressor<'static>> = None;
+    let mut eager_sent: u64 = 0;
+    let mut eager_scan: usize = 0; // next un-offered source chunk (offset-sorted)
+    let mut eager_offered: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    let mut offer_eager_chunk = |chunk: &Chunk,
+                                 manifest: &HashMap<Hash, u64>,
+                                 consumed_upto: u64,
+                                 manifest_done: bool,
+                                 stream: &mut dyn Write|
+     -> Result<u64, SyncError> {
+        if !eager_active {
+            return Ok(0);
+        }
+        let covered = manifest.contains_key(&chunk.hash);
+        if covered || (!manifest_done && chunk.offset + 2 * cdc.1 as u64 > consumed_upto) {
+            return Ok(0); // still rescuable, or already covered
+        }
+        let file = eager_file.get_or_insert_with(|| {
+            File::open(&request.path).expect("sender file open for eager DATA")
+        });
+        let compressor = eager_compressor.get_or_insert_with(|| {
+            zstd::bulk::Compressor::new(3).expect("zstd context for eager DATA")
+        });
+        let mut buf = Vec::with_capacity(chunk.length);
+        use std::io::{Read as _, Seek as _};
+        file.seek(io::SeekFrom::Start(chunk.offset))?;
+        buf.resize(chunk.length, 0);
+        file.read_exact(&mut buf)?;
+        let compressed = compressor.compress(&buf)?;
+        message::encode_data(chunk.hash, &compressed)?.encode(stream)?;
+        stream.flush()?;
+        eager_offered.insert(chunk.hash);
+        Ok(chunk.length as u64)
+    };
     loop {
         let frame = framing::read_frame(stream)?;
         match frame.ftype {
@@ -477,8 +542,25 @@ where
                     .map_err(|e| SyncError::Protocol(format!("bad manifest chunk: {}", e)))?;
                 manifest.insert(entry.hash, entry.offset);
                 manifest_chunks.push((entry.hash, entry.offset, entry.length));
+                let consumed = entry.offset + entry.length as u64;
+                for chunk in source_chunks[eager_scan..]
+                    .iter()
+                    .take_while(|c| c.offset < consumed)
+                {
+                    eager_sent += offer_eager_chunk(chunk, &manifest, consumed, false, stream)?;
+                }
+                eager_scan = eager_scan
+                    + source_chunks[eager_scan..]
+                        .iter()
+                        .take_while(|c| c.offset < consumed)
+                        .count();
             }
-            framing::T_MANIFEST_DONE => break,
+            framing::T_MANIFEST_DONE => {
+                for chunk in &source_chunks[eager_scan..] {
+                    eager_sent += offer_eager_chunk(chunk, &manifest, 0, true, stream)?;
+                }
+                break;
+            }
             other => {
                 return Err(send_error_and_finish(
                     stream,
@@ -552,9 +634,14 @@ where
     // chunk bytes from the file. zstd-compress each chunk payload.
     // §7.1: in dry-run mode the receiver has already answered (NOT_MODIFIED
     // + DRY_RUN_ACK) — skip DATA and VERIFY entirely; read the report.
+    // §9.2: eagerly offered chunks are ALREADY on the wire (sent during the
+    // manifest exchange); the plan loop re-sends only what the gate withheld
+    // (late-rescuable chunks the manifest eventually missed). The eager
+    // counter is part of the transfer progress.
     let mut sent: u64 = 0;
     let mut sent_chunks: usize = 0;
     if remote_total > 0 && !request.dry_run {
+        sent = eager_sent;
         let mut file = File::open(&request.path)?;
         let mut chunk_buf = Vec::new();
         // One zstd context reused across all chunks: bulk::compress would
@@ -570,6 +657,13 @@ where
                 } => (*target_offset, *length as usize, *hash),
                 _ => continue,
             };
+            // §9.2: this chunk's bytes are already on the wire (offered
+            // eagerly during the manifest exchange) and buffered by the
+            // receiver — re-sending would corrupt the frame stream the
+            // receiver reads at VERIFY.
+            if eager_offered.contains(&hash) {
+                continue;
+            }
             chunk_buf.clear();
             chunk_buf.resize(length, 0);
             use std::io::{Read as _, Seek as _};
@@ -728,6 +822,14 @@ where
     if resuming {
         flags |= FLAG_RESUMING;
     }
+    // §9.2: accept the eager offer iff the CLI asked for it (the receiver
+    // must OPT IN too — buffering pre-plan DATA is a real resource
+    // commitment). Mirroring without opt-in would surprise a receiver
+    // operator; both sides opt in, the bit goes active, and a sender
+    // offering without a willing receiver fails loudly (see the sender).
+    if request.eager {
+        flags |= message::FLAG_EAGER;
+    }
     // §7.1: dry-run acceptance is a marker frame (T_DRY_RUN_ACK) sent
     // right after the peer's HELLO is validated — not a HELLO bit (both
     // HELLOs are on the wire before either is read).
@@ -786,6 +888,7 @@ where
     };
     let request = ReceiveRequest {
         apply_mtime: request.apply_mtime.or(peer_mtime),
+        eager: request.eager,
         ..(*request).clone()
     };
 
@@ -914,6 +1017,15 @@ where
     // failure means the next readable frame is NOT_MODIFIED (handled in the
     // plan loop) — or nothing, in which case the plan loop surfaces the
     // real error.
+    // §9.2: an eager session interleaves DATA frames into the manifest
+    // stream (the sender's position gate, §6.2). Buffer them by hash;
+    // the plan's Remote arm consumes from the buffer instead of the wire.
+    // Cap: 64 MiB (§12 spirit) — overflow is a loud ERROR + lazy retry,
+    // never a spill file.
+    let eager_active = request.eager && peer.flags & message::FLAG_EAGER != 0;
+    let mut eager_buf: HashMap<Hash, Vec<u8>> = HashMap::new();
+    let mut eager_bytes: usize = 0;
+    const EAGER_BUF_CAP: usize = 64 * 1024 * 1024;
     for chunk in &temp_chunks {
         let frame = message::ManifestChunk {
             hash: chunk.hash,
@@ -956,6 +1068,43 @@ where
     loop {
         let frame = framing::read_frame(stream)?;
         match frame.ftype {
+            framing::T_MANIFEST_CHUNK | framing::T_MANIFEST_DONE => {
+                // §9.2: manifest frames after our DONE cannot happen in a
+                // well-formed session... but in eager mode the SENDER may
+                // legitimately still send DATA (offered chunks) AFTER our
+                // manifest finished — handled below; manifest frames here
+                // are a protocol error either way.
+                return Err(send_error_and_finish(
+                    stream,
+                    ErrorCode::BadFrame,
+                    "unexpected manifest frame after MANIFEST_DONE",
+                ));
+            }
+            framing::T_DATA if eager_active => {
+                // The frame is already read; parse (hash, payload) directly
+                // (read_data would try to read ANOTHER frame).
+                if frame.payload.len() < 32 {
+                    return Err(send_error_and_finish(
+                        stream,
+                        ErrorCode::BadFrame,
+                        "eager DATA frame too short",
+                    ));
+                }
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&frame.payload[..32]);
+                let hash = Hash::from_bytes(h);
+                let compressed = frame.payload[32..].to_vec();
+                let len = compressed.len();
+                if eager_bytes + len > EAGER_BUF_CAP {
+                    return Err(send_error_and_finish(
+                        stream,
+                        ErrorCode::BadFrame,
+                        "eager buffer overflow (64 MiB cap, §9.2); retry without --eager",
+                    ));
+                }
+                eager_bytes += len;
+                eager_buf.insert(hash, compressed);
+            }
             framing::T_PLAN_LOCAL | framing::T_PLAN_REMOTE => {
                 let entry = PlanEntry::from_frame(frame)
                     .map_err(|e| SyncError::Protocol(format!("bad plan entry: {}", e)))?;
@@ -1175,14 +1324,25 @@ where
                     length,
                     hash,
                 } => {
-                    let (data_hash, compressed) = message::read_data(stream)?;
-                    if data_hash != hash {
-                        return Err(send_error_and_finish(
-                            stream,
-                            ErrorCode::BadFrame,
-                            "DATA hash does not match plan",
-                        ));
-                    }
+                    // §9.2: an eagerly offered chunk is already in the
+                    // buffer (consumed during the manifest exchange); only
+                    // chunks the sender declared via the plan but never
+                    // offered (not eager-active, or offered-late) come from
+                    // the wire now.
+                    let compressed = match eager_buf.get(&hash) {
+                        Some(c) => c.clone(),
+                        None => {
+                            let (data_hash, compressed) = message::read_data(stream)?;
+                            if data_hash != hash {
+                                return Err(send_error_and_finish(
+                                    stream,
+                                    ErrorCode::BadFrame,
+                                    "DATA hash does not match plan",
+                                ));
+                            }
+                            compressed
+                        }
+                    };
                     // One zstd context reused across all chunks (see the
                     // sender's data phase for the reasoning).
                     let decompressed = DECOMPRESSOR.with(|d| {
@@ -1600,9 +1760,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hello_rejects_eager_bit() {
-        // §9.2 is designed but unimplemented: a peer offering eager mode
-        // must be rejected loudly (ERROR Version), not silently ignored.
+    fn hello_accepts_eager_bit_decline_is_session_level() {
+        // §9.2 (D8 implemented): the eager bit is KNOWN and passes HELLO
+        // validation; whether the session runs eager is decided per-side
+        // (the sender checks the receiver's mirror, the receiver gates its
+        // buffer on its own opt-in). Decline is a session-level loud error,
+        // not a decode error.
         let peer = Hello {
             version: super::super::VERSION,
             flags: message::FLAG_EAGER,
@@ -1615,7 +1778,6 @@ mod tests {
             file_mtime_nanos: 0,
             path: "x".into(),
         };
-        let err = validate_hello(&peer, Role::Sender).unwrap_err();
-        assert!(matches!(err, SyncError::Peer(ErrorCode::Version, _)));
+        assert!(validate_hello(&peer, Role::Sender).is_ok());
     }
 }

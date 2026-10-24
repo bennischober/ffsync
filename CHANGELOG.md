@@ -4,6 +4,16 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Eager diff (D8, §9.2):** `--eager` (single-file, both peers) streams
+  chunk DATA during the manifest exchange, bounded by the §6.2 position
+  gate: over-send 0 bytes in every paired bench run, wall time −18–33% at
+  0 ms RTT and −12–18% at 30 ms RTT (128 MiB modified fixture, 3 paired
+  runs each). A peer that declines the offer fails the session loudly.
+
 ## [1.0.0] - 2026-10-24
 
 ### Added

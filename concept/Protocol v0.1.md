@@ -345,11 +345,19 @@ degradation. (This resolves §13 question 2.)
 D10's locals-first ordering is a lazy-mode property (§7), and resume is
 unaffected because the temp re-scan is content-addressed (§10).
 
-**Status.** Not implemented in v0.8.x. Implementation is deliberately
-deferred until the bench harness grows an eager-mode simulation cell
-measuring over-send and wall time vs lazy at 0/30 ms RTT — D8's doctrine
-is "decided on data". Until then flag bit 1 must be 0 on the wire and the
-CLI flag `--eager` stays reserved (rejected as not-yet-implemented).
+**Status.** Implemented (2026-10-24, post-1.0). The bench cell
+(`bench --eager --rtt-ms {0,30} --seed 42`) measures paired lazy-vs-eager
+sessions over the RTT-modeled duplex; over-send was 0 bytes in every run
+(the §6.2 position gate rescues late matches exactly as designed), and
+eager cut wall time 18–33% at 0 ms RTT and 12–18% at 30 ms RTT (medians
+455→368 ms and 596→488 ms on the 128 MiB modified fixture, 3 paired runs
+each). The knob is `--eager` on both peers; a declining peer fails the
+session loudly (the sender checks the receiver's HELLO mirror). Wire
+contract notes: eager offers are deduplicated by hash (repeated content
+chunks are offered once; the receiver's by-hash buffer is a cache that
+serves every plan entry with that hash), and the sender's data phase
+skips hashes already offered (re-sending would corrupt the frame stream
+the receiver reads at VERIFY).
 
 ## 10. Resume (D10, decided and implemented)
 
