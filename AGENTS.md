@@ -257,10 +257,8 @@ pre-existing.
 - The crate's only `unsafe` block is the mmap at
   `src/chunking/pipeline.rs:82` — keep it that way, and add the missing
   `SAFETY:` comment when you touch it.
-- `src/lib.rs`'s crate-level doc comment is stale (calls main.rs a
-  benchmark harness) — fix on touch.
-- `.opencode/` holds tracked agent tooling (a git-commit-message skill);
-  credentials under it are untracked and must stay that way.
+- `.opencode/` is local-only agent tooling (a git-commit-message skill,
+  credentials, local config); it is untracked and must stay that way.
 
 ## Gotchas (non-obvious invariants)
 
