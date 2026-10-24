@@ -1435,6 +1435,21 @@ where
                 cdc_u32,
             ),
         );
+        // D21: a --from conversation also indexes the OLD file (its own
+        // identity) when we scanned it this session — a repeated --from
+        // sync then warm-starts the receiver's scan. Never for the target
+        // itself (that index above is already the right one).
+        if request.local_source != request.path {
+            let _ = crate::index::write_index(
+                &request.local_source,
+                &FileIndex::from_scan(
+                    local_chunks.clone(),
+                    local_size,
+                    crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
+                    cdc_u32,
+                ),
+            );
+        }
         message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
         stream.flush()?;
         return Ok(SyncOutcome::Transferred {
@@ -1538,25 +1553,40 @@ where
                         cdc_u32,
                     ),
                 );
-            } else if request.local_source == request.path {
-                // Old file already matched (no transfer needed): persist its
-                // index so the NEXT sync warms (D15). The scan already ran;
-                // writing costs one file of bytes. Only when the file we
-                // scanned IS the target: with --from <other-file> the index
-                // would claim the target's identity from another file's
-                // content (size/mtime of `local_source` keyed to `path`),
-                // and the next warm start would serve the wrong chunk list.
+            } else {
+                // Old file already matched (no transfer needed): persist
+                // indexes so the NEXT sync warms (D15). The scan already
+                // ran; writing costs one file of bytes.
+                // - target case (no --from, or --from == target): index the
+                //   target under its own identity.
+                // - --from <other-file> case (D21): the OLD file matched —
+                //   index IT under its own identity (size/mtime/chunks of
+                //   local_source, path local_source), so a repeated
+                //   --from sync warm-starts the receiver's scan. Never
+                //   index the target from another file's content.
                 apply_commit_mode(&request.path, request.apply_mode)?;
                 apply_commit_mtime(&request)?;
-                let _ = crate::index::write_index(
-                    &request.path,
-                    &FileIndex::from_scan(
-                        local_chunks.clone(),
-                        local_size,
-                        crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
-                        cdc_u32,
-                    ),
-                );
+                if request.local_source == request.path {
+                    let _ = crate::index::write_index(
+                        &request.path,
+                        &FileIndex::from_scan(
+                            local_chunks.clone(),
+                            local_size,
+                            crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
+                            cdc_u32,
+                        ),
+                    );
+                } else {
+                    let _ = crate::index::write_index(
+                        &request.local_source,
+                        &FileIndex::from_scan(
+                            local_chunks.clone(),
+                            local_size,
+                            crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
+                            cdc_u32,
+                        ),
+                    );
+                }
             }
             message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
             stream.flush()?;

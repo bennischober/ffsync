@@ -973,3 +973,48 @@ start serves a matching-parameter index and cold-scans a mismatched one
 chunk counts unchanged vs the shipped defaults); full gates on Windows +
 Docker Linux.
 
+## D21 — Warm-start scope after the snapshot analysis (2026-10-24)
+
+**Decision:** three-part. (1) The "receiver-side index snapshot a peer can
+request" idea (first sync to a fresh machine becomes a delta) is
+REJECTED on analysis, not on measurement: an index carries only chunk
+lists (hash/offset/length) — no bytes. Every PLAN_LOCAL entry is a
+byte-verified read from the receiver's own temp/old-file; a fresh
+machine has neither, so a served manifest of unbacked chunks cannot
+produce a Local entry and the session degrades to a full transfer —
+exactly what it does today. Migration is a bulk-copy problem (out of
+niche, D9). (2) The index gains ONE scoped extension instead: the
+receiver-side `--from` sync writes an index for `local_source`
+(the old file) at commit, mirroring what the sender already does —
+repeated `--from` syncs against the same old file then warm-start the
+receiver's scan (today: re-scanned every run; the load path at
+`sync.rs:932` already reads `load_index(&request.local_source)`,
+only the write is missing). (3) A cross-file chunk manifest (rename
+detection: one file's chunk list serving another file's plan) stays a
+recorded FUTURE wire feature — real value on fat links, but it is a
+protocol extension (§-level) and must pass the full doctrine (design,
+bench cell, implementation), not ride along here.
+
+**Reasoning:** the index's identity model is per-file and
+position-critical (D15/D6); the snapshot idea violated it silently. The
+`--from` write is the same data, same validation, no new wire format —
+a pure plumbing win. Rename detection changes what a manifest can mean;
+that deserves its own decision pass.
+
+**Alternatives considered:** the snapshot (rejected — see 1);
+a sidecar "tree index" bundling per-file indexes (rejected: it would
+desync from the per-file indexes on every commit — two sources of
+truth); doing nothing (kept for (3)).
+
+**Implementation + measurement (same day):** (2) shipped — the receiver
+writes the old-file index at commit on BOTH conversation outcomes
+(executed plan: the old file's chunks were hash-verified as plan reads;
+empty-plan/match: the scan already ran). Test:
+`from_sync_writes_old_file_index_and_repeat_warm_starts` (index
+identity per file, target never indexed from foreign content, and a
+repeated --from sync emits WarmStart). Measured saving (the --warm cell
+mechanism is identical for either side loading): 128 MiB fixture, cold
+scan 116.53 ms vs warm load 488.50 µs — 238.6×, i.e. a repeated --from
+sync against a same old file skips the receiver's full scan (disk-bound,
+scales with size). No wire change; no spec amendment needed (the index
+is local-only state).
