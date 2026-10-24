@@ -29,7 +29,9 @@ commands.
 > conversations (`--parallel K`, §16.8) cut WAN sync time by the connection
 > count; QUIC transport (`--quic`, §17) puts K conversations on one
 > connection with stream-level loss recovery; tree sync carries POSIX
-> mode bits (§16.9, D18). See [roadmap](#roadmap) below.
+> mode bits (§16.9, D18). Renamed files are detected and moved with
+> zero wire bytes (D22: the receiver's census of same-size indexed
+> files serves the rename from its own disk). See [roadmap](#roadmap) below.
 
 ## Why
 

@@ -216,6 +216,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
 
@@ -260,6 +261,7 @@ mod tests {
             apply_mode: None,
             apply_mtime: None,
             eager: false,
+            extra_sources: Vec::new(),
         };
 
         // Sync 1 (cold): full scan both sides, index files written at commit.
@@ -381,6 +383,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         assert!(
@@ -412,6 +415,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         s2.expect("attempt 2 sender converges");
@@ -453,6 +457,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         s.expect("sender ok");
@@ -490,6 +495,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
 
@@ -534,6 +540,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
 
@@ -578,6 +585,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
 
@@ -696,6 +704,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
             64 * 1024,
         );
@@ -725,6 +734,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         let _ = s2.expect("resumed sender ok");
@@ -779,6 +789,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: true,
+                extra_sources: Vec::new(),
             },
             64 * 1024,
         );
@@ -811,6 +822,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: true,
+                extra_sources: Vec::new(),
             },
         );
         let _ = s2.expect("resumed eager sender ok");
@@ -849,6 +861,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
 
@@ -931,6 +944,7 @@ mod tests {
             apply_mode: None,
             apply_mtime: None,
             eager: false,
+            extra_sources: Vec::new(),
         };
         let pipeline = PipelineConfig::default();
         let mut progress = |_p: Progress| {};
@@ -983,6 +997,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         let _s = s.expect("sender ok");
@@ -1061,6 +1076,7 @@ mod tests {
             apply_mode: None,
             apply_mtime: None,
             eager: false,
+            extra_sources: Vec::new(),
         };
 
         // Sync 1: converges via the from-file's chunks (mostly Local).
@@ -1146,6 +1162,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         assert!(
@@ -1225,6 +1242,7 @@ mod tests {
             apply_mode: None,
             apply_mtime: None,
             eager: false,
+            extra_sources: Vec::new(),
         };
 
         // Sync 1: converges; both indexes record the small-file parameters.
@@ -1307,6 +1325,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         s.expect("sender ok");
@@ -1376,6 +1395,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         s.expect("sender ok");
@@ -1442,6 +1462,7 @@ mod tests {
                 apply_mode: None,
                 apply_mtime: None,
                 eager: false,
+                extra_sources: Vec::new(),
             },
         );
         let s = s.expect("sender ok");
@@ -1496,6 +1517,7 @@ mod tests {
             apply_mtime: None,
             apply_mode: None,
             eager: false,
+            extra_sources: Vec::new(),
         };
         let (s_out, r_out) = run_sync(s, r);
         assert!(
@@ -1545,6 +1567,7 @@ mod tests {
             apply_mtime: None,
             apply_mode: None,
             eager: false,
+            extra_sources: Vec::new(),
         };
         let (s_out, r_out) = run_sync(s, r);
         assert!(
@@ -1611,6 +1634,7 @@ mod tests {
             force_checksum: false,
             tree: false,
             eager: true,
+            extra_sources: Vec::new(),
             apply_mtime: None,
             apply_mode: None,
         };
@@ -1656,6 +1680,7 @@ mod tests {
             eager: false, // receiver declines
             apply_mtime: None,
             apply_mode: None,
+            extra_sources: Vec::new(),
         };
         let (s_out, r_out) = run_sync(s, r);
         match (&s_out, &r_out) {

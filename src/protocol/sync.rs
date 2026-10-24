@@ -45,13 +45,24 @@ thread_local! {
         );
 }
 
-/// Where a locally available chunk lives (D10 union manifest).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a locally available chunk lives (D10 union manifest, D22 census
+/// sources). The read path resolves the file per origin: `Temp` reads the
+/// reconstruction temp, `Foreign` reads the named file (the old file in
+/// plain syncs; a same-size indexed tree file offered as a rename census
+/// source — D22).
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalOrigin {
     /// In the partially written temp file (newest state, temp-first claim).
     Temp { offset: u64, length: usize },
-    /// In the receiver's old file.
-    OldFile { offset: u64, length: usize },
+    /// In a named local file (the receiver's old file, or a D22 census
+    /// source). The file exists and its index validated against its
+    /// current stat — or it is the plain old file whose chunks we scanned
+    /// this session.
+    Foreign {
+        file: PathBuf,
+        offset: u64,
+        length: usize,
+    },
 }
 
 /// Errors from the sync state machines.
@@ -175,6 +186,13 @@ pub struct ReceiveRequest {
     /// Eager diff (§9.2, D8): accept pre-plan DATA buffering (64 MiB cap).
     /// Both peers must opt in; the sender fails loudly on decline.
     pub eager: bool,
+    /// D22 rename-census sources: local files whose validated D15 indexes
+    /// supply additional manifest chunks (hash → Foreign{file}) when the
+    /// target does not exist locally. Tree mode fills this from same-size
+    /// indexed files in the receiver's own manifest (rename evidence);
+    /// single-file mode leaves it empty. Every claim is hash-verified at
+    /// read (D12) — a stale source costs an ERROR, never corruption.
+    pub extra_sources: Vec<PathBuf>,
 }
 
 /// Outcome of a completed sync.
@@ -977,10 +995,37 @@ where
         });
     }
     for c in &local_chunks {
-        manifest_map.entry(c.hash).or_insert(LocalOrigin::OldFile {
+        manifest_map.entry(c.hash).or_insert(LocalOrigin::Foreign {
+            file: request.local_source.clone(),
             offset: c.offset,
             length: c.length,
         });
+    }
+    // D22 rename census: chunks from same-size indexed files in the tree
+    // (rename evidence — the bytes live under the old name until the delete
+    // pass). Each source's index must validate against the file's CURRENT
+    // stat (size + nanosecond mtime + CDC parameters): an index that
+    // validates describes exactly those bytes (D15's model), so the offer
+    // is sound; the read stays hash-verified (D12) as belt-and-braces.
+    // Precedence: Temp > own old file > census (first insert wins).
+    for src in &request.extra_sources {
+        if src == &request.local_source {
+            continue;
+        }
+        let Some(idx) = load_index(src) else {
+            continue;
+        };
+        if idx.validate(src, cdc_u32).is_none() {
+            continue;
+        }
+        let file = src.clone();
+        for c in &idx.chunks {
+            manifest_map.entry(c.hash).or_insert(LocalOrigin::Foreign {
+                file: file.clone(),
+                offset: c.offset,
+                length: c.length,
+            });
+        }
     }
 
     // ---- Fast path (§4): the sender may answer NOT_MODIFIED right after
@@ -1063,6 +1108,41 @@ where
         .into_frame()?;
         if frame.encode(stream).and_then(|_| stream.flush()).is_err() {
             break;
+        }
+    }
+    // D22 rename census: offer the extra sources' chunks as manifest
+    // entries too (the sender diffs against the STREAMED manifest — map
+    // entries the sender never sees cannot become Local plan entries).
+    // The map's precedence already decided which origin serves each hash;
+    // here only not-yet-offered hashes are streamed, temp/old-file first.
+    let offered: HashSet<Hash> = temp_chunks
+        .iter()
+        .chain(local_chunks.iter())
+        .map(|c| c.hash)
+        .collect();
+    for src in &request.extra_sources {
+        if src == &request.local_source {
+            continue;
+        }
+        let Some(idx) = load_index(src) else {
+            continue;
+        };
+        if idx.validate(src, cdc_u32).is_none() {
+            continue;
+        }
+        for chunk in &idx.chunks {
+            if offered.contains(&chunk.hash) {
+                continue;
+            }
+            let frame = message::ManifestChunk {
+                hash: chunk.hash,
+                offset: chunk.offset,
+                length: chunk.length as u32,
+            }
+            .into_frame()?;
+            if frame.encode(stream).and_then(|_| stream.flush()).is_err() {
+                break;
+            }
         }
     }
     let manifest_done = message::encode_empty(framing::T_MANIFEST_DONE)?;
@@ -1251,8 +1331,10 @@ where
         // code re-opened the source file for every Local entry (thousands
         // of opens per sync on large files). Both handles are read-only and
         // may coexist with the reconstructor's temp write handle.
+        // D22: census sources join the cache, keyed by their path (a rename
+        // conversation reads the old-name file's bytes through here).
         let mut temp_read: Option<File> = None;
-        let mut local_read: Option<File> = None;
+        let mut foreign_reads: HashMap<PathBuf, File> = HashMap::new();
         for entry in &plan {
             match *entry {
                 PlanEntry::Local {
@@ -1270,7 +1352,7 @@ where
                     })?;
                     let offset = match origin {
                         LocalOrigin::Temp { offset, .. } => *offset,
-                        LocalOrigin::OldFile { offset, .. } => *offset,
+                        LocalOrigin::Foreign { offset, .. } => *offset,
                     };
                     // Spec §12 resource limits: writes stay inside the
                     // declared file size.
@@ -1281,23 +1363,31 @@ where
                             "plan chunk extends beyond the declared file size",
                         ));
                     }
-                    let source_file = match origin {
+                    match origin {
                         LocalOrigin::Temp { .. } => {
                             if temp_read.is_none() {
                                 temp_read = Some(File::open(&temp_path)?);
                             }
-                            temp_read.as_mut().expect("temp read handle just opened")
+                            let source_file =
+                                temp_read.as_mut().expect("temp read handle just opened");
+                            scratch.clear();
+                            scratch.resize(length as usize, 0);
+                            source_file.read_at(&mut scratch[..length as usize], offset)?;
                         }
-                        LocalOrigin::OldFile { .. } => {
-                            if local_read.is_none() {
-                                local_read = Some(File::open(&request.local_source)?);
-                            }
-                            local_read.as_mut().expect("local read handle just opened")
+                        LocalOrigin::Foreign { file, .. } => {
+                            let source_file = match foreign_reads.get_mut(file) {
+                                Some(f) => f,
+                                None => {
+                                    let f = File::open(file)?;
+                                    foreign_reads.insert(file.clone(), f);
+                                    foreign_reads.get_mut(file).expect("just inserted")
+                                }
+                            };
+                            scratch.clear();
+                            scratch.resize(length as usize, 0);
+                            source_file.read_at(&mut scratch[..length as usize], offset)?;
                         }
                     };
-                    scratch.clear();
-                    scratch.resize(length as usize, 0);
-                    source_file.read_at(&mut scratch[..length as usize], offset)?;
                     // Verify the read content (D12 exact-match guarantee).
                     let actual = blake3::hash(&scratch[..length as usize]);
                     if actual != hash {
@@ -1313,7 +1403,16 @@ where
                         if matches!(origin, LocalOrigin::Temp { .. }) {
                             let _ = std::fs::remove_file(&temp_path);
                         }
-                        crate::index::remove_index(&request.local_source);
+                        // The lying index belongs to the origin's file: the
+                        // local source in plain syncs, the census source in a
+                        // D22 rename conversation. Both get dropped so the
+                        // retry cold-scans (a wrong index must never fail a
+                        // sync twice).
+                        let origin_file = match origin {
+                            LocalOrigin::Foreign { file, .. } => file.clone(),
+                            LocalOrigin::Temp { .. } => request.local_source.clone(),
+                        };
+                        crate::index::remove_index(&origin_file);
                         return Err(send_error_and_finish(
                             stream,
                             ErrorCode::HashMismatch,

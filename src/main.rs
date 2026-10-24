@@ -589,6 +589,7 @@ fn run_receive(
         eager,
         apply_mode: None,
         apply_mtime: None,
+        extra_sources: Vec::new(),
     };
     let pipeline = PipelineConfig::default();
     let outcome = match receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {

@@ -1032,3 +1032,47 @@ scan 116.53 ms vs warm load 488.50 µs — 238.6×, i.e. a repeated --from
 sync against a same old file skips the receiver's full scan (disk-bound,
 scales with size). No wire change; no spec amendment needed (the index
 is local-only state).
+
+## D22 — Rename detection via the receiver's orphan-index census (2026-10-24)
+
+**Decision:** a file renamed (or moved) within a synced tree is detected
+and served from the receiver's own bytes — **receiver-only, local-only,
+no wire change**. When `tree_receive` runs a conversation for a file
+that does not exist locally, it extends the conversation's manifest with
+**census sources**: the chunk lists of `*.ffsync-index` orphans (indexes
+whose target file is gone — the rename moved the file, the index
+remained), size-filtered to the conversation file's HELLO size. The
+sender's diff then finds the renamed file's chunks in the manifest, the
+plan comes out all-Local, and the conversation writes the new path from
+the old path's bytes over **zero wire bytes**; the delete pass removes
+the old path and its index afterward (the existing
+`remove_index` in the delete pass — no new cleanup). Wrong census
+claims cost an ERROR at the hash-verified read (D12's model), never
+corruption: the census is a claim, the read is the proof.
+
+**Why this shape:** the alternatives were (a) a per-chunk census riding
+TREE_BEGIN (rejected: the receiver would chunk or index the WHOLE TREE
+per session to build it — the exact cost D17's metadata triage exists
+to avoid, on every session even with zero renames — and 44 B/chunk on
+the wire per session), and (b) lazy per-file hash queries (rejected: a
+request/response frame pair per chunk, protocol- and latency-heavy).
+The orphan-index census costs nothing when there are no renames (no
+orphans, no census entries), and the size filter bounds each
+conversation's offer to same-size orphan chunks.
+
+**Scope bounds (v1):** a rename plus CONTENT EDIT changes the size in
+most cases (falls back to a normal transfer — correct, just not
+delta-optimized); a same-size content edit under a rename is missed by
+the size filter (the chunks differ anyway — the transfer happens;
+correctness unaffected). Multiple same-size orphans: first-insert-wins
+per hash, after the conversation's own temp/old-file sources
+(precedence: Temp > OldFile > census — the union manifest's existing
+order). The census never touches triage inputs (deterministic triage
+unchanged, §16.4 contract); it only extends conversation-local manifest
+sources. A hostile peer cannot inject census entries (the census is
+built from the receiver's own disk — nothing to guard on the wire).
+
+**Spec:** §16.4's manifest description gains the census-source note (a
+documentation amendment — the manifest's meaning "I have these chunks"
+is unchanged; where the bytes live has always been the receiver's
+business, per the D10 union-manifest precedent).

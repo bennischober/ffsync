@@ -383,6 +383,7 @@ fn tree_v2_flow_rejects_tree_frames() {
             apply_mode: None,
             apply_mtime: None,
             eager: false,
+            extra_sources: Vec::new(),
         };
         ffsync::protocol::sync::receive(&mut &tcp, &req, &PipelineConfig::default(), &mut |_p| {})
     });
@@ -1336,4 +1337,106 @@ fn tree_eager_parallel_converges() {
             sender.read(&format!("f{i:02}.bin"))
         );
     }
+}
+
+#[test]
+fn tree_rename_moves_content_with_zero_wire_bytes() {
+    // D22: a renamed file's second session must NOT re-transfer the bytes.
+    // The receiver's conversation for the new name finds the old name's
+    // chunks through the census (same-size indexed file, valid index) and
+    // plans them all-Local; the delete pass removes the old name.
+    let sender = TempTree::new("ren_sender");
+    let receiver = TempTree::new("ren_receiver");
+
+    let mut data = vec![0u8; 2 * 1024 * 1024];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(71).wrapping_add((i / 4096) as u8);
+    }
+    sender.write("old/name.bin", &data);
+
+    // Session 1: sync (writes the receiver's index at commit).
+    let (s1, r1) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        1,
+        false,
+        false,
+    );
+    s1.expect("session 1 sender ok");
+    r1.expect("session 1 receiver ok");
+    assert_eq!(receiver.read("old/name.bin"), Some(data.clone()));
+    assert!(
+        ffsync::index::load_index(&receiver.0.join("old/name.bin")).is_some(),
+        "session 1 must leave the receiver's index (warm start + census)"
+    );
+
+    // Sender renames the file (same content, new name, new dir).
+    std::fs::create_dir_all(sender.0.join("new")).unwrap();
+    std::fs::rename(sender.0.join("old/name.bin"), sender.0.join("new/name.bin")).unwrap();
+
+    // Session 2: the rename must move bytes locally, not over the wire.
+    let (s2, r2) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        1,
+        false,
+        false,
+    );
+    let s2 = s2.expect("session 2 sender ok");
+    let r2 = r2.expect("session 2 receiver ok");
+    assert!(
+        matches!(
+            s2,
+            ffsync::protocol::tree_sync::TreeOutcome {
+                transferred_bytes: 0,
+                ..
+            }
+        ),
+        "sender must transfer 0 wire bytes for a pure rename: {s2:?}"
+    );
+    assert!(
+        matches!(
+            r2,
+            ffsync::protocol::tree_sync::TreeOutcome {
+                transferred_bytes: 0,
+                ..
+            }
+        ),
+        "receiver must write 0 wire bytes for a pure rename: {r2:?}"
+    );
+    // Convergence: new name has the content, old name deleted, index moved.
+    assert_eq!(receiver.read("new/name.bin"), Some(data.clone()));
+    assert_eq!(receiver.read("old/name.bin"), None, "old name deleted");
+    assert!(
+        ffsync::index::load_index(&receiver.0.join("new/name.bin")).is_some(),
+        "the new name's index written at commit"
+    );
+    assert!(
+        ffsync::index::load_index(&receiver.0.join("old/name.bin")).is_none(),
+        "the old name's index removed by the delete pass"
+    );
+    // Session 3: everything skips (mtime preservation held through the rename).
+    let (s3, r3) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        1,
+        false,
+        false,
+    );
+    let s3 = s3.expect("session 3 sender ok");
+    let r3 = r3.expect("session 3 receiver ok");
+    assert_eq!(s3.files, 0, "third session fast-paths everything");
+    assert_eq!(r3.files, 0);
 }

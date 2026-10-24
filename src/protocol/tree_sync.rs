@@ -221,28 +221,6 @@ fn read_tree_begin(stream: &mut impl Read) -> Result<(TreeBegin, TreeManifest), 
 /// the session carries the metadata section AND the sender's manifest has
 /// the entry with a nonzero mode (the 0 = absent convention — applying 0
 /// would mean "everything denied" on unix, so it is skipped).
-fn sender_mode_of(peer_manifest: &TreeManifest, rel: &str, metadata: bool) -> Option<u32> {
-    if !metadata {
-        return None;
-    }
-    peer_manifest.get(rel).map(|e| e.mode).filter(|m| *m != 0)
-}
-
-/// The sender's per-path modes for the parallel service loop (§16.9).
-fn sender_modes_of(
-    peer_manifest: &TreeManifest,
-    metadata: bool,
-) -> std::collections::HashMap<String, u32> {
-    if !metadata {
-        return std::collections::HashMap::new();
-    }
-    peer_manifest
-        .entries()
-        .map(|e| (e.rel_path.clone(), e.mode))
-        .filter(|(_, m)| *m != 0)
-        .collect()
-}
-
 fn send_tree_begin(
     stream: &mut impl Write,
     flags: u16,
@@ -926,6 +904,9 @@ where
             checksum: bool,
             eager: bool,
             pipeline: &'a crate::chunking::PipelineConfig,
+            /// D22: OUR per-file sizes (census size filter) — the candidates
+            /// are the receiver's own same-size indexed files.
+            own_sizes: &'a std::collections::HashMap<String, u64>,
         }
         fn run_one<S: Read + Write>(
             ctx: &ConvCtx<'_>,
@@ -933,7 +914,10 @@ where
             rel: &str,
             idx: usize,
             total: usize,
-            sender_mode: Option<u32>,
+            // (mode when the session carries metadata, file size) from the
+            // sender's manifest entry — mode applies at commit (§16.9),
+            // size filters the D22 census sources.
+            peer_meta: Option<(Option<u32>, u64)>,
             progress: &mut dyn FnMut(TreeProgress),
         ) -> Result<(SyncOutcome, String), SyncError> {
             let ConvCtx {
@@ -941,6 +925,7 @@ where
                 checksum,
                 eager,
                 pipeline,
+                own_sizes,
             } = *ctx;
             progress(TreeProgress::FileStart(idx, total));
             let path = abs_path(root, rel);
@@ -954,6 +939,40 @@ where
             // We answer with our own HELLO inside sync::receive; our request
             // points at the file's local state (target path; local_source is
             // the same file — tree mode has no --from concept).
+            // D22 rename census: a conversation whose target does NOT exist
+            // locally (a rename moved the content elsewhere in this tree)
+            // offers the bytes of same-size indexed files as extra manifest
+            // sources — the sender's diff then plans those chunks as Local
+            // and the conversation moves 0 wire bytes. The source's index
+            // must EXIST here and is validated inside sync::receive against
+            // the file's current stat (size + nanosecond mtime + CDC): an
+            // edited file invalidates its index and offers nothing. Cap: 8
+            // candidates (bounds per-conversation work; renames in real
+            // trees collide on size rarely).
+            let extra_sources = if std::fs::metadata(&path).is_err() {
+                let want_size = peer_meta.map(|(_, s)| s).unwrap_or(0);
+                let mut sources: Vec<PathBuf> = Vec::new();
+                if want_size > 0 {
+                    for (cand_rel, cand_size) in own_sizes {
+                        if sources.len() >= 8 {
+                            break;
+                        }
+                        if cand_size != &want_size || cand_rel == rel {
+                            continue;
+                        }
+                        // The candidate must exist in OUR tree (the sender's
+                        // manifest entry names it; our scan must agree — the
+                        // triage contract already guarantees the union).
+                        let candidate = abs_path(root, cand_rel);
+                        if candidate.exists() && crate::index::index_path_for(&candidate).exists() {
+                            sources.push(candidate);
+                        }
+                    }
+                }
+                sources
+            } else {
+                Vec::new()
+            };
             let recv_req = ReceiveRequest {
                 path: path.clone(),
                 local_source: path.clone(),
@@ -963,8 +982,9 @@ where
                 // §16.9: the sender's mode from the TREE_BEGIN manifest entry.
                 // None (apply nothing) when the session has no metadata section
                 // or the entry is absent — the lookup is by rel_path.
-                apply_mode: sender_mode,
+                apply_mode: peer_meta.and_then(|(m, _)| m),
                 eager,
+                extra_sources,
             };
             let rel_c = rel.to_string();
             let outcome = match sync::receive(stream, &recv_req, pipeline, &mut |p| {
@@ -986,16 +1006,28 @@ where
             Ok((outcome, rel.to_string()))
         }
 
+        // D22: OUR per-file sizes (census size filter) — the candidates are
+        // the receiver's own same-size indexed files (rename evidence lives
+        // in OUR tree: the old name), one map shared by sequential and
+        // parallel conversation paths.
+        let own_sizes: std::collections::HashMap<String, u64> = manifest
+            .entries()
+            .filter(|e| e.kind == crate::tree::EntryKind::File)
+            .map(|e| (e.rel_path.clone(), e.size))
+            .collect();
         if k <= 1 {
             let ctx = ConvCtx {
                 root: &request.root,
                 checksum,
                 eager,
                 pipeline,
+                own_sizes: &own_sizes,
             };
             for (idx, rel) in conversation_paths.iter().enumerate() {
-                let sender_mode = sender_mode_of(&peer_manifest, rel, metadata);
-                let (outcome, _) = run_one(&ctx, stream, rel, idx, total, sender_mode, progress)?;
+                let peer_meta = peer_manifest
+                    .get(rel)
+                    .map(|e| (metadata.then_some(e.mode).filter(|m| *m != 0), e.size));
+                let (outcome, _) = run_one(&ctx, stream, rel, idx, total, peer_meta, progress)?;
                 match outcome {
                     SyncOutcome::InSync => in_sync += 1,
                     SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
@@ -1082,9 +1114,11 @@ where
                 root: PathBuf,
                 checksum: bool,
                 eager: bool,
-                /// §16.9: the sender's per-entry modes (empty when the session
-                /// has no metadata section).
-                sender_modes: std::collections::HashMap<String, u32>,
+                /// D22: OUR per-file sizes (census size filter).
+                own_sizes: std::collections::HashMap<String, u64>,
+                /// The sender's manifest (mode/size lookups inside worker
+                /// closures — the outer binding is dropped before threads run).
+                peer_manifest: crate::tree::TreeManifest,
                 pipeline: crate::chunking::PipelineConfig,
             }
             impl Shared {
@@ -1104,7 +1138,8 @@ where
                 root: request.root.clone(),
                 checksum,
                 eager,
-                sender_modes: sender_modes_of(&peer_manifest, metadata),
+                own_sizes: own_sizes.clone(),
+                peer_manifest: peer_manifest.clone(),
                 pipeline: pipeline_clone(pipeline),
             });
             let serve_connection = {
@@ -1155,19 +1190,23 @@ where
                         }
                         let rel = named.rel_path.clone();
                         let _ = event_tx.send(ConvEvent::Start(rel.clone()));
-                        let sender_mode = shared.sender_modes.get(&rel).copied();
+                        let peer_meta = shared
+                            .peer_manifest
+                            .get(&rel)
+                            .map(|e| (metadata.then_some(e.mode).filter(|m| *m != 0), e.size));
                         let outcome = run_one(
                             &ConvCtx {
                                 root: &shared.root,
                                 checksum: shared.checksum,
                                 eager: shared.eager,
                                 pipeline: &shared.pipeline,
+                                own_sizes: &shared.own_sizes,
                             },
                             &mut s,
                             &rel,
                             0,
                             0,
-                            sender_mode,
+                            peer_meta,
                             &mut |p| {
                                 if let TreeProgress::FileProgress { rel_path, progress } = p {
                                     let _ = event_tx.send(ConvEvent::Progress(rel_path, progress));
@@ -1276,20 +1315,22 @@ where
                             break;
                         }
                         let rel = named.rel_path.clone();
-                        let sender_mode =
-                            peer_manifest.get(&rel).filter(|_| metadata).map(|e| e.mode);
+                        let peer_meta = peer_manifest
+                            .get(&rel)
+                            .map(|e| (metadata.then_some(e.mode).filter(|m| *m != 0), e.size));
                         let outcome = run_one(
                             &ConvCtx {
                                 root: &request.root,
                                 checksum,
                                 eager,
                                 pipeline,
+                                own_sizes: &own_sizes,
                             },
                             stream,
                             &rel,
                             idx,
                             total,
-                            sender_mode,
+                            peer_meta,
                             &mut |tp| progress(tp),
                         );
                         idx += 1;
@@ -1458,10 +1499,11 @@ where
                 Ok(()) => {
                     deleted_count += 1;
                     deleted_bytes += size;
-                    // Remove the orphaned D15 index of a deleted file.
-                    if p.is_file() {
-                        crate::index::remove_index(&p);
-                    }
+                    // Remove the orphaned D15 index of a deleted file. The
+                    // file is already gone at this point, so the is_file()
+                    // gate of the original code never fired for it — remove
+                    // unconditionally (remove_index is a no-op when absent).
+                    crate::index::remove_index(&p);
                 }
                 // Already gone — or its ancestor became a file when a kind
                 // conflict was resolved this session (the conflict removal

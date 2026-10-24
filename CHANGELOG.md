@@ -8,6 +8,14 @@ All notable changes to ffsync are documented here. The format follows
 
 ### Added
 
+- **Rename detection (D22):** a file renamed (or moved) within a synced
+  tree is served from the receiver's own bytes — the census of same-size
+  indexed files makes the renamed file's plan all-Local, moving **zero
+  wire bytes** (bench cell: 3.00 MiB → 0 B for a renamed file). No wire
+  change: census sources are receiver-local claims, hash-verified at
+  read; the delete pass removes the old name and its index. Wrong
+  claims cost an ERROR, never corruption.
+
 - **Warm-started --from syncs (D21):** the receiver now indexes the old
   file (--from <file>) at commit — a repeated --from sync against the
   same old file skips the receiver's full scan (measured 238.6x on the

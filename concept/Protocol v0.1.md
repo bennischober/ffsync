@@ -579,6 +579,20 @@ including resume (a mid-tree failure leaves that file's temp file; the
 next session's triage sees the file still differing and the per-file
 resume logic takes over), warm indexes (D15), and the fast path.
 
+**Manifest sources (D22, receiver-side rename detection):** the
+conversation manifest's meaning — "I have these chunks" — is
+source-agnostic by the D10 union-manifest precedent (temp first, then
+old-file). A receiver MAY add further local sources: when a file is
+missing locally (a rename moved it elsewhere), the chunks of its
+**orphan D15 index** (an index whose target file no longer exists) are
+offered as census sources, size-filtered to the conversation file's
+HELLO size, at lower precedence than temp/old-file. Every census claim
+is hash-verified at read like any other manifest source (D12): a stale
+or wrong claim costs an ERROR, never corruption. The census never
+touches triage inputs; the delete pass removes the old path and its
+consumed index (the existing orphan cleanup). No new wire format, no
+flag — the sources are the receiver's local business.
+
 Deletions happen **after** all conversations succeeded. A failed
 conversation aborts the session (ERROR, terminal per §3) before any
 delete is applied — fail-closed: a failed transfer never destroys data.

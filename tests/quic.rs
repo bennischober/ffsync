@@ -189,6 +189,7 @@ fn run_receive_over(
         apply_mode: None,
         apply_mtime: None,
         eager: false,
+        extra_sources: Vec::new(),
     };
     let pipeline = PipelineConfig::default();
     let out = receive(stream, &req, &pipeline, &mut |_p| {});

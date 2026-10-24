@@ -1121,6 +1121,53 @@ fn run_tree_simulation(cfg: &BenchConfig, pipeline: &PipelineConfig) -> io::Resu
     // ---- Cold counterfactual: what an unchanged second session costs
     // without D17/D15 (rsync-style full re-scan + per-file hashing of both
     // trees) — session 2's cold scan + delta sim is that model. ----
+    // ---- Session 4: rename detection (D22) — rename one sender file;
+    // the receiver's census (same-size indexed files) must move the bytes
+    // locally: 0 wire bytes for the renamed file. ----
+    // The simulation's receiver is a plain copy (no real indexes), so the
+    // cell writes the receiver's D15 indexes the way the real commit path
+    // would (from the real chunking pipeline) before the session.
+    let renamed_from = {
+        let dir = sender.join("dir_00");
+        let mut entries: Vec<_> = fs::read_dir(&dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        entries.sort();
+        entries[0].clone()
+    };
+    let renamed_size = fs::metadata(&renamed_from)?.len();
+    // Receiver-side index for the old name (what a real commit wrote).
+    {
+        // The sim's session CDC (the parameters both sides chunk with here —
+        // the real flow's index is written by the syncing conversation with
+        // the session's parameters, D19).
+        use ffsync::chunking::scan_file_ordered;
+        use ffsync::index::FileIndex;
+        let recv_old = receiver.join(renamed_from.strip_prefix(&sender).unwrap());
+        let (_stats, chunks) = scan_file_ordered(&recv_old, pipeline, cdc)?;
+        let idx = FileIndex::from_scan(
+            chunks,
+            renamed_size,
+            ffsync::index::stat_mtime(&recv_old).unwrap_or((0, 0)),
+            (cdc.0 as u32, cdc.1 as u32, cdc.2 as u32),
+        );
+        ffsync::index::write_index(&recv_old, &idx)?;
+    }
+    let renamed_to = renamed_from.parent().unwrap().join("renamed_d22.bin");
+    fs::rename(&renamed_from, &renamed_to)?;
+    let s4 = simulate_tree_session(&sender, &receiver, pipeline, cdc, false)?;
+    print_tree_stats("session 4 (one file renamed, D22 census)", &s4);
+    let rename_bytes = s4.transferred_bytes;
+    println!(
+        "rename cell: renamed {} ({} bytes); wire bytes for the rename: {} ({} without the census)",
+        renamed_from.file_name().unwrap().to_string_lossy(),
+        fmt_bytes(renamed_size),
+        fmt_bytes(rename_bytes),
+        fmt_bytes(renamed_size)
+    );
+
     let cold_second = s2.scan_both + s2.delta_sim;
     println!();
     println!(
@@ -1204,11 +1251,25 @@ fn simulate_tree_session(
     }
 
     // Per-file delta simulation for the conversation set. A Transfer file
-    // (receiver lacks it) scans on the sender only — every chunk is "missing"
-    // and would cross the wire.
+    // (receiver lacks it) scans on the sender only; the D22 census model
+    // consults the receiver tree's same-size indexed files (rename
+    // evidence) as extra sources — chunks they cover are Local, not wire.
     let t_delta = Instant::now();
     let mut transferred = 0u64;
     let mut total_bytes = 0u64;
+    // The census sources: receiver-tree files (≠ the conversation target)
+    // with a valid index and the conversation file's size. Built per
+    // conversation (cheap: index validation is stat-only).
+    let receiver_sizes: Vec<(std::path::PathBuf, u64)> = receiver_manifest
+        .entries()
+        .filter(|e| e.kind == ffsync::tree::EntryKind::File)
+        .map(|e| {
+            (
+                receiver.join(e.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR)),
+                e.size,
+            )
+        })
+        .collect();
     for rel in &conversations {
         let src = sender.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
         let dst = receiver.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -1219,8 +1280,33 @@ fn simulate_tree_session(
             transferred += delta.missing_bytes;
             total_bytes += delta.target_bytes;
         } else {
-            transferred += src_chunks.iter().map(|c| c.length as u64).sum::<u64>();
-            total_bytes += src_chunks.iter().map(|c| c.length as u64).sum::<u64>();
+            // D22 census model: same-size indexed receiver files vouch for
+            // their chunks (index validity = stat match = the bytes match
+            // the list). Coverage = hashes of all valid same-size sources.
+            let src_size = fs::metadata(&src)?.len();
+            let mut census: std::collections::HashSet<blake3::Hash> =
+                std::collections::HashSet::new();
+            for (cand, size) in &receiver_sizes {
+                if *size != src_size || *cand == dst {
+                    continue;
+                }
+                if let Some(idx) = ffsync::index::load_index(cand)
+                    && idx
+                        .validate(cand, (cdc.0 as u32, cdc.1 as u32, cdc.2 as u32))
+                        .is_some()
+                {
+                    census.extend(idx.chunks.iter().map(|c| c.hash));
+                }
+            }
+            let (mut miss, mut tot) = (0u64, 0u64);
+            for chunk in &src_chunks {
+                tot += chunk.length as u64;
+                if !census.contains(&chunk.hash) {
+                    miss += chunk.length as u64;
+                }
+            }
+            transferred += miss;
+            total_bytes += tot;
         }
     }
     let delta_sim = t_delta.elapsed();
@@ -1606,6 +1692,7 @@ fn run_one_eager_session(
                 eager,
                 apply_mode: None,
                 apply_mtime: None,
+                extra_sources: Vec::new(),
             };
             receive(
                 &mut r_end,
