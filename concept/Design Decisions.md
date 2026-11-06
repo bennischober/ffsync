@@ -1168,3 +1168,46 @@ candidate is cheaper and exact.
 sidecar filter (`tree::is_sidecar`). A writer killed mid-index left the
 temp in the *source* tree, where the next index write consumed it and
 the sender aborted with "sender file vanished".
+
+## D24 — COMMIT_ACK reports the receiver's outcome (2026-11-06)
+
+**Problem.** The sender labelled each conversation (InSync vs
+Transferred) by predicting what the receiver would do with the plan:
+an empty plan, or an all-Local plan reproducing the streamed chunk list,
+meant "no rewrite". The prediction runs on what the sender can see, and
+two receiver decisions are invisible to it:
+
+1. **`--from` (D21).** The manifest describes the from-file, not the
+   target. When the from-file already is the sender's file and the
+   target exists at the sender's size (different content or mtime, so
+   the §4 fast path does not fire), the sender predicted InSync while
+   the receiver correctly wrote the target and reported Transferred.
+2. **Empty sender files.** An empty file yields an empty plan, which
+   the sender labelled InSync while the receiver truncated its old
+   content to zero and reported Transferred.
+
+The data was correct in both cases. Only the sender's report was wrong,
+so the two peers' summaries (and a tree session's per-file counts) disagreed.
+
+**Decision.** COMMIT_ACK, empty since v1, carries one outcome byte:
+`1` = the receiver wrote the target, `0` = it did not. The sender takes
+its label from that byte. Bytes the sender put on the wire always
+count as written, whatever the byte claims. The decoder is strict:
+empty → no outcome, `0`/`1` → the outcome, anything else → malformed.
+
+**Compatibility without a version bump.** Every released sender
+(through v1.3.0) matches COMMIT_ACK by frame type and never reads its
+payload, so new receivers work with old senders unchanged. Old
+receivers send the empty payload; new senders then fall back to the
+prediction (unchanged, including the `FLAG_RESUMING`/size guards of
+§8), so a new sender with an old receiver behaves exactly as before.
+
+**Rejected.**
+- A HELLO flag ("my manifest is not my target"). The strict HELLO
+  decoder of every released peer rejects unknown bits, so a new `--from`
+  receiver would have failed against an old sender.
+- Making the receiver's manifest break the sender's positional check
+  (duplicate or reordered entries). That leaks a label concern into
+  manifest content and interacts with the §6.2 eager position gate.
+- A protocol version bump. That costs every mixed-version pair, all
+  to fix a cosmetic label.

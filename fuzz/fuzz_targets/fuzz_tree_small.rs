@@ -1,8 +1,11 @@
-//! Fuzz targets: TreeWorker / TreeFile / TreeEnd + ERROR payload decode.
+//! Fuzz targets: TreeWorker / TreeFile / TreeEnd + ERROR payload decode,
+//! plus the COMMIT_ACK outcome byte (D24).
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use ffsync::protocol::framing::{Frame, T_TREE_END, T_TREE_FILE, T_TREE_WORKER};
-use ffsync::protocol::message::{read_error_payload, Message, TreeEnd, TreeFile, TreeWorker};
+use ffsync::protocol::message::{
+    decode_commit_ack, read_error_payload, Message, TreeEnd, TreeFile, TreeWorker,
+};
 
 fuzz_target!(|data: &[u8]| {
     let w = Frame::new(T_TREE_WORKER, data.to_vec());
@@ -14,4 +17,5 @@ fuzz_target!(|data: &[u8]| {
     // ERROR payloads are (code u8, msg bytes) — read_error_payload validates.
     let err = Frame::new(ffsync::protocol::framing::T_ERROR, data.to_vec());
     let _ = read_error_payload(&err);
+    let _ = decode_commit_ack(data);
 });

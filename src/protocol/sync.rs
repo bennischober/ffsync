@@ -679,7 +679,9 @@ where
         }
     }
 
-    // Layout-reproduction check (mirrors the receiver's decision, §8): an
+    // Layout-reproduction check (mirrors the receiver's decision, §8) —
+    // only the label fallback for a pre-D24 receiver, whose COMMIT_ACK
+    // carries no outcome byte; a current receiver reports what it did. An
     // all-Local plan whose target spans equal the receiver's raw chunk spans
     // (same count, same offsets, same lengths — hash equality implies length
     // equality) means the receiver's file is already chunked exactly like
@@ -790,6 +792,10 @@ where
     let frame = framing::read_frame(stream)?;
     match frame.ftype {
         framing::T_COMMIT_ACK => {
+            // D24: a current receiver says whether it wrote the target;
+            // decode before anything is persisted so a malformed ACK fails
+            // the sync without touching our index.
+            let reported_written = message::decode_commit_ack(&frame.payload)?;
             // §7.1: in dry-run mode COMMIT_ACK is the receiver's "nothing
             // would change" report (no temp was created, no index is
             // written). Normal mode: commit succeeded — persist our chunk
@@ -805,12 +811,19 @@ where
                 );
                 let _ = crate::index::write_index(&request.path, &index);
             }
-            // InSync is for plans that changed nothing on the receiver: the
-            // zero-entry plan, or an all-Local plan that reproduced the
-            // receiver's chunk layout (no rewrite). Any executed plan —
-            // including an all-Local one that repositioned chunks — reports
+            // InSync is for syncs that wrote nothing on the receiver; any
+            // write — an executed plan, including an all-Local one that
+            // repositioned chunks, or an empty-file commit — reports
             // Transferred (with 0 wire bytes when no Remote entry existed).
-            if plan.is_empty() || layout_reproduced {
+            // D24: the receiver's outcome byte decides. Only a pre-D24
+            // receiver (empty COMMIT_ACK) leaves us predicting from the
+            // plan: the zero-entry plan or a layout-reproducing all-Local
+            // plan means no rewrite — wrong for a --from receiver (its
+            // manifest is not its target) and for an empty-file commit.
+            // Bytes we sent were written, whatever the ACK claims.
+            let written =
+                sent > 0 || reported_written.unwrap_or(!(plan.is_empty() || layout_reproduced));
+            if !written {
                 Ok(SyncOutcome::InSync)
             } else {
                 Ok(SyncOutcome::Transferred {
@@ -1403,7 +1416,7 @@ where
         // Would NOT change (empty plan, or an all-Local plan that already
         // reproduces the receiver's layout): answer COMMIT_ACK like the
         // normal empty-plan path — the dry-run sender reads it as InSync.
-        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        message::encode_commit_ack(false)?.encode(stream)?;
         stream.flush()?;
         progress(Progress::NothingToDo);
         return Ok(SyncOutcome::InSync);
@@ -1756,7 +1769,7 @@ where
                 ),
             );
         }
-        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        message::encode_commit_ack(true)?.encode(stream)?;
         stream.flush()?;
         return Ok(SyncOutcome::Transferred {
             bytes: received,
@@ -1810,7 +1823,7 @@ where
                 cdc_u32,
             ),
         );
-        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        message::encode_commit_ack(true)?.encode(stream)?;
         stream.flush()?;
         progress(Progress::CreatedEmpty);
         return Ok(SyncOutcome::Transferred {
@@ -1861,7 +1874,7 @@ where
                     ),
                 );
             }
-            message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+            message::encode_commit_ack(false)?.encode(stream)?;
             stream.flush()?;
             progress(Progress::NothingToDo);
             Ok(SyncOutcome::InSync)
@@ -1902,7 +1915,7 @@ where
                         cdc_u32,
                     ),
                 );
-                message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+                message::encode_commit_ack(true)?.encode(stream)?;
                 stream.flush()?;
                 progress(Progress::CreatedEmpty);
                 return Ok(SyncOutcome::Transferred {

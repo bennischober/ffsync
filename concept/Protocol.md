@@ -105,7 +105,7 @@ not by tolerating unknown frames).
 | 0x06  | PLAN_DONE      | send→recv | empty |
 | 0x07  | DATA           | send→recv | hash 32B + zstd-compressed chunk bytes |
 | 0x08  | VERIFY         | send→recv | root_hash 32B |
-| 0x09  | COMMIT_ACK     | recv→send | empty |
+| 0x09  | COMMIT_ACK     | recv→send | outcome u8 (0 = target not written, 1 = written; §8, D24) — empty from pre-D24 receivers |
 | 0x0A  | NOT_MODIFIED   | both    | empty |
 | 0x0B  | ERROR          | both    | code u16 + message (u16 len + UTF-8) |
 | 0x0C  | TREE_BEGIN     | send→recv | flags u16 (§16.2), [parallel u16 when bit 3], [pattern section when bit 2], entry_count u64, then entry_count × tree entry (§16.2; per-entry `mode u32` when bit 4) |
@@ -270,7 +270,8 @@ TREE_WORKER/TREE_FILE):
      reads the report, returns `WouldChange`.
    - nothing-would-change (empty plan with matching state, or an all-Local
      plan reproducing the receiver's layout exactly) → `COMMIT_ACK` as
-     usual; the sender returns `InSync`. No index is written in dry-run.
+     usual (outcome byte `0`, §8); the sender returns `InSync`. No index
+     is written in dry-run.
 5. Tree sessions (§16.10) carry the preview as a TREE_BEGIN flag bit; the
    delete pass counts instead of removing.
 
@@ -302,6 +303,18 @@ and (c) VERIFY has arrived. It must not finalize before (a)–(c) all hold.
    file and compares it to the VERIFY frame.
 3. Match → fsync, atomic rename over the target path, send COMMIT_ACK. Both
    peers are done.
+
+**COMMIT_ACK outcome (D24, 2026-11-06).** COMMIT_ACK carries one byte:
+`1` when the receiver wrote the target (an executed plan, an empty-file
+commit), `0` when it did not (the no-rewrite paths below, and the §7.1
+"nothing would change" answer). The sender labels the conversation from
+that byte (InSync for `0`, Transferred for `1`) instead of predicting
+the receiver's decision, and bytes it sent always count as written.
+Compatibility, no version bump: pre-D24 senders read only the frame
+type, so they ignore the byte; a pre-D24 receiver sends an empty
+payload, and the sender then falls back to its prediction (the
+layout-reproduction check below). Any other payload is malformed
+(strict decode).
 4. Mismatch → delete the temp file, send ERROR 4. The original file is
    untouched. Retry is the sender's decision (fresh connection).
 
@@ -337,12 +350,14 @@ list). VERIFY guards every path regardless.
 The skip applies only when the manifest describes nothing but the target
 itself. A resuming receiver (resume-temp chunks, §10), one that streamed
 D22 census chunks, and one whose old file is a `--from` source other than
-the target always execute: they commit the temp. The sender cannot always see
-those cases in the chunk list, so it labels the plan InSync only when the
-receiver's HELLO also says the target is exactly that file: `resuming`
-(flag bit 2) clear and the HELLO `file_size` equal to its own. Without
-that, a complete resume temp made the sender report InSync while the
-receiver committed.
+the target always execute: they commit the temp. The COMMIT_ACK outcome
+byte reports that to the sender. For a pre-D24 receiver (empty
+COMMIT_ACK) the sender predicts instead: it labels the plan InSync only
+when the plan reproduces the streamed chunk list and the receiver's
+HELLO says the target is exactly that file: `resuming` (flag bit 2)
+clear and the HELLO `file_size` equal to its own. The prediction cannot
+see a `--from` source whose target already has the sender's size, nor an
+empty-file commit; only the byte gets those right.
 
 ## 9. Diff strategy (D8) — lazy default, eager opt-in
 

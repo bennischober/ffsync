@@ -394,6 +394,12 @@ pre-existing.
   remaining manifest. Held bytes are capped at `EAGER_BUF_CAP` (= the
   receiver's cap). Do not "optimize" the writes back into the manifest
   loop; `eager_does_not_deadlock_on_small_transport_buffers` pins it.
+- COMMIT_ACK carries the receiver's outcome byte (D24, §8): every
+  receiver COMMIT_ACK send must pass `encode_commit_ack(written)` with
+  `written` matching the label it returns (Transferred ⇔ true). The
+  sender's layout-reproduction check is only the fallback for pre-D24
+  receivers (empty payload) — do not "simplify" it away, and do not let
+  it override a present byte.
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
 - The identity file (`identity.bin`) holds the private key: `0600` on unix,

@@ -7,12 +7,14 @@ All notable changes to ffsync are documented here. The format follows [Keep a Ch
 ### Added
 
 - `chunking::REGION_SIZE`: the 256 MiB region size as a public protocol constant.
+- **COMMIT_ACK reports what the receiver did** (D24). The frame now carries one outcome byte (target written or not), and the sender takes its InSync/Transferred label from it instead of predicting. No version bump: released senders ignore the byte, and with a pre-1.4 receiver (empty COMMIT_ACK) the sender keeps predicting as before. Library: `message::encode_commit_ack`, `message::decode_commit_ack`.
 
 ### Fixed
 
 - **`receive --from <old>` could leave the target unwritten.** When the old file already matched the sender's file (same size and mtime, or same content under `--checksum`), both peers reported InSync and the target was never written. The receiver's HELLO now describes its target, and a `--from` old file never takes the no-rewrite shortcut.
 - **Resume after the sender's file shifted.** A leftover temp whose chunks belong at other offsets (bytes inserted or removed between attempts) failed its own read verification, because an earlier write overwrote a chunk that a later one still needed. The attempt was wasted and the temp deleted. Moved temp chunks are now stashed before any write, so the resume converges in one attempt. Temp chunks that are already in place are verified and no longer rewritten.
 - A complete resume temp no longer makes the sender report InSync while the receiver commits the temp. Both now report Transferred.
+- The sender's summary now matches the receiver's in two more cases: `receive --from` when the target already exists at the sender's size, and an empty sender file truncating a non-empty target. The sender used to report InSync while the receiver wrote the target. Both peers need 1.4.0 for this.
 
 ### Changed
 
