@@ -1469,6 +1469,13 @@ fn tree_case_only_rename_keeps_synced_content() {
     sender.write("Docs/a.txt", b"new doc");
     receiver.write("README.md", b"old readme");
     receiver.write("docs/a.txt", b"old doc");
+    // `new doc` / `old doc` are the same size, and the two writes land in
+    // the same Windows clock tick often enough that both files carry one
+    // mtime: the size+mtime fast path (§4) then rightly calls docs/a.txt
+    // unchanged and the content assert flakes. Backdate the receiver's
+    // files so only the case logic decides the outcome.
+    set_mtime(&receiver.path().join("README.md"), 1600000000);
+    set_mtime(&receiver.path().join("docs/a.txt"), 1600000000);
 
     let (s, r) = run_tree_session(sender.path(), receiver.path(), false, false);
     s.expect("sender ok");
