@@ -2,7 +2,9 @@
 
 All notable changes to ffsync are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] - 2026-11-06
+
+The rest of the code-review fixes, including a data bug: `receive --from` could leave the target unwritten. The protocol stays at v4 and 1.3.x peers interoperate. COMMIT_ACK gains an outcome byte (D24) that released peers ignore. Upgrade the receiver to get the `--from` fix; peers' InSync/Transferred labels agree in all cases once both run 1.4.0.
 
 ### Added
 
@@ -258,7 +260,7 @@ First working implementation: single-file sync between two peers over TCP.
 - The chunk-tree root (file identity for verification and change detection) is a domain-separated BLAKE3 over the ordered chunk-hash list — not the standard BLAKE3 file hash (its internal tree is over fixed 1024-byte blocks, not CDC chunk boundaries).
 - rsync remains faster on delta ratio for small localized edits (fine-grained fixed blocks); ffsync's advantage is the parallel scan (~3.8x cold start on the 72.7 GiB reference file) and resumability.
 
-[Unreleased]: https://github.com/bennischober/ffsync/compare/v1.3.0...HEAD
+[1.4.0]: https://github.com/bennischober/ffsync/releases/tag/v1.4.0
 [1.3.0]: https://github.com/bennischober/ffsync/releases/tag/v1.3.0
 [1.2.0]: https://github.com/bennischober/ffsync/releases/tag/v1.2.0
 [1.1.0]: https://github.com/bennischober/ffsync/releases/tag/v1.1.0
