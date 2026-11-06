@@ -1494,6 +1494,52 @@ mod tests {
     }
 
     #[test]
+    fn stale_temp_does_not_block_an_already_matching_target() {
+        // The receiver's old file already equals the sender's, but a temp
+        // from an earlier interrupted sync of DIFFERENT content is left
+        // over. The plan reproduces the old file, so nothing is written —
+        // and the old code then judged the session by the TEMP's root:
+        // HashMismatch, temp kept, every retry failing the same way.
+        use ffsync::protocol::sync::SyncOutcome;
+        let fx = Fixture::new("staletemp");
+        let src_data: Vec<u8> = (0..2 * 1024 * 1024u32)
+            .map(|i| (i as u8).wrapping_mul(13).wrapping_add((i / 4096) as u8))
+            .collect();
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data);
+        let temp_path = ffsync::reconstruction::Reconstructor::temp_path_for(&target);
+        create_file(&temp_path, &vec![0xA5u8; 1024 * 1024]);
+
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: true,
+                tree: false,
+                dry_run: false,
+                eager: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: true,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager: false,
+                extra_sources: Vec::new(),
+            },
+        );
+        s.expect("sender ok");
+        let r = r.expect("receiver ok (was HashMismatch on the stale temp)");
+        assert!(matches!(r, SyncOutcome::InSync), "{r:?}");
+        assert_eq!(read_file(&target), src_data);
+        assert!(!temp_path.exists(), "the stale temp is dropped");
+    }
+
+    #[test]
     fn dry_run_reports_would_change_without_writing() {
         let fx = Fixture::new("dry_run_change");
         // Different SIZES from the receiver's old file: the size+mtime fast
@@ -1541,7 +1587,7 @@ mod tests {
         );
         // Nothing was written: content identical, no temp file, mtime intact.
         assert_eq!(std::fs::read(&target).unwrap(), old_data);
-        assert!(!target.with_extension("ffsync-tmp").exists());
+        assert!(!ffsync::reconstruction::Reconstructor::temp_path_for(&target).exists());
         assert_eq!(
             std::fs::metadata(&target).unwrap().modified().unwrap(),
             before,

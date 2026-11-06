@@ -269,13 +269,13 @@ pre-existing.
   because it is stateless (`Send + Sync`). Preserve this split.
 - The mmap is created with `unsafe { Mmap::map }`; the underlying file must not
   be modified while the pipeline holds the mapping.
-- The reconstructor's temp path is derived with
-  `Path::with_extension("ffsync-tmp")`, which *replaces* the last extension
-  (`a.mkv` → `a.ffsync-tmp`). This differs from the `<.file.ext.ffsync-tmp>`
-  naming in the concept doc (recorded as D6 in `concept/Design Decisions.md`).
-  The index path does the OPPOSITE (appends `.ffsync-index`) because the
-  orphan cleanup must recover the target name by stripping the suffix; never
-  "fix" one to match the other.
+- Sidecar names APPEND their suffix: the temp is `a.mkv.ffsync-tmp`
+  (`Reconstructor::temp_path_for`, D6 amendment 2026-11) and the index is
+  `a.mkv.ffsync-index` (`index_path_for`). Never derive either with
+  `Path::with_extension` — substituting the extension mapped `a.mkv` and
+  `a.mp4` to one temp (a §16.8 parallel collision), and the orphan cleanup
+  recovers target names by stripping the index suffix. Both stay visible
+  (no leading-dot convention; the tree scan filters them by suffix).
 - Sub-second mtime is load-bearing in two places: the index validation and
   the §4 wire fast path (HELLO `file_mtime_nanos`, protocol v2). Whole-second
   comparisons let a same-second same-size rewrite pass as unchanged — a

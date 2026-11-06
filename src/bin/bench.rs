@@ -613,10 +613,8 @@ fn simulate_disconnect(
     cdc: (usize, usize, usize),
     kill_pct: u32,
 ) -> io::Result<DisconnectStats> {
-    // The Reconstructor derives its on-disk temp path by replacing the last
-    // extension with "ffsync-tmp"; mirror that here.
     let rec_path = variant.with_file_name("disconnect_sim.bin");
-    let temp_path = rec_path.with_extension("ffsync-tmp");
+    let temp_path = Reconstructor::temp_path_for(&rec_path);
     let _ = fs::remove_file(&temp_path);
 
     let source_hashes: HashSet<Hash> = source_chunks.iter().map(|c| c.hash).collect();
