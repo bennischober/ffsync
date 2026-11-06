@@ -649,6 +649,12 @@ sync's triage (§16.3) skips the file — the tree fast path fires without
 reading a byte. Without this, every synced file's mtime would change at
 commit and no tree sync would ever skip.
 
+A sender mtime of `(0, 0)` is applied literally, as the Unix epoch. The
+wire fields are unsigned, so a file dated before 1970 (or one whose mtime
+cannot be read) is reported as `(0, 0)`; the receiver must set exactly
+that, or its own scan reports a different mtime and the file re-syncs on
+every run (amended 2026-11; earlier builds skipped the write for `(0, 0)`).
+
 Single-file sync adopts the same behavior under protocol v3 (observable
 change: the receiver's file now carries the sender's mtime after a sync;
 this matches rsync's default `--times` behavior and is what users expect
@@ -923,27 +929,32 @@ identical on both peers).
   same trade rsync's default fast path makes. The metadata is best-effort
   convergence, not a change detector. (`--checksum` still forces full
   per-file conversations, which then also apply metadata.)
-- **Apply:** after a file's reconstruction succeeds and before the mtime
+- **Apply:** after a file's reconstruction succeeds and after the mtime
   preservation write (§16.6), the receiver applies the sender's mode:
-  on unix, `fchmod`-equivalent via `std::os::unix::fs::PermissionsExt`
-  (mode masked `0o7777`); on Windows, the no-write bits
-  (`0o222` for owner/group/other) map to clearing the read-only
-  attribute — write-enable always wins (an attribute cannot express
-  read-denial; documenting the lossy direction is the honest choice).
+  on unix, `chmod` via `std::os::unix::fs::PermissionsExt` (mode masked
+  `0o7777`); on Windows, a mode with **no** write bit (`mode & 0o222 ==
+  0`) sets the read-only attribute and any write bit clears it —
+  write-enable always wins (an attribute cannot express read-denial;
+  documenting the lossy direction is the honest choice). Both metadata
+  writes are best-effort: a failure is a warning, never a failed sync
+  (the content is already verified and committed).
   Directories: mode applies to created directories at creation time;
   pre-existing directories keep their mode (the receiver's directory is
   not replaced — matching the "dir with files needs no entry" rule).
-- **Order is load-bearing:** mode write → mtime write → stat → D15 index
-  write. The index must record the post-metadata mtime or every
-  metadata-synced file re-syncs (§16.6's ordering rule, extended one
-  step earlier).
+- **Order is load-bearing:** mtime write → mode write → stat → D15 index
+  write (amended 2026-11; the v4 text had mode first). The index must
+  record the sender's mtime or every metadata-synced file re-syncs
+  (§16.6's ordering rule). Neither chmod nor the Windows read-only
+  attribute changes the mtime, so mode may follow it — and must: a
+  read-only mode applied first made the mtime write fail (EACCES for a
+  non-root unix user, os error 5 on Windows).
 - **Index (D15): no change.** The index stays (chunk list, root, size,
   mtime): triage never reads mode (chmod-only changes are accepted as
   not-synced — the §16.3 invariant), the sender's manifest mode comes
   from a fresh metadata scan at session start (never from the index —
   the tree scan is metadata-only and always current), and the per-file
-  warm path serves chunks, not metadata. Applying mode before mtime
-  (above) keeps the index's recorded mtime correct without mode ever
+  warm path serves chunks, not metadata. Mode never touches the mtime,
+  so the index's recorded mtime stays correct without mode ever
   touching the index. (An earlier draft of this section bumped the index
   codec for a mode field; the implementation review dropped it — nothing
   consumes it.)

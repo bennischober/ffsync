@@ -872,6 +872,17 @@ rest stays out:
   stat → D15 index write. The index must record the post-metadata mtime
   or every metadata-synced file re-syncs on the next run (the §16.6
   ordering rule extended one step earlier).
+  > **Amendment (2026-11, code review):** the order is now mtime → mode
+  > → stat → index. Mode first broke read-only modes: the mtime write
+  > opened a writable handle, which a `0o444` file refuses (EACCES for a
+  > non-root unix user; os error 5 on Windows), and the error failed an
+  > already-committed sync on every run. chmod and the Windows read-only
+  > attribute do not touch the mtime, so the index still records the
+  > sender's value. The mtime handle now requests the least access
+  > (read-only fd / `FILE_WRITE_ATTRIBUTES`), both writes are warnings
+  > rather than errors (the "best-effort" this decision always promised),
+  > and the Windows mapping's inverted test (`bits & 0o222 != 0` marked
+  > writable modes read-only) was fixed to `== 0`.
 - **Wire:** TREE_BEGIN flag bit 4 `metadata`; when set, each entry gains
   `mode u32` (st_mode low bits masked `0o7777`, 0 where the platform has
   no POSIX modes — Windows maps no-write bits to the read-only attribute,
