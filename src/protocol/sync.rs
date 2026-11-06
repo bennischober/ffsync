@@ -645,12 +645,13 @@ where
         && plan
             .iter()
             .zip(manifest_chunks.iter())
-            .all(|(e, (_, off, len))| match e {
+            .all(|(e, (h, off, len))| match e {
                 PlanEntry::Local {
                     target_offset,
                     length,
+                    hash,
                     ..
-                } => target_offset == off && length == len,
+                } => target_offset == off && length == len && hash == h,
                 _ => false,
             });
 
@@ -1249,11 +1250,14 @@ where
         && plan.iter().all(|e| matches!(e, PlanEntry::Local { .. }))
         && plan.len() == local_chunks.len()
         && plan.iter().zip(local_chunks.iter()).all(|(e, c)| match e {
+            // Hash included: equal spans alone also match two swapped
+            // equal-length chunks, whose bytes do need rewriting.
             PlanEntry::Local {
                 target_offset,
                 length,
+                hash,
                 ..
-            } => *target_offset == c.offset && *length as usize == c.length,
+            } => *target_offset == c.offset && *length as usize == c.length && *hash == c.hash,
             _ => false,
         });
     if dry_run {
@@ -1304,11 +1308,14 @@ where
         && plan.iter().all(|e| matches!(e, PlanEntry::Local { .. }))
         && plan.len() == local_chunks.len()
         && plan.iter().zip(local_chunks.iter()).all(|(e, c)| match e {
+            // Hash included: equal spans alone also match two swapped
+            // equal-length chunks, whose bytes do need rewriting.
             PlanEntry::Local {
                 target_offset,
                 length,
+                hash,
                 ..
-            } => *target_offset == c.offset && *length as usize == c.length,
+            } => *target_offset == c.offset && *length as usize == c.length && *hash == c.hash,
             _ => false,
         });
     if !plan.is_empty() && !plan_reproduces_local_layout {
@@ -1613,93 +1620,66 @@ where
             chunks: 0,
         });
     }
-    let (state_root, state_desc, state_chunks): (Option<Hash>, &str, Vec<Chunk>) = if resuming {
-        let chunks = scan_file_plain(&temp_path, pipeline, cdc)?;
-        (Some(chunk_root(&chunks)), "temp", chunks)
-    } else {
-        (local_root, "old file", Vec::new())
-    };
-    match state_root {
+    // The only non-empty plan that reaches here reproduces the OLD FILE's
+    // chunk list position by position, hashes included — so the old file
+    // already is the sender's content and is what VERIFY must match. A
+    // leftover resume temp is stale: it must not decide the outcome (the
+    // old code compared the temp's root, failed HashMismatch, and kept the
+    // temp — so every retry failed the same way), and it is dropped.
+    if resuming {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    match local_root {
         Some(root) if root == verify_root => {
-            if resuming {
-                // The previous attempt actually completed the data; commit it.
-                // Durability (§8.3): flush before the rename (see the
-                // executed-plan commit above).
-                let reconstructor = Reconstructor::open_existing(
-                    &request.path,
-                    &request.local_source,
-                    target_size,
-                )?;
-                reconstructor.sync_temp()?;
-                drop(reconstructor);
-                clear_readonly_best_effort(&request.path);
-                std::fs::rename(&temp_path, &request.path)?;
-                fsync_parent_dir_best_effort(&request.path);
-                apply_commit_mode(&request.path, request.apply_mode)?;
-                apply_commit_mtime(&request)?;
-                // Persist the committed state (D15): the temp scan above IS
-                // the verified chunk list — reuse it instead of re-scanning.
-                // (Found while landing D19: this site re-scanned the temp
-                // path AFTER renaming it away, so `unwrap_or_default` fed an
-                // empty index after every successful resume commit — the
-                // warm start then served nothing.)
+            // Old file already matched (no transfer needed): persist
+            // indexes so the NEXT sync warms (D15). The scan already
+            // ran; writing costs one file of bytes.
+            // - target case (no --from, or --from == target): index the
+            //   target under its own identity.
+            // - --from <other-file> case (D21): the OLD file matched —
+            //   index IT under its own identity (size/mtime/chunks of
+            //   local_source, path local_source), so a repeated
+            //   --from sync warm-starts the receiver's scan. Never
+            //   index the target from another file's content.
+            apply_commit_mode(&request.path, request.apply_mode)?;
+            apply_commit_mtime(&request)?;
+            if request.local_source == request.path {
                 let _ = crate::index::write_index(
                     &request.path,
                     &FileIndex::from_scan(
-                        state_chunks,
-                        target_size,
-                        crate::index::stat_mtime(&request.path).unwrap_or((0, 0)),
+                        local_chunks.clone(),
+                        local_size,
+                        crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
                         cdc_u32,
                     ),
                 );
             } else {
-                // Old file already matched (no transfer needed): persist
-                // indexes so the NEXT sync warms (D15). The scan already
-                // ran; writing costs one file of bytes.
-                // - target case (no --from, or --from == target): index the
-                //   target under its own identity.
-                // - --from <other-file> case (D21): the OLD file matched —
-                //   index IT under its own identity (size/mtime/chunks of
-                //   local_source, path local_source), so a repeated
-                //   --from sync warm-starts the receiver's scan. Never
-                //   index the target from another file's content.
-                apply_commit_mode(&request.path, request.apply_mode)?;
-                apply_commit_mtime(&request)?;
-                if request.local_source == request.path {
-                    let _ = crate::index::write_index(
-                        &request.path,
-                        &FileIndex::from_scan(
-                            local_chunks.clone(),
-                            local_size,
-                            crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
-                            cdc_u32,
-                        ),
-                    );
-                } else {
-                    let _ = crate::index::write_index(
-                        &request.local_source,
-                        &FileIndex::from_scan(
-                            local_chunks.clone(),
-                            local_size,
-                            crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
-                            cdc_u32,
-                        ),
-                    );
-                }
+                let _ = crate::index::write_index(
+                    &request.local_source,
+                    &FileIndex::from_scan(
+                        local_chunks.clone(),
+                        local_size,
+                        crate::index::stat_mtime(&request.local_source).unwrap_or((0, 0)),
+                        cdc_u32,
+                    ),
+                );
             }
             message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
             stream.flush()?;
             progress(Progress::NothingToDo);
             Ok(SyncOutcome::InSync)
         }
-        Some(_) => Err(send_error_and_finish(
-            stream,
-            ErrorCode::HashMismatch,
-            &format!(
-                "content differs despite empty plan (stale {} manifest?)",
-                state_desc
-            ),
-        )),
+        Some(_) => {
+            // Equal positional hashes but a different root: our chunk list
+            // did not describe the old file (a lying D15 index). Drop it so
+            // the retry cold-scans instead of failing the same way again.
+            crate::index::remove_index(&request.local_source);
+            Err(send_error_and_finish(
+                stream,
+                ErrorCode::HashMismatch,
+                "content differs despite a plan that reproduces the old file (stale index?)",
+            ))
+        }
         None => {
             // We have no local file but the plan was empty. v3 (§16): this
             // is legitimate when the sender's file is EMPTY (an empty chunk

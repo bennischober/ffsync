@@ -144,7 +144,8 @@ impl TreeManifest {
 
     /// [`TreeManifest::scan`] with exclude patterns (§16.7): an excluded
     /// file is skipped; an excluded directory is pruned with its whole
-    /// subtree (contents cannot re-include — there is no negation syntax).
+    /// subtree (a `!` negation cannot re-include anything below a pruned
+    /// directory — the scan never descends into it).
     /// The sidecar filter (`*.ffsync-index` / `*.ffsync-tmp`) applies in
     /// addition and is not user-visible.
     pub fn scan_with_excludes(root: &Path, excludes: &ExcludeSet) -> io::Result<TreeManifest> {
@@ -180,13 +181,21 @@ impl TreeManifest {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            // `entry.metadata()` on a symlink already returns link metadata
-            // (std does not follow), but be explicit: re-read through
-            // symlink_metadata so the is_symlink flag is authoritative.
-            let is_symlink = std::fs::symlink_metadata(entry.path())
-                .map(|m| m.is_symlink())
-                .unwrap_or(false);
-            let name = entry.file_name().to_string_lossy().into_owned();
+            // `DirEntry::metadata` never traverses a symlink (lstat on unix,
+            // the directory record on Windows), so its flag is authoritative
+            // without a second stat per entry.
+            let is_symlink = meta.is_symlink();
+            // Wire paths are UTF-8 (§16.2). A lossy conversion would map the
+            // name to one that does not exist (the sender's open then fails
+            // the whole session) and could merge two distinct names into
+            // one. Skip it, recorded not silent (D17).
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                eprintln!(
+                    "warning: skipping non-UTF-8 file name: {}",
+                    entry.path().display()
+                );
+                continue;
+            };
             let rel = if prefix.is_empty() {
                 name
             } else {
@@ -239,8 +248,8 @@ impl TreeManifest {
             } else if meta.is_file() {
                 // D15/D17: the sidecar index and the temp file are ffsync's
                 // own bookkeeping, never tree content. The index filename is
-                // `<target>.ffsync-index` (suffix APPENDED — see index.rs);
-                // the temp is `<target-with-ext>.ffsync-tmp`. Both are
+                // `<target>.ffsync-index` and the temp `<target>.ffsync-tmp`
+                // (suffixes APPENDED — index.rs, D6 amendment). Both are
                 // excluded from tree manifests: syncing them would (a) sync
                 // our bookkeeping to the peer and (b) desync on every run
                 // (an index written at commit changes mtime → re-transfer
@@ -347,7 +356,7 @@ impl ExcludePattern {
             (false, raw)
         };
         if rest.is_empty() {
-            return Err("exclude pattern is only a negation: {raw:?}".to_string());
+            return Err(format!("exclude pattern is only a negation: {raw:?}"));
         }
         if rest.contains('\\') {
             return Err(format!(
@@ -651,17 +660,12 @@ impl ExcludeSet {
         if self.excluded(rel_path, kind) {
             return true;
         }
-        let mut prefix = String::new();
-        for seg in rel_path.split('/') {
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(seg);
-            if self.excluded(&prefix, EntryKind::Dir) {
-                return true;
-            }
-        }
-        false
+        // Proper ancestors only: the path itself was judged above with its
+        // REAL kind. Re-judging the final segment as a Dir made a dir-only
+        // pattern (`build/`) protect a *file* named `build`.
+        rel_path
+            .match_indices('/')
+            .any(|(i, _)| self.excluded(&rel_path[..i], EntryKind::Dir))
     }
 }
 
@@ -1085,6 +1089,18 @@ mod tests {
         assert!(set.matches("]x", EntryKind::File));
         assert!(!set.matches("x", EntryKind::File));
         assert!(ExcludeSet::from_patterns(["!"]).is_err());
+    }
+
+    #[test]
+    fn delete_guard_judges_the_path_itself_by_its_real_kind() {
+        let set = ExcludeSet::from_patterns(["build/"]).unwrap();
+        // A FILE named build is not matched by a dir-only pattern.
+        assert!(!set.matches_path_or_ancestor("build", EntryKind::File));
+        assert!(!set.matches_path_or_ancestor("src/build", EntryKind::File));
+        // The directory and everything below it are protected.
+        assert!(set.matches_path_or_ancestor("build", EntryKind::Dir));
+        assert!(set.matches_path_or_ancestor("build/out.o", EntryKind::File));
+        assert!(set.matches_path_or_ancestor("src/build/out.o", EntryKind::File));
     }
 
     #[test]

@@ -530,7 +530,10 @@ exist only to create empty directories on the receiver (a directory with
 files needs no entry; its files imply the path). Paths are relative to the
 synced root, `/`-separated regardless of platform, and must not contain
 `..` components (protocol error otherwise — path traversal is a protocol
-violation, not a filesystem concern).
+violation, not a filesystem concern). A local name that is not valid
+UTF-8 (possible on unix) has no wire spelling: the scan skips it with a
+warning on both peers (amended 2026-11 — a lossy conversion named a file
+that did not exist and failed the session, and could merge two names).
 
 Tree flags (in TREE_BEGIN, u16): bit 0 `checksum` (D11 tree-wide: no
 metadata fast path on any file), bit 1 `no_delete` (§16.5).
@@ -622,6 +625,18 @@ reads the reply and exits; the receiver exits after sending. The sender's
 TREE_END doubles as the "transfers done, please finalize" barrier — the
 receiver must not delete anything before it (a sender aborting
 mid-session leaves the receiver's tree intact apart from synced files).
+
+A receiver-only directory can hold entries no manifest listed: ffsync's
+own sidecars (`*.ffsync-tmp`, `*.ffsync-index`), files the sender's
+patterns exclude (§16.7), names the scan skips (non-UTF-8, §16.2). Before
+removing such a directory the receiver deletes **orphaned** sidecars in
+it (those whose target is gone), and the delete pass removes a deleted
+file's own sidecars with it. A directory that is still not empty is
+**kept** — it is not counted, and the session does not fail (amended
+2026-11; previously `remove_dir` failed the session after every transfer
+had committed). A real delete failure (permissions, I/O) fails the
+session and is announced to the sender with ERROR (`Aborted`) in place of
+the TREE_END reply.
 
 Delete safety is bounded by the same trust decision as every write in the
 session: the receiver already pinned the sender's fingerprint (D16).

@@ -110,6 +110,19 @@ temp file is deleted and the original untouched.
 `.a.mkv.ffsync-tmp` from the concept doc. Accepted for now; revisit when the
 network layer lands (a hidden-file convention may be preferable).
 
+> **Amendment (2026-11):** the temp suffix is now *appended*:
+> `a.mkv` → `a.mkv.ffsync-tmp` (`Reconstructor::temp_path_for`), the same
+> rule as the D15 index sidecar. The substitution was a real bug once
+> §16.8 parallel sessions landed: `a.mkv` and `a.mp4` shared
+> `a.ffsync-tmp`, so two workers truncated each other's temp, and a
+> resume (D10) of one file could adopt the other's partial temp (caught
+> only by the final root check). The dotfile variant stays rejected (the
+> tree scan already filters sidecars by suffix, and hidden temps would
+> surprise users on Windows less than on unix — not worth a platform
+> split). Temps left by older builds use the old name; they no longer
+> resume (a one-time full re-transfer) and the tree delete pass removes
+> them as sidecars (§16.4).
+
 ## D13 — Transport plan: plain TCP in v0.1, QUIC as the v0.2 default
 
 > **Amendment (2026-10, v0.2 work):** QUIC is *deferred past* v0.2; the
