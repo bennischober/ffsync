@@ -38,6 +38,15 @@ not a heap cost). Sampling every 200 ms over live CLI-to-CLI syncs.
   striding chunker threads only fault what they hash). 32-bit targets are
   out of scope by design (Windows-primary, 64-bit).
 
+- **Eager mode is the one bounded exception** (D8 amendment,
+  2026-11-06): an `--eager` sender holds its eager DATA frames
+  (compressed) until the receiver's MANIFEST_DONE, capped at the
+  receiver's 64 MiB buffer cap, so an eager sender's heap can grow by up
+  to 64 MiB above the table (the eager receiver's by-hash buffer already
+  had the same cap). Lazy sessions are unchanged. Each connection also
+  carries a 64 KiB read + 64 KiB write buffer (`BufStream`, 2026-11-06):
+  128 KiB per connection, ×K under `--parallel K`. Not yet re-sampled.
+
 ## Leak posture
 
 Each ffsync process runs exactly one sync and exits; classic long-lived

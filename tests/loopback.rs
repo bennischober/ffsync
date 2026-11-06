@@ -746,6 +746,84 @@ mod tests {
     }
 
     #[test]
+    fn eager_does_not_deadlock_on_small_transport_buffers() {
+        // §9.2: the receiver streams its whole manifest without reading,
+        // so a sender that WROTE eager DATA during the manifest exchange
+        // blocked as soon as the forward buffer filled — and then stopped
+        // reading, which blocked the receiver's manifest writes: a
+        // deadlock on any transport whose buffers are smaller than the
+        // eager bytes + the remaining manifest (large files over TCP).
+        // A 2-message duplex makes that window tiny; the session must
+        // still converge. Lazy runs too: with three writes per frame the
+        // write-then-read HELLO exchange itself deadlocked on it.
+        let fx = Fixture::new("eager_small_bufs");
+        let mut src_data = vec![0u8; 8 * 1024 * 1024];
+        for (i, b) in src_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add((i / 4093) as u8);
+        }
+        create_file(fx.source(), &src_data);
+        // Modified head: eager offers start after a few manifest entries,
+        // while ~100 more are still to come.
+        let mut old_data = src_data.clone();
+        for b in &mut old_data[..1024 * 1024] {
+            *b ^= 0x5A;
+        }
+        let target = fx.path("target.bin");
+        for eager in [false, true] {
+            create_file(&target, &old_data);
+
+            let send_req = SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: true,
+                tree: false,
+                dry_run: false,
+                eager,
+            };
+            let recv_req = ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: true,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager,
+                extra_sources: Vec::new(),
+            };
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut sender_end, mut receiver_end) = DuplexPair::new(2);
+                let s = std::thread::spawn(move || {
+                    send(
+                        &mut sender_end,
+                        &send_req,
+                        &PipelineConfig::default(),
+                        &mut |_| {},
+                    )
+                });
+                let r = std::thread::spawn(move || {
+                    receive(
+                        &mut receiver_end,
+                        &recv_req,
+                        &PipelineConfig::default(),
+                        &mut |_| {},
+                    )
+                });
+                let s = s.join().unwrap().map_err(|e| e.to_string());
+                let r = r.join().unwrap().map_err(|e| e.to_string());
+                let _ = done_tx.send((s, r));
+            });
+            let (s, r) = done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("session deadlocked (eager = {eager})"));
+            s.expect("sender ok");
+            r.expect("receiver ok");
+            assert_eq!(read_file(&target), src_data, "eager = {eager}");
+        }
+    }
+
+    #[test]
     fn eager_resume_after_mid_transfer_disconnect() {
         // D10 x §9.2: an eager session that dies mid-transfer must leave the
         // same resume state as a lazy one, and the resumed session (eager
@@ -829,6 +907,158 @@ mod tests {
         let _ = r2.expect("resumed eager receiver ok");
         assert_eq!(read_file(&target), src_data);
         assert!(!temp.exists(), "temp file must be committed away");
+    }
+
+    /// Counts the write calls that reach the transport.
+    struct CountingEnd {
+        inner: DuplexEnd,
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for CountingEnd {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for CountingEnd {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn buffered_streams_converge_and_coalesce_writes() {
+        // The CLI wraps every connection in `BufStream`. Every flow must
+        // still converge on tiny transport buffers (flush-before-read keeps
+        // request/response steps live; the fast path's early sender exit
+        // must not fail the receiver's buffered manifest), and the
+        // receiver's ~128 manifest frames must leave in a handful of writes.
+        use ffsync::protocol::BufStream;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fx = Fixture::new("bufstream");
+        // Non-repeating content (xorshift): every chunk is distinct, so the
+        // manifest is not deduplicated down to a few entries.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let src_data: Vec<u8> = (0..8 * 1024 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        create_file(fx.source(), &src_data);
+        let mut old_data = src_data.clone();
+        for b in &mut old_data[..1024 * 1024] {
+            *b ^= 0x5A;
+        }
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(fx.source(), filetime::FileTime::from_system_time(t)).unwrap();
+        let target = fx.path("target.bin");
+
+        // (label, old target content, trust times, eager, buffered)
+        type Case<'a> = (&'a str, Option<&'a [u8]>, bool, bool, bool);
+        let cases: [Case<'_>; 6] = [
+            ("fast path", Some(&src_data), true, false, true),
+            ("lazy", Some(&old_data), false, false, true),
+            ("eager", Some(&old_data), false, true, true),
+            ("fresh", None, false, false, true),
+            ("eager fresh", None, false, true, true),
+            ("lazy unbuffered", Some(&old_data), false, false, false),
+        ];
+        let mut receiver_writes = Vec::new();
+        for (label, old, trust, eager, buffered) in cases {
+            let _ = std::fs::remove_file(&target);
+            if let Some(old) = old {
+                create_file(&target, old);
+                if trust {
+                    filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(t))
+                        .unwrap();
+                }
+            }
+            let send_req = SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: trust.then_some(t),
+                force_checksum: !trust,
+                tree: false,
+                dry_run: false,
+                eager,
+            };
+            let recv_req = ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: !trust,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager,
+                extra_sources: Vec::new(),
+            };
+            let writes = Arc::new(AtomicUsize::new(0));
+            let recv_writes = Arc::clone(&writes);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (sender_end, receiver_end) = DuplexPair::new(2);
+                let receiver_end = CountingEnd {
+                    inner: receiver_end,
+                    writes: recv_writes,
+                };
+                let pipeline = PipelineConfig::default();
+                let s = std::thread::spawn(move || {
+                    if buffered {
+                        let mut s = BufStream::new(sender_end);
+                        send(&mut s, &send_req, &pipeline, &mut |_| {})
+                    } else {
+                        let mut s = sender_end;
+                        send(&mut s, &send_req, &pipeline, &mut |_| {})
+                    }
+                });
+                let pipeline = PipelineConfig::default();
+                let r = std::thread::spawn(move || {
+                    if buffered {
+                        let mut r = BufStream::new(receiver_end);
+                        receive(&mut r, &recv_req, &pipeline, &mut |_| {})
+                    } else {
+                        let mut r = receiver_end;
+                        receive(&mut r, &recv_req, &pipeline, &mut |_| {})
+                    }
+                });
+                let s = s.join().unwrap().map_err(|e| e.to_string());
+                let r = r.join().unwrap().map_err(|e| e.to_string());
+                let _ = done_tx.send((s, r));
+            });
+            let (s, r) = done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("session deadlocked ({label})"));
+            let s = s.unwrap_or_else(|e| panic!("sender failed ({label}): {e}"));
+            let r = r.unwrap_or_else(|e| panic!("receiver failed ({label}): {e}"));
+            if trust {
+                assert!(matches!(s, SyncOutcome::InSync), "{label}: {s:?}");
+                assert!(matches!(r, SyncOutcome::InSync), "{label}: {r:?}");
+            }
+            assert_eq!(read_file(&target), src_data, "{label}");
+            receiver_writes.push((label, writes.load(Ordering::Relaxed)));
+        }
+        // 8 MiB < 16 MiB → 16k/64k/256k CDC (D19): ~128 manifest entries.
+        eprintln!("receiver transport writes: {receiver_writes:?}");
+        let count = |l: &str| receiver_writes.iter().find(|(x, _)| *x == l).unwrap().1;
+        assert!(
+            count("lazy unbuffered") > 100,
+            "unbuffered baseline: {receiver_writes:?}"
+        );
+        assert!(
+            count("lazy") <= 8,
+            "buffered receiver should coalesce: {receiver_writes:?}"
+        );
     }
 
     #[test]

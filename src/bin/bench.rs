@@ -1501,7 +1501,8 @@ fn run_one_latency_session(
         // Take the control end FIRST, dropping the lock before tree_receive
         // runs (a temporary guard on an argument would live for the whole
         // call and deadlock the accept closure).
-        let mut control_end = receiver_ends.lock().unwrap().remove(0);
+        let mut control_end =
+            ffsync::protocol::BufStream::new(receiver_ends.lock().unwrap().remove(0));
         tree_receive(
             &mut control_end,
             &TreeReceiveRequest {
@@ -1512,7 +1513,9 @@ fn run_one_latency_session(
                 accept_worker: {
                     let ends = std::sync::Arc::clone(&receiver_ends);
                     std::sync::Arc::new(move || {
-                        Ok(Box::new(ends.lock().unwrap().remove(0)) as Box<dyn ReadWrite>)
+                        Ok(Box::new(ffsync::protocol::BufStream::new(
+                            ends.lock().unwrap().remove(0),
+                        )) as Box<dyn ReadWrite>)
                     })
                 },
                 dry_run: false,
@@ -1525,7 +1528,7 @@ fn run_one_latency_session(
 
     let t = Instant::now();
     let send_res = tree_send(
-        &mut sender_ends.remove(0),
+        &mut ffsync::protocol::BufStream::new(sender_ends.remove(0)),
         &TreeSendRequest {
             root: send_root,
             force_checksum: false,
@@ -1537,7 +1540,9 @@ fn run_one_latency_session(
             connect_worker: {
                 let ends = std::sync::Mutex::new(sender_ends);
                 std::sync::Arc::new(move |_| {
-                    Ok(Box::new(ends.lock().unwrap().remove(0)) as Box<dyn ReadWrite>)
+                    Ok(Box::new(ffsync::protocol::BufStream::new(
+                        ends.lock().unwrap().remove(0),
+                    )) as Box<dyn ReadWrite>)
                 })
             },
         },
@@ -1677,7 +1682,11 @@ fn run_one_eager_session(
     let _ = fs::remove_file(&target);
     fs::copy(source, &target)?;
 
-    let (mut s_end, mut r_end) = latency_pair(Duration::from_millis(rtt_ms) / 2);
+    // Buffered like the CLI's connections (`BufStream`), so the session
+    // runs the shipped write pattern.
+    let (s_end, r_end) = latency_pair(Duration::from_millis(rtt_ms) / 2);
+    let mut s_end = ffsync::protocol::BufStream::new(s_end);
+    let mut r_end = ffsync::protocol::BufStream::new(r_end);
 
     let variant_p = variant.to_path_buf();
     let target_r = target.clone();

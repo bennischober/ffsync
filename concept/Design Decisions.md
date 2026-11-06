@@ -289,6 +289,25 @@ treated as a cache (get, not take) — otherwise duplicate DATA frames
 desync the frame stream at VERIFY. Correctness tests: eager convergence,
 loud decline on a non-opt-in receiver, in `tests/loopback.rs`.
 
+**Amendment (2026-11-06): decide early, write after MANIFEST_DONE.** The
+shipped sender WROTE eager DATA while still reading the receiver's
+manifest. The receiver streams its whole manifest without reading, so once
+the send→recv buffers filled the sender blocked, stopped reading, and the
+receiver blocked on its manifest writes: a deadlock whenever the eager
+bytes plus the remaining manifest exceed the transport's buffering (any
+large modified file over real TCP). The bench never saw it because its
+in-memory duplex buffers 1 024 messages. Fix: the gate decisions and the
+chunk reads + zstd still happen during the manifest exchange, but the
+sender holds the DATA frames and writes them after MANIFEST_DONE, before
+the plan, capped at the receiver's 64 MiB buffer cap (the rest go lazy).
+No wire change: the receiver reads nothing before its own MANIFEST_DONE,
+so it sees the identical frame sequence. Re-measured with the same cell
+(3 paired runs, both ends now `BufStream`-wrapped like the CLI): over-send
+0 B in every run, eager −20% at 0 ms RTT (median 479→381 ms) and −23% at
+30 ms (551→423 ms) — the gain survives because the expensive part (read +
+compress) still overlaps the receiver's scan. Pinned by
+`eager_does_not_deadlock_on_small_transport_buffers` (2-message duplex).
+
 **Amendment (2026-10-24, trees):** eager extends to tree sessions
 (§16.11): TREE_BEGIN flag bit 7 announced by the sender, mirrored by the
 receiver only on its own opt-in (an offer is not a session property —
