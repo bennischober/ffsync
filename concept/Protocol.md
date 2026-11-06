@@ -456,6 +456,18 @@ origin, D5):
 - Receiver MUST enforce: DATA total ≤ PLAN_REMOTE total; temp file never
   exceeds sender's file_size. A sender violating these is malicious or broken
   → ERROR 3.
+- Plan entries are validated as they arrive, before any buffer is sized from
+  them (2026-11 hardening): `1 ≤ length ≤ cdc_max`, `target_offset + length
+  ≤ file_size` computed without overflow, at most `2 × file_size / cdc_min
+  + 2` entries, and a PLAN_LOCAL's length equals the receiver's own manifest
+  entry for that hash (§6.1). Each is ERROR 3.
+- HELLO CDC parameters are honored only inside the chunker library's own
+  supported ranges (fastcdc 5.0: min 64 B–1 MiB, avg 256 B–4 MiB, max
+  1 KiB–16 MiB, all even, `min ≤ avg ≤ max`); anything else falls back to
+  the receiver's local policy (§4.3) — the library checks these only in
+  debug builds, and an out-of-range average panics it in release.
+- The sender keeps manifest state bounded by its own chunk count: entries
+  for hashes it does not have are not stored, whatever the receiver sends.
 
 ## 13. Open questions
 
@@ -569,7 +581,10 @@ exist only to create empty directories on the receiver (a directory with
 files needs no entry; its files imply the path). Paths are relative to the
 synced root, `/`-separated regardless of platform, and must not contain
 `..` components (protocol error otherwise — path traversal is a protocol
-violation, not a filesystem concern).
+violation, not a filesystem concern). A local name that is not valid
+UTF-8 (possible on unix) has no wire spelling: the scan skips it with a
+warning on both peers (amended 2026-11 — a lossy conversion named a file
+that did not exist and failed the session, and could merge two names).
 
 Tree flags (in TREE_BEGIN, u16): bit 0 `checksum` (D11 tree-wide: no
 metadata fast path on any file), bit 1 `no_delete` (§16.5).
@@ -662,6 +677,18 @@ TREE_END doubles as the "transfers done, please finalize" barrier — the
 receiver must not delete anything before it (a sender aborting
 mid-session leaves the receiver's tree intact apart from synced files).
 
+A receiver-only directory can hold entries no manifest listed: ffsync's
+own sidecars (`*.ffsync-tmp`, `*.ffsync-index`), files the sender's
+patterns exclude (§16.7), names the scan skips (non-UTF-8, §16.2). Before
+removing such a directory the receiver deletes **orphaned** sidecars in
+it (those whose target is gone), and the delete pass removes a deleted
+file's own sidecars with it. A directory that is still not empty is
+**kept** — it is not counted, and the session does not fail (amended
+2026-11; previously `remove_dir` failed the session after every transfer
+had committed). A real delete failure (permissions, I/O) fails the
+session and is announced to the sender with ERROR (`Aborted`) in place of
+the TREE_END reply.
+
 Delete safety is bounded by the same trust decision as every write in the
 session: the receiver already pinned the sender's fingerprint (D16).
 
@@ -675,6 +702,12 @@ peers then record the same mtime in their D15 indexes, so the next tree
 sync's triage (§16.3) skips the file — the tree fast path fires without
 reading a byte. Without this, every synced file's mtime would change at
 commit and no tree sync would ever skip.
+
+A sender mtime of `(0, 0)` is applied literally, as the Unix epoch. The
+wire fields are unsigned, so a file dated before 1970 (or one whose mtime
+cannot be read) is reported as `(0, 0)`; the receiver must set exactly
+that, or its own scan reports a different mtime and the file re-syncs on
+every run (amended 2026-11; earlier builds skipped the write for `(0, 0)`).
 
 Single-file sync adopts the same behavior under protocol v3 (observable
 change: the receiver's file now carries the sender's mtime after a sync;
@@ -950,27 +983,32 @@ identical on both peers).
   same trade rsync's default fast path makes. The metadata is best-effort
   convergence, not a change detector. (`--checksum` still forces full
   per-file conversations, which then also apply metadata.)
-- **Apply:** after a file's reconstruction succeeds and before the mtime
+- **Apply:** after a file's reconstruction succeeds and after the mtime
   preservation write (§16.6), the receiver applies the sender's mode:
-  on unix, `fchmod`-equivalent via `std::os::unix::fs::PermissionsExt`
-  (mode masked `0o7777`); on Windows, the no-write bits
-  (`0o222` for owner/group/other) map to clearing the read-only
-  attribute — write-enable always wins (an attribute cannot express
-  read-denial; documenting the lossy direction is the honest choice).
+  on unix, `chmod` via `std::os::unix::fs::PermissionsExt` (mode masked
+  `0o7777`); on Windows, a mode with **no** write bit (`mode & 0o222 ==
+  0`) sets the read-only attribute and any write bit clears it —
+  write-enable always wins (an attribute cannot express read-denial;
+  documenting the lossy direction is the honest choice). Both metadata
+  writes are best-effort: a failure is a warning, never a failed sync
+  (the content is already verified and committed).
   Directories: mode applies to created directories at creation time;
   pre-existing directories keep their mode (the receiver's directory is
   not replaced — matching the "dir with files needs no entry" rule).
-- **Order is load-bearing:** mode write → mtime write → stat → D15 index
-  write. The index must record the post-metadata mtime or every
-  metadata-synced file re-syncs (§16.6's ordering rule, extended one
-  step earlier).
+- **Order is load-bearing:** mtime write → mode write → stat → D15 index
+  write (amended 2026-11; the v4 text had mode first). The index must
+  record the sender's mtime or every metadata-synced file re-syncs
+  (§16.6's ordering rule). Neither chmod nor the Windows read-only
+  attribute changes the mtime, so mode may follow it — and must: a
+  read-only mode applied first made the mtime write fail (EACCES for a
+  non-root unix user, os error 5 on Windows).
 - **Index (D15): no change.** The index stays (chunk list, root, size,
   mtime): triage never reads mode (chmod-only changes are accepted as
   not-synced — the §16.3 invariant), the sender's manifest mode comes
   from a fresh metadata scan at session start (never from the index —
   the tree scan is metadata-only and always current), and the per-file
-  warm path serves chunks, not metadata. Applying mode before mtime
-  (above) keeps the index's recorded mtime correct without mode ever
+  warm path serves chunks, not metadata. Mode never touches the mtime,
+  so the index's recorded mtime stays correct without mode ever
   touching the index. (An earlier draft of this section bumped the index
   codec for a mode field; the implementation review dropped it — nothing
   consumes it.)

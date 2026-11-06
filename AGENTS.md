@@ -269,13 +269,13 @@ pre-existing.
   because it is stateless (`Send + Sync`). Preserve this split.
 - The mmap is created with `unsafe { Mmap::map }`; the underlying file must not
   be modified while the pipeline holds the mapping.
-- The reconstructor's temp path is derived with
-  `Path::with_extension("ffsync-tmp")`, which *replaces* the last extension
-  (`a.mkv` → `a.ffsync-tmp`). This differs from the `<.file.ext.ffsync-tmp>`
-  naming in the concept doc (recorded as D6 in `concept/Design Decisions.md`).
-  The index path does the OPPOSITE (appends `.ffsync-index`) because the
-  orphan cleanup must recover the target name by stripping the suffix; never
-  "fix" one to match the other.
+- Sidecar names APPEND their suffix: the temp is `a.mkv.ffsync-tmp`
+  (`Reconstructor::temp_path_for`, D6 amendment 2026-11) and the index is
+  `a.mkv.ffsync-index` (`index_path_for`). Never derive either with
+  `Path::with_extension` — substituting the extension mapped `a.mkv` and
+  `a.mp4` to one temp (a §16.8 parallel collision), and the orphan cleanup
+  recovers target names by stripping the index suffix. Both stay visible
+  (no leading-dot convention; the tree scan filters them by suffix).
 - Sub-second mtime is load-bearing in two places: the index validation and
   the §4 wire fast path (HELLO `file_mtime_nanos`, protocol v2). Whole-second
   comparisons let a same-second same-size rewrite pass as unchanged — a
@@ -286,8 +286,11 @@ pre-existing.
   D15 index (order: rename → set_modified → stat → write_index). Reversing
   the order leaves the index recording the wrong mtime and every subsequent
   tree sync re-checks the file.
-- Mode bits (§16.9, v4/D18) extend that ordering: rename → **apply_mode** →
-  set_modified → stat → write_index. Mode is never a triage input (a
+- Mode bits (§16.9, v4/D18) extend that ordering: rename → set_modified
+  → **apply_mode** → stat → write_index (D18 amendment, 2026-11: mode
+  first broke read-only modes — the mtime write was refused; chmod never
+  changes the mtime, so mode goes last). Both writes are best-effort
+  warnings via `apply_commit_metadata`, never a failed sync. Mode is never a triage input (a
   chmod-only change is not synced — the same trade as rsync's fast path);
   it rides conversations the size+mtime triage already starts. The
   metadata flag is sender-authoritative and mirrored by the receiver
@@ -342,9 +345,13 @@ pre-existing.
   sender's TREE_END itself (that is how it stops serving partition 0), so
   the sequential §16.5 barrier read is gated on `sender_end_consumed` —
   removing that gate deadlocks the sender on its TREE_END reply.
-- Worker connections authenticate with the SAME pin policy as the control
-  connection; the CLI's connect/accept closures handle that, and the
-  state machines stay transport-agnostic (the closures are injected).
+- Worker connections authenticate against the control connection's peer:
+  the CLI narrows the pin set to the ONE fingerprint the control
+  connection presented (`WorkerAuth`/`authenticate_worker` in main.rs),
+  so another pinned peer cannot inject conversations into a running
+  session; no first-use prompt, no per-worker "peer identity" line. The
+  connect/accept closures handle that, and the state machines stay
+  transport-agnostic (the closures are injected).
   Over QUIC (§17) the same closures open/accept extra streams on the one
   session connection — the membership protocol is unchanged.
 - QUIC teardown is NOT TCP teardown (§17.6): closing a QUIC connection

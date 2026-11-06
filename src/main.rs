@@ -37,7 +37,7 @@ Usage:
               [--plaintext] [--quic] [--trust <fp>]
   ffsync receive <file|dir> <port> [--checksum] [--from <old-file>]
               [--no-delete] [--exclude <pat>]... [--exclude-from <file>]
-              [--plaintext] [--quic] [--trust <fp>]
+              [--plaintext] [--quic] [--trust <fp>] [--bind <ip>]
   ffsync trust <fingerprint>       pin a peer fingerprint (TOFU first contact)
   ffsync untrust <fingerprint>     remove a pinned fingerprint
   ffsync fingerprints              show this peer's identity + all pins
@@ -74,6 +74,9 @@ Options:
                      sender connects over UDP. Same pinning model as TCP.
   --trust <fp>       non-interactive first contact: pin <fp> instead of
                      prompting; also overrides which pinned peer to expect
+  --bind <ip>        receive: local address to listen on (default 0.0.0.0,
+                     all IPv4 interfaces); e.g. --bind :: for IPv6, or
+                     --bind 127.0.0.1 to accept only local peers
   -h, --help         print this help
   -V, --version      print version
 
@@ -92,8 +95,8 @@ loudly and syncs nothing.
 
 Notes:
   <host:port> — for IPv6 use the bracketed form, e.g. [::1]:7788.
-  receive binds IPv4 (0.0.0.0) only; IPv6 destinations need a dual-stack
-  proxy or an IPv4 address for now.
+  receive listens on IPv4 (0.0.0.0) by default; pass --bind :: for IPv6
+  (dual-stack where the OS defaults to it, e.g. Linux).
   Port 0 on receive binds an OS-assigned port; the actual port is printed.
 ";
 
@@ -268,6 +271,19 @@ fn parse_host_port(s: &str) -> (String, u16) {
     (host.to_string(), port)
 }
 
+/// Resolves `host:port` to one socket address for the QUIC client (UDP has
+/// no `connect((host, port))` convenience). DNS names and bare IPv6
+/// literals (as `parse_host_port` returns them, brackets stripped) both
+/// work; the old `format!("{host}:{port}").parse()` accepted neither.
+fn resolve_addr(host: &str, port: u16) -> std::io::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs as _;
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| std::io::Error::other(format!("cannot resolve {host}:{port}: {e}")))?
+        .next()
+        .ok_or_else(|| std::io::Error::other(format!("cannot resolve {host}:{port}: no address")))
+}
+
 fn report_outcome(role: &str, outcome: SyncOutcome, display: &mut ProgressDisplay) {
     display.finish();
     match outcome {
@@ -377,9 +393,7 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
     let (host, port) = parse_host_port(&addr);
     let stream: Box<dyn ReadWrite> = if quic {
         println!("connecting to {host}:{port} (QUIC) ...");
-        let server_addr: std::net::SocketAddr = format!("{host}:{port}")
-            .parse()
-            .map_err(|e| std::io::Error::other(format!("cannot resolve {host}:{port}: {e}")))?;
+        let server_addr = resolve_addr(&host, port)?;
         let (identity, created) = ffsync::transport::Identity::load_or_create()?;
         if created {
             println!("identity created: {}", identity.fingerprint());
@@ -460,7 +474,7 @@ fn io_err(e: &SyncError) -> std::io::Error {
 
 fn run_receive(
     file: PathBuf,
-    port: u16,
+    bind_addr: std::net::SocketAddr,
     from: Option<PathBuf>,
     opts: CliOptions,
 ) -> std::io::Result<()> {
@@ -484,16 +498,14 @@ fn run_receive(
         // The peer label is unknown before accept; the policy is
         // label-independent (a fingerprint set).
         let policy = resolve_pin_policy(trust_flag.as_deref(), "peer")?;
-        let bind: std::net::SocketAddr =
-            format!("0.0.0.0:{port}").parse().expect("valid bind addr");
-        let endpoint = ffsync::transport::quic::listen(bind, &identity, &policy)?;
+        let endpoint = ffsync::transport::quic::listen(bind_addr, &identity, &policy)?;
         Listener::Quic(endpoint)
     } else {
-        Listener::Tcp(TcpListener::bind(("0.0.0.0", port))?)
+        Listener::Tcp(TcpListener::bind(bind_addr)?)
     };
     let bound = match &listener {
-        Listener::Tcp(l) => l.local_addr()?.port(),
-        Listener::Quic(e) => e.local_addr()?.port(),
+        Listener::Tcp(l) => l.local_addr()?,
+        Listener::Quic(e) => e.local_addr()?,
     };
     if file.is_dir() {
         if from.is_some() {
@@ -526,10 +538,10 @@ fn run_receive(
             local_source.display()
         )));
     }
-    if port == 0 {
-        println!("listening on 0.0.0.0:{bound} (OS-assigned port) ...");
+    if bind_addr.port() == 0 {
+        println!("listening on {bound} (OS-assigned port) ...");
     } else {
-        println!("listening on 0.0.0.0:{bound} ...");
+        println!("listening on {bound} ...");
     }
     let mut quic_receive_session: Option<ffsync::transport::quic::QuicSession> = None;
     let stream: Box<dyn ReadWrite> = match listener {
@@ -651,9 +663,7 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
         // from client_session; workers clone the session handle and open
         // their own stream (the QUIC equivalent of a fresh TCP connect).
         println!("connecting to {host}:{port} (QUIC) ...");
-        let server_addr: std::net::SocketAddr = format!("{host}:{port}")
-            .parse()
-            .map_err(|e| std::io::Error::other(format!("cannot resolve {host}:{port}: {e}")))?;
+        let server_addr = resolve_addr(&host, port)?;
         let (identity, created) = ffsync::transport::Identity::load_or_create()?;
         if created {
             println!("identity created: {}", identity.fingerprint());
@@ -687,17 +697,20 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
         })?;
         tcp.set_nodelay(true).ok();
         set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-        let stream = connect_authenticated(tcp, &host, true, plaintext, trust_flag.clone())?;
+        let (stream, worker_auth) =
+            connect_authenticated(tcp, &host, true, plaintext, trust_flag.as_deref())?;
 
-        // Worker connections (§16.8): same host/port, same TLS setup, one per
-        // worker index. Opened by the state machine after TREE_BEGIN.
+        // Worker connections (§16.8): same host/port, one per worker index,
+        // opened by the state machine after TREE_BEGIN. They must reach the
+        // SAME peer as the control connection (its fingerprint, not just
+        // any pinned one).
         let connect_worker = move |index: u16| -> std::io::Result<Box<dyn ReadWrite>> {
             let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
                 std::io::Error::other(format!("cannot connect worker {index}: {e}"))
             })?;
             tcp.set_nodelay(true).ok();
             set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-            connect_authenticated(tcp, &host, true, plaintext, trust_flag.clone()).map(buffered)
+            authenticate_worker(tcp, &host, true, worker_auth.as_ref()).map(buffered)
         };
         let connect_worker: Box<dyn Fn(u16) -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
             Box::new(connect_worker);
@@ -747,7 +760,7 @@ struct TreeReceiveOpts {
     no_delete: bool,
     excludes: Vec<String>,
     listener: Listener,
-    bound: u16,
+    bound: std::net::SocketAddr,
     dry_run: bool,
     eager: bool,
 }
@@ -781,16 +794,18 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
     let display = &mut TreeDisplay::new();
     let (stream, accept_worker, _peer_label, session) = match listener {
         Listener::Tcp(listener) => {
-            println!("listening on 0.0.0.0:{bound} (tree mode) ...");
+            println!("listening on {bound} (tree mode) ...");
             let (tcp, peer) = listener.accept()?;
             println!("peer connected: {peer}");
             tcp.set_nodelay(true).ok();
             set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
             let peer_label = peer.to_string();
-            let stream =
-                connect_authenticated(tcp, &peer_label, false, plaintext, trust_flag.clone())?;
+            let (stream, worker_auth) =
+                connect_authenticated(tcp, &peer_label, false, plaintext, trust_flag.as_deref())?;
             // Worker connections (§16.8): accept from the same listener (the
-            // sender connects them to the same port), same TLS setup.
+            // sender connects them to the same port). Each must present the
+            // control connection's fingerprint — another pinned peer must
+            // not be able to inject conversations into this session.
             let accept_worker: Box<dyn Fn() -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
                 Box::new(move || -> std::io::Result<Box<dyn ReadWrite>> {
                     let (tcp, wpeer) = listener
@@ -798,14 +813,8 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
                         .map_err(|e| std::io::Error::other(format!("cannot accept worker: {e}")))?;
                     tcp.set_nodelay(true).ok();
                     set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-                    connect_authenticated(
-                        tcp,
-                        &wpeer.to_string(),
-                        false,
-                        plaintext,
-                        trust_flag.clone(),
-                    )
-                    .map(buffered)
+                    authenticate_worker(tcp, &wpeer.to_string(), false, worker_auth.as_ref())
+                        .map(buffered)
                 });
             (
                 stream,
@@ -815,7 +824,7 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
             )
         }
         Listener::Quic(endpoint) => {
-            println!("listening on 0.0.0.0:{bound} (tree mode, QUIC) ...");
+            println!("listening on {bound} (tree mode, QUIC) ...");
             // Identity + policy are needed BEFORE accept (they configure the
             // endpoint's TLS); FirstUse enforcement happens after the
             // handshake, exactly like TCP.
@@ -898,25 +907,72 @@ fn buffered(stream: Box<dyn ReadWrite>) -> Box<dyn ReadWrite> {
     Box::new(ffsync::protocol::BufStream::new(stream))
 }
 
+/// What a §16.8 worker connection must match: this session's identity and
+/// a policy pinned to exactly the control connection's peer fingerprint.
+/// `None` under `--plaintext` (nothing to authenticate).
+#[derive(Clone)]
+struct WorkerAuth {
+    identity: std::sync::Arc<ffsync::transport::Identity>,
+    peer_fp: Vec<u8>,
+}
+
+/// Authenticates one worker connection against the control connection's
+/// peer (D16 + §16.8). The pin set is narrowed to that ONE fingerprint, so
+/// the TLS verifier itself rejects any other peer — even one that is in
+/// pins.conf. No first-use prompt and no "peer identity" line: the user
+/// already decided on the control connection.
+fn authenticate_worker(
+    tcp: TcpStream,
+    peer_label: &str,
+    client_role: bool,
+    auth: Option<&WorkerAuth>,
+) -> std::io::Result<Box<dyn ReadWrite>> {
+    let Some(auth) = auth else {
+        return Ok(Box::new(tcp));
+    };
+    let policy = ffsync::transport::PinPolicy::Pinned(vec![auth.peer_fp.clone()]);
+    let (tls, presented) = if client_role {
+        let (tls, presented) = ffsync::transport::client_session(
+            tcp,
+            &auth.identity,
+            &policy,
+            rustls_pki_types_server_name(peer_label)?,
+        )?;
+        (Box::new(tls) as Box<dyn ReadWrite>, presented)
+    } else {
+        let (tls, presented) = ffsync::transport::server_session(tcp, &auth.identity, &policy)?;
+        (Box::new(tls) as Box<dyn ReadWrite>, presented)
+    };
+    // Belt and braces: the verifier already enforced this.
+    if presented != auth.peer_fp {
+        return Err(std::io::Error::other(format!(
+            "worker connection from {peer_label} presented {} — not the session's peer",
+            ffsync::transport::format_fingerprint(&presented)
+        )));
+    }
+    Ok(tls)
+}
+
 /// Shared transport setup (D16): TLS by default with mutual fingerprint
-/// pinning; `--plaintext` bypasses. Used by all four runners (file/tree ×
-/// send/receive).
+/// pinning; `--plaintext` bypasses. Used by the tree runners for the
+/// control connection; returns the [`WorkerAuth`] that §16.8 worker
+/// connections must match (`None` under `--plaintext`).
 fn connect_authenticated(
     tcp: TcpStream,
     peer_label: &str,
     client_role: bool,
     plaintext: bool,
-    trust_flag: Option<String>,
-) -> std::io::Result<Box<dyn ReadWrite>> {
+    trust_flag: Option<&str>,
+) -> std::io::Result<(Box<dyn ReadWrite>, Option<WorkerAuth>)> {
     if plaintext {
-        return Ok(Box::new(tcp));
+        return Ok((Box::new(tcp), None));
     }
     let (identity, created) = ffsync::transport::Identity::load_or_create()?;
     if created {
         println!("identity created: {}", identity.fingerprint());
         println!("(share this fingerprint out-of-band so peers can pin it)");
     }
-    let policy = resolve_pin_policy(trust_flag.as_deref(), peer_label)?;
+    let policy = resolve_pin_policy(trust_flag, peer_label)?;
     let (tls, presented) = if client_role {
         let (tls, presented) = ffsync::transport::client_session(
             tcp,
@@ -934,7 +990,11 @@ fn connect_authenticated(
         "peer identity: {}",
         ffsync::transport::format_fingerprint(&presented)
     );
-    Ok(tls)
+    let auth = WorkerAuth {
+        identity: std::sync::Arc::new(identity),
+        peer_fp: presented,
+    };
+    Ok((tls, Some(auth)))
 }
 
 // The `Read + Write` object bound the sync state machines run over —
@@ -1228,6 +1288,7 @@ fn main() {
             let mut quic = false;
             let mut trust_flag = None;
             let mut from = None;
+            let mut bind_ip: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
             let mut no_delete = false;
             let mut excludes: Vec<String> = Vec::new();
             let mut parallel: u16 = 1;
@@ -1248,6 +1309,18 @@ fn main() {
                     "--from" => {
                         let v = it.next().unwrap_or_else(|| die("--from requires a path"));
                         from = Some(PathBuf::from(v));
+                    }
+                    "--bind" => {
+                        let v = it
+                            .next()
+                            .unwrap_or_else(|| die("--bind requires an IP address"));
+                        // Accept "[::1]" as well as "::1".
+                        let bare = v.trim_start_matches('[').trim_end_matches(']');
+                        bind_ip = bare.parse().unwrap_or_else(|_| {
+                            die(&format!(
+                                "invalid --bind address: {v} (an IP, e.g. :: or 0.0.0.0)"
+                            ))
+                        });
                     }
                     "--eager" => eager = true,
                     "--dry-run" => dry_run = true,
@@ -1300,7 +1373,7 @@ fn main() {
                 .unwrap_or_else(|_| die(&format!("invalid port: {}", positional[1])));
             run_receive(
                 file,
-                port,
+                std::net::SocketAddr::new(bind_ip, port),
                 from,
                 CliOptions {
                     force_checksum,
@@ -1371,5 +1444,70 @@ fn main() {
             }
         }
         other => die(&format!("unknown command: {} (try 'ffsync --help')", other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(name: &str) -> ffsync::transport::Identity {
+        let c = rcgen::generate_simple_self_signed(vec![format!("ffsync-{name}")]).unwrap();
+        ffsync::transport::Identity {
+            cert_der: c.cert.der().as_ref().to_vec(),
+            key_der: c.signing_key.serialize_der(),
+        }
+    }
+
+    /// One worker handshake: `client` connects to a receiver whose worker
+    /// auth is bound to `control_fp`. Returns whether the receiver accepted.
+    fn worker_accepted(
+        receiver: &ffsync::transport::Identity,
+        client: &ffsync::transport::Identity,
+        control_fp: Vec<u8>,
+    ) -> bool {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let auth = WorkerAuth {
+            identity: std::sync::Arc::new(receiver.clone()),
+            peer_fp: control_fp,
+        };
+        let server = std::thread::spawn(move || {
+            let (tcp, peer) = listener.accept().unwrap();
+            authenticate_worker(tcp, &peer.to_string(), false, Some(&auth)).is_ok()
+        });
+        // The client trusts the receiver (both peers are in each other's
+        // pins in this scenario); only the receiver's narrowing decides.
+        let tcp = TcpStream::connect(addr).unwrap();
+        let policy = ffsync::transport::PinPolicy::Pinned(vec![ffsync::transport::sha256(
+            &receiver.cert_der,
+        )]);
+        let name = rustls_pki_types_server_name("127.0.0.1").unwrap();
+        let _ = ffsync::transport::client_session(tcp, client, &policy, name);
+        server.join().unwrap()
+    }
+
+    #[test]
+    fn worker_connections_are_bound_to_the_control_peer() {
+        // §16.8 + D16: a worker must present the CONTROL connection's
+        // fingerprint. Before the fix, workers were checked against the
+        // whole pin set, so any other pinned peer could inject
+        // conversations into a running session.
+        let receiver = identity("receiver");
+        let control = identity("control");
+        let other_pinned = identity("other");
+        let control_fp = ffsync::transport::sha256(&control.cert_der);
+        assert!(worker_accepted(&receiver, &control, control_fp.clone()));
+        assert!(!worker_accepted(&receiver, &other_pinned, control_fp));
+    }
+
+    #[test]
+    fn resolve_addr_handles_ipv6_literals_and_names() {
+        assert!(resolve_addr("::1", 7788).unwrap().is_ipv6());
+        assert_eq!(
+            resolve_addr("127.0.0.1", 7788).unwrap(),
+            "127.0.0.1:7788".parse().unwrap()
+        );
+        assert_eq!(resolve_addr("localhost", 7788).unwrap().port(), 7788);
     }
 }

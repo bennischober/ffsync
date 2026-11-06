@@ -1426,14 +1426,23 @@ mod tests {
             (CHUNK_MIN, CHUNK_AVG, CHUNK_MAX)
         );
         // Sane-parameter gate (the receiver's hostile-peer guard).
-        assert!(sane_cdc_params((16, 64, 256)));
-        assert!(sane_cdc_params((64, 256, 1024)));
+        assert!(sane_cdc_params((64, 256, 1024)), "fastcdc's own minimums");
+        assert!(sane_cdc_params((
+            SMALL_CHUNK_MIN as u32,
+            SMALL_CHUNK_AVG as u32,
+            SMALL_CHUNK_MAX as u32
+        )));
+        assert!(!sane_cdc_params((16, 64, 256)), "below fastcdc's minimums");
         assert!(!sane_cdc_params((0, 64, 256)), "zero min is degenerate");
         assert!(!sane_cdc_params((256, 64, 256)), "min > avg is nonsense");
         assert!(!sane_cdc_params((64, 256, 32)), "avg > max is nonsense");
         assert!(
+            !sane_cdc_params((64, 64 * 1024 * 1024, 64 * 1024 * 1024)),
+            "avg past fastcdc's AVERAGE_MAX would panic its mask table in release"
+        );
+        assert!(
             !sane_cdc_params((1, 1, 128 * 1024 * 1024)),
-            "max beyond the 64 MiB cap is refused"
+            "max beyond fastcdc's 16 MiB MAXIMUM_MAX is refused"
         );
     }
 
@@ -1715,6 +1724,52 @@ mod tests {
     }
 
     #[test]
+    fn stale_temp_does_not_block_an_already_matching_target() {
+        // The receiver's old file already equals the sender's, but a temp
+        // from an earlier interrupted sync of DIFFERENT content is left
+        // over. The plan reproduces the old file, so nothing is written —
+        // and the old code then judged the session by the TEMP's root:
+        // HashMismatch, temp kept, every retry failing the same way.
+        use ffsync::protocol::sync::SyncOutcome;
+        let fx = Fixture::new("staletemp");
+        let src_data: Vec<u8> = (0..2 * 1024 * 1024u32)
+            .map(|i| (i as u8).wrapping_mul(13).wrapping_add((i / 4096) as u8))
+            .collect();
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &src_data);
+        let temp_path = ffsync::reconstruction::Reconstructor::temp_path_for(&target);
+        create_file(&temp_path, &vec![0xA5u8; 1024 * 1024]);
+
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: true,
+                tree: false,
+                dry_run: false,
+                eager: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: true,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager: false,
+                extra_sources: Vec::new(),
+            },
+        );
+        s.expect("sender ok");
+        let r = r.expect("receiver ok (was HashMismatch on the stale temp)");
+        assert!(matches!(r, SyncOutcome::InSync), "{r:?}");
+        assert_eq!(read_file(&target), src_data);
+        assert!(!temp_path.exists(), "the stale temp is dropped");
+    }
+
+    #[test]
     fn dry_run_reports_would_change_without_writing() {
         let fx = Fixture::new("dry_run_change");
         // Different SIZES from the receiver's old file: the size+mtime fast
@@ -1762,7 +1817,7 @@ mod tests {
         );
         // Nothing was written: content identical, no temp file, mtime intact.
         assert_eq!(std::fs::read(&target).unwrap(), old_data);
-        assert!(!target.with_extension("ffsync-tmp").exists());
+        assert!(!ffsync::reconstruction::Reconstructor::temp_path_for(&target).exists());
         assert_eq!(
             std::fs::metadata(&target).unwrap().modified().unwrap(),
             before,
