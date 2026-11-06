@@ -712,7 +712,7 @@ where
     stream.flush()?;
 
     // ---- Data transfer (§7) ----
-    // Chunks are hashed from the mmap'd pipeline, but for v0.1 we re-read the
+    // Chunks are hashed from the mmap'd pipeline, but for now we re-read the
     // chunk bytes from the file. zstd-compress each chunk payload.
     // §7.1: in dry-run mode the receiver has already answered (NOT_MODIFIED
     // + DRY_RUN_ACK) — skip DATA and VERIFY entirely; read the report.
@@ -903,31 +903,6 @@ where
     let temp_path = Reconstructor::temp_path_for(&request.path);
     let resuming = temp_path.exists();
 
-    // Orphan-index cleanup (D15): an index whose target file no longer
-    // exists is a leftover from a deleted file. Best-effort, only our own
-    // naming convention (`<target>.ffsync-index`, where <target> may itself
-    // contain dots — strip the literal suffix, not the last extension).
-    if let Some(parent) = request.path.parent()
-        && let Ok(entries) = std::fs::read_dir(parent)
-    {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(base) = name.strip_suffix(".ffsync-index") else {
-                continue;
-            };
-            if base.is_empty() {
-                continue;
-            }
-            let target = parent.join(base);
-            if !target.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
-
     // ---- Metadata for HELLO (scanning happens after the handshake, D19:
     // the manifest scan uses the sender's CDC parameters, which we learn
     // from its HELLO). ----
@@ -1000,6 +975,16 @@ where
     if peer.flags & message::FLAG_DRY_RUN != 0 {
         message::encode_empty(framing::T_DRY_RUN_ACK)?.encode(stream)?;
         stream.flush()?;
+    }
+    // Orphan-index cleanup (D15), single-file mode only: after the
+    // handshake so a dry-run (§7.1, zero mutation) removes nothing. Tree
+    // sessions run it once per directory at session end instead
+    // (`tree_receive`) — per conversation it was O(files²) per directory.
+    if !request.tree
+        && peer.flags & message::FLAG_DRY_RUN == 0
+        && let Some(parent) = request.path.parent()
+    {
+        crate::index::remove_orphan_indexes(parent);
     }
     // Tree mode (§16.6): the sender's HELLO mtime is what the receiver must
     // carry after commit — fill the per-conversation apply_mtime here.
@@ -1179,6 +1164,14 @@ where
     let eager_active = request.eager && peer.flags & message::FLAG_EAGER != 0;
     let mut eager_buf: HashMap<Hash, Vec<u8>> = HashMap::new();
     let mut eager_bytes: usize = 0;
+    // Did the streamed manifest carry anything besides our own old file's
+    // chunk list (resume temp chunks, D22 census chunks)? The sender's
+    // InSync label compares the plan against the STREAMED positional list;
+    // the no-rewrite shortcut below compares against `local_chunks`. Both
+    // agree only when the two lists are the same list — otherwise the
+    // shortcut is off and the plan executes (a no-op rewrite at worst),
+    // so both peers report Transferred instead of disagreeing.
+    let mut extra_entries_streamed = !temp_chunks.is_empty();
     for chunk in &temp_chunks {
         let frame = message::ManifestChunk {
             hash: chunk.hash,
@@ -1229,6 +1222,7 @@ where
             if offered.contains(&chunk.hash) {
                 continue;
             }
+            extra_entries_streamed = true;
             let frame = message::ManifestChunk {
                 hash: chunk.hash,
                 offset: chunk.offset,
@@ -1270,17 +1264,13 @@ where
             framing::T_DATA if eager_active => {
                 // The frame is already read; parse (hash, payload) directly
                 // (read_data would try to read ANOTHER frame).
-                if frame.payload.len() < 32 {
+                let Ok((hash, compressed)) = message::split_data_payload(frame.payload) else {
                     return Err(send_error_and_finish(
                         stream,
                         ErrorCode::BadFrame,
                         "eager DATA frame too short",
                     ));
-                }
-                let mut h = [0u8; 32];
-                h.copy_from_slice(&frame.payload[..32]);
-                let hash = Hash::from_bytes(h);
-                let compressed = frame.payload[32..].to_vec();
+                };
                 let len = compressed.len();
                 if eager_bytes + len > EAGER_BUF_CAP {
                     return Err(send_error_and_finish(
@@ -1354,7 +1344,8 @@ where
     // already detected at the marker: they stream a manifest where a §7.1
     // peer sends DRY_RUN_ACK, so nothing reaches this branch unless both
     // peers implement the mode.
-    let plan_reproduces_local_layout = !plan.is_empty()
+    let plan_reproduces_local_layout = !extra_entries_streamed
+        && !plan.is_empty()
         && plan.iter().all(|e| matches!(e, PlanEntry::Local { .. }))
         && plan.len() == local_chunks.len()
         && plan.iter().zip(local_chunks.iter()).all(|(e, c)| match e {
@@ -1411,20 +1402,7 @@ where
     // parameters on both sides produce the same root — so writing would be a
     // no-op rewrite: report InSync without touching the file (the
     // --checksum identical-files case). VERIFY still guards every path.
-    let plan_reproduces_local_layout = !plan.is_empty()
-        && plan.iter().all(|e| matches!(e, PlanEntry::Local { .. }))
-        && plan.len() == local_chunks.len()
-        && plan.iter().zip(local_chunks.iter()).all(|(e, c)| match e {
-            // Hash included: equal spans alone also match two swapped
-            // equal-length chunks, whose bytes do need rewriting.
-            PlanEntry::Local {
-                target_offset,
-                length,
-                hash,
-                ..
-            } => *target_offset == c.offset && *length as usize == c.length && *hash == c.hash,
-            _ => false,
-        });
+    // (`plan_reproduces_local_layout` is computed above, before dry-run.)
     if !plan.is_empty() && !plan_reproduces_local_layout {
         let reconstructor = if resuming {
             // D10: never truncate — the temp content IS the resume state.
@@ -1433,7 +1411,15 @@ where
             Reconstructor::new(&request.path, &request.local_source, target_size)?
         };
 
-        // ---- Execute plan entries in order ----
+        // ---- Execute plan entries: all Locals, then all Remotes (D10) ----
+        // Locals-first is what makes resume worth anything: a disconnect
+        // mid-DATA then leaves a temp that is mostly real bytes (the local
+        // copies, ~all of a typical delta's file) instead of zero-filled
+        // holes every chunk straddles. Wire-neutral: the sender streams DATA
+        // in the plan's Remote order, which the second pass preserves
+        // (Locals read no frames), and an eager buffer is keyed by hash.
+        // Also no Remote write can clobber a resume-temp region a later
+        // Local still reads (Locals read the temp, Remotes only write it).
         // Locals are resolved per-hash from the union manifest (temp first,
         // then old file) and verified against the plan's expected hash (D12:
         // a stale manifest entry can cost an ERROR, never silent corruption;
@@ -1449,7 +1435,11 @@ where
         // conversation reads the old-name file's bytes through here).
         let mut temp_read: Option<File> = None;
         let mut foreign_reads: HashMap<PathBuf, File> = HashMap::new();
-        for entry in &plan {
+        let locals = plan.iter().filter(|e| matches!(e, PlanEntry::Local { .. }));
+        let remotes = plan
+            .iter()
+            .filter(|e| matches!(e, PlanEntry::Remote { .. }));
+        for entry in locals.chain(remotes) {
             match *entry {
                 PlanEntry::Local {
                     target_offset,
@@ -1488,7 +1478,7 @@ where
                                 temp_read.as_mut().expect("temp read handle just opened");
                             scratch.clear();
                             scratch.resize(length as usize, 0);
-                            source_file.read_at(&mut scratch[..length as usize], offset)?;
+                            source_file.read_full_at(&mut scratch[..length as usize], offset)?;
                         }
                         LocalOrigin::Foreign { file, .. } => {
                             let source_file = match foreign_reads.get_mut(file) {
@@ -1501,7 +1491,7 @@ where
                             };
                             scratch.clear();
                             scratch.resize(length as usize, 0);
-                            source_file.read_at(&mut scratch[..length as usize], offset)?;
+                            source_file.read_full_at(&mut scratch[..length as usize], offset)?;
                         }
                     };
                     // Verify the read content (D12 exact-match guarantee).
@@ -1605,6 +1595,10 @@ where
                 }
             }
         }
+        // D10: a resumed temp may be longer than this attempt's target
+        // (the sender's file shrank); trim only now — plan Locals above
+        // may have read that tail.
+        reconstructor.set_final_len(target_size)?;
 
         // ---- VERIFY (§8) ----
         progress(Progress::Verifying);
@@ -2011,16 +2005,11 @@ fn scan_with_progress(
     )?;
     let mut hashed: u64 = 0;
     let mut chunks = Vec::new();
-    loop {
-        match rx.recv() {
-            Ok(ChunkEvent::Chunk(chunk)) => {
-                hashed += chunk.length as u64;
-                chunks.push(chunk);
-                on_progress(hashed);
-            }
-            Ok(ChunkEvent::Done) => {}
-            Err(_) => break,
-        }
+    // Disconnect (all hash workers finished) ends the scan.
+    while let Ok(ChunkEvent::Chunk(chunk)) = rx.recv() {
+        hashed += chunk.length as u64;
+        chunks.push(chunk);
+        on_progress(hashed);
     }
     // CRITICAL: hash workers complete chunks concurrently, so arrival order
     // is nondeterministic (worker-completion order, not file order). The

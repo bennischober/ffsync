@@ -54,7 +54,11 @@ impl Reconstructor {
     /// Opens an existing temp file for resume (D10): no truncation, no
     /// creation. The caller must have verified the temp file exists; its
     /// content is the resume state. Size is ensured (extends with zeros if
-    /// a crash happened mid-pre-allocation; a no-op otherwise).
+    /// a crash happened mid-pre-allocation; a no-op otherwise). A temp
+    /// LONGER than `final_size` (the sender's file shrank between attempts)
+    /// is deliberately not trimmed here — plan Locals may still read its
+    /// tail; the caller trims with [`set_final_len`](Self::set_final_len)
+    /// after the last plan write, before the VERIFY re-scan.
     pub fn open_existing(
         target_path: &Path,
         local_source_path: &Path,
@@ -70,6 +74,17 @@ impl Reconstructor {
             local_source_path: local_source_path.to_path_buf(),
             source_file: std::cell::RefCell::new(None),
         })
+    }
+
+    /// Trims (or extends) the temp file to exactly `len` bytes. Called
+    /// after every plan write and before verification: a resumed temp
+    /// that is longer than the new target would otherwise keep a stale
+    /// tail, fail the VERIFY re-scan, and waste the whole attempt.
+    pub fn set_final_len(&self, len: u64) -> io::Result<()> {
+        if self.temp_file.metadata()?.len() != len {
+            self.temp_file.set_len(len)?;
+        }
+        Ok(())
     }
 
     /// The temp file path for a given target path (single source of truth
@@ -99,8 +114,7 @@ impl Reconstructor {
     /// either decompressed network data or verified local bytes in a
     /// buffer, and only needs them placed at `task.target_offset`.
     pub fn write_chunk(&self, task: &ReconstructionTask, data: &[u8]) -> io::Result<()> {
-        self.temp_file.write_at(data, task.target_offset)?;
-        Ok(())
+        self.temp_file.write_all_at(data, task.target_offset)
     }
 
     /// Process a single chunk by copying it from the local source file.
@@ -128,10 +142,9 @@ impl Reconstructor {
         {
             let mut guard = self.source_file.borrow_mut();
             let source_file = guard.as_mut().expect("source handle was just cached above");
-            source_file.read_at(slice, task.source.offset)?;
+            source_file.read_exact_at(slice, task.source.offset)?;
         }
-        self.temp_file.write_at(slice, task.target_offset)?;
-        Ok(())
+        self.temp_file.write_all_at(slice, task.target_offset)
     }
 
     /// Legacy finalize using the standard BLAKE3 file hash.

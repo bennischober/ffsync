@@ -65,7 +65,13 @@ pub struct FileIndex {
 /// Reads a file's mtime as (unix secs, subsec nanos), or `None` if
 /// unavailable.
 pub fn stat_mtime(path: &Path) -> Option<(u64, u32)> {
-    let meta = std::fs::metadata(path).ok()?;
+    mtime_of(&std::fs::metadata(path).ok()?)
+}
+
+/// [`stat_mtime`] on metadata the caller already holds (one `stat` per
+/// check instead of two — and both fields then come from the same
+/// snapshot of the file).
+fn mtime_of(meta: &std::fs::Metadata) -> Option<(u64, u32)> {
     let d = meta
         .modified()
         .ok()?
@@ -149,6 +155,22 @@ impl FileIndex {
         if pos != bytes.len() {
             return None; // trailing garbage
         }
+        // Structural check: the chunks must partition [0, file_size) in
+        // order, with no empty chunk. The root check below cannot catch a
+        // well-formed but structurally bogus list (its root is computed
+        // over whatever entries are there); a list with gaps, overlaps or
+        // a wrong total would hand warm starts offsets that do not describe
+        // the file.
+        let mut expect = 0u64;
+        for c in &chunks {
+            if c.offset != expect || c.length == 0 {
+                return None;
+            }
+            expect = expect.checked_add(c.length as u64)?;
+        }
+        if expect != file_size {
+            return None;
+        }
         // Self-integrity check (D15): the stored root must equal the root
         // derived from the decoded chunk list. This catches corruption in
         // the root *or* any chunk entry at load time — O(chunk count) of
@@ -180,10 +202,7 @@ impl FileIndex {
             return None;
         }
         let meta = std::fs::metadata(path).ok()?;
-        if meta.len() != self.file_size {
-            return None;
-        }
-        if stat_mtime(path)? != self.file_mtime {
+        if meta.len() != self.file_size || mtime_of(&meta)? != self.file_mtime {
             return None;
         }
         Some(())
@@ -235,11 +254,7 @@ pub fn write_index(path: &Path, index: &FileIndex) -> io::Result<()> {
 /// Best-effort removal of a corrupt index is NOT done here — the next
 /// successful commit overwrites it anyway.
 pub fn load_index_with_cdc(path: &Path, cdc: (u32, u32, u32)) -> Option<FileIndex> {
-    let idx_path = index_path_for(path);
-    let mut f = File::open(&idx_path).ok()?;
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes).ok()?;
-    let index = FileIndex::decode(&bytes)?;
+    let index = load_index(path)?;
     index.validate(path, cdc)?;
     Some(index)
 }
@@ -259,6 +274,31 @@ pub fn load_index(path: &Path) -> Option<FileIndex> {
 /// the target state, and by orphan cleanup).
 pub fn remove_index(path: &Path) {
     let _ = std::fs::remove_file(index_path_for(path));
+}
+
+/// Orphan-index cleanup (D15): removes every `<target>.ffsync-index` in
+/// `dir` whose target no longer exists — a leftover from a file deleted
+/// outside ffsync. Best-effort, only our own naming convention (`<target>`
+/// may itself contain dots — strip the literal suffix, not the last
+/// extension). One `read_dir` per call: callers run it once per directory
+/// per session (a tree session batches its directories; calling it per
+/// file made trees with many files per directory quadratic).
+pub fn remove_orphan_indexes(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(base) = name.to_str().and_then(|n| n.strip_suffix(".ffsync-index")) else {
+            continue;
+        };
+        if base.is_empty() {
+            continue;
+        }
+        if !dir.join(base).exists() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -364,5 +404,34 @@ mod tests {
         assert!(load_index(&path).is_none(), "corrupt index refuses");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn index_decode_refuses_non_partitioning_chunk_lists() {
+        let cdc = (64, 256, 1024);
+        // Each list carries a self-consistent root (from_scan derives it),
+        // so only the structural check can refuse these.
+        let ok = sample_chunks(3);
+        assert!(
+            FileIndex::decode(&FileIndex::from_scan(ok.clone(), 768, (1, 0), cdc).encode())
+                .is_some()
+        );
+
+        let mut gap = ok.clone();
+        gap[1].offset += 1;
+        let mut zero = ok.clone();
+        zero[2].length = 0;
+        for (label, chunks, size) in [
+            ("gap", gap, 768),
+            ("empty chunk", zero, 512),
+            ("wrong total", ok.clone(), 1024),
+            ("not starting at 0", ok[1..].to_vec(), 512),
+        ] {
+            let bytes = FileIndex::from_scan(chunks, size, (1, 0), cdc).encode();
+            assert!(
+                FileIndex::decode(&bytes).is_none(),
+                "{label} must be refused"
+            );
+        }
     }
 }

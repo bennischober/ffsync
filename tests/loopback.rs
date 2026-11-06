@@ -344,12 +344,18 @@ mod tests {
         filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(t_tgt)).unwrap();
         // Re-stamp the bogus index with the backdated source mtime so its
         // validation still passes — the poison scenario must survive.
+        // Structurally valid (64 KiB chunks partitioning the file — the
+        // decoder refuses lists that do not, and the receiver refuses plan
+        // chunks above the session's CDC max), wrong hashes: only VERIFY
+        // can catch this one.
         let stale = ffsync::index::FileIndex::from_scan(
-            vec![ffsync::chunking::Chunk {
-                offset: 0,
-                length: 512,
-                hash: blake3::hash(b"bogus"),
-            }],
+            (0..src_data.len() / 65536)
+                .map(|i| ffsync::chunking::Chunk {
+                    offset: (i * 65536) as u64,
+                    length: 65536,
+                    hash: blake3::hash(format!("bogus{i}").as_bytes()),
+                })
+                .collect(),
             src_data.len() as u64,
             ffsync::index::stat_mtime(fx.source()).unwrap(),
             {
@@ -388,7 +394,7 @@ mod tests {
         );
         assert!(
             matches!(&s1, Err(SyncError::Peer(code, _)) if *code == ErrorCode::HashMismatch),
-            "attempt 1 must fail loudly at VERIFY: {s1:?}"
+            "attempt 1 must fail loudly at VERIFY: {s1:?} / {r1:?}"
         );
         assert!(r1.is_err(), "attempt 1 receiver must also fail");
         assert!(
@@ -1762,9 +1768,22 @@ mod tests {
                 extra_sources: Vec::new(),
             },
         );
-        s.expect("sender ok");
+        let s = s.expect("sender ok");
         let r = r.expect("receiver ok (was HashMismatch on the stale temp)");
-        assert!(matches!(r, SyncOutcome::InSync), "{r:?}");
+        // The temp's chunks ride the manifest (D10), so the sender cannot
+        // see the plan as a no-op: both peers report a zero-byte transfer
+        // (they must agree — never InSync on one side only).
+        assert!(
+            matches!(
+                (&s, &r),
+                (SyncOutcome::InSync, SyncOutcome::InSync)
+                    | (
+                        SyncOutcome::Transferred { bytes: 0, .. },
+                        SyncOutcome::Transferred { bytes: 0, .. }
+                    )
+            ),
+            "{s:?} / {r:?}"
+        );
         assert_eq!(read_file(&target), src_data);
         assert!(!temp_path.exists(), "the stale temp is dropped");
     }

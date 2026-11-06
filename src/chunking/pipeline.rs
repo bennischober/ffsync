@@ -54,15 +54,10 @@ pub fn scan_file_ordered(
     )?;
     let mut hashed: u64 = 0;
     let mut chunks = Vec::new();
-    loop {
-        match rx.recv() {
-            Ok(ChunkEvent::Chunk(chunk)) => {
-                hashed += chunk.length as u64;
-                chunks.push(chunk);
-            }
-            Ok(ChunkEvent::Done) => {}
-            Err(_) => break,
-        }
+    // Disconnect (all hash workers finished) ends the scan.
+    while let Ok(ChunkEvent::Chunk(chunk)) = rx.recv() {
+        hashed += chunk.length as u64;
+        chunks.push(chunk);
     }
     chunks.sort_by_key(|c| c.offset);
     Ok((hashed, chunks))
@@ -154,10 +149,9 @@ where
     }
 
     drop(chunk_rx);
-
-    thread::spawn(move || {
-        drop(result_tx);
-    });
+    // Only the workers' clones remain: the receiver disconnects exactly
+    // when the last worker finishes (no helper thread needed).
+    drop(result_tx);
 
     Ok(result_rx)
 }

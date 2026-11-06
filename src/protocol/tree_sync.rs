@@ -22,8 +22,8 @@
 //! ```
 //!
 //! A parallel session (§16.8, `--parallel K`) runs the same envelope on
-//! connection 0 (control) and distributes conversations round-robin over
-//! K−1 worker connections; each worker announces itself with TREE_WORKER
+//! connection 0 (control) and K−1 worker connections, all pulling
+//! conversations from one shared queue (work-stealing, §16.8); each worker announces itself with TREE_WORKER
 //! and names each conversation with TREE_FILE (membership, not order).
 //!
 //! Determinism contract (§16.4): both peers compute the same action list
@@ -596,13 +596,29 @@ where
                 "parallel={k} outside 2..={MAX_PARALLEL} (§16.8)"
             )));
         }
-        // Round-robin partition (deterministic, §16.8): conversation i →
-        // connection i mod K. Connection 0 (the control stream) carries
-        // partition 0 inline; partitions 1..K run on worker connections.
-        let mut partitions: Vec<Vec<String>> = vec![Vec::new(); k as usize];
-        for (i, rel) in actions.iter().enumerate() {
-            partitions[i % k as usize].push(rel.clone());
-        }
+        // Shared work queue (§16.8): every connection — control included —
+        // pulls the next conversation from one cursor over the sorted
+        // action list. The receiver validates membership, not assignment,
+        // so any distribution is wire-legal; a queue keeps all K
+        // connections busy until the list is drained (a static
+        // round-robin split idles K−1 connections behind one large file).
+        // `stop` is raised by the first failing connection: the others
+        // finish their current conversation and pull nothing new (§16.8:
+        // stop before the NEXT conversation).
+        let queue: std::sync::Arc<Vec<String>> = std::sync::Arc::new(actions.clone());
+        let cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_job = |cursor: &std::sync::atomic::AtomicUsize,
+                        stop: &std::sync::atomic::AtomicBool,
+                        len: usize|
+         -> Option<usize> {
+            use std::sync::atomic::Ordering;
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let i = cursor.fetch_add(1, Ordering::Relaxed);
+            (i < len).then_some(i)
+        };
         // Shared progress funnel: worker threads cannot call the non-Send
         // progress closure; they send events the control thread forwards
         // live — between and during its own conversations, and while it
@@ -610,16 +626,18 @@ where
         // counts, not partition-local indices.
         let (progress_tx, progress_rx) = std::sync::mpsc::channel::<SenderEvent>();
         let mut counts = SessionCounts::default();
-        // Every worker index 1..K announces itself — even with an empty
-        // partition — because the receiver expects exactly that set
-        // (§16.8); it connects, announces, and immediately closes when it
-        // has nothing to do.
+        // Every worker index 1..K announces itself — even when the queue
+        // is already drained — because the receiver expects exactly that
+        // set (§16.8); it connects, announces, and immediately closes when
+        // it has nothing to do.
         let mut handles = Vec::new();
         let mut worker_errors: Vec<Option<SyncError>> = (0..k as usize).map(|_| None).collect();
         for w in 1..k {
             let connect = std::sync::Arc::clone(&request.connect_worker);
             let root = request.root.clone();
-            let part = partitions[w as usize].clone();
+            let queue = std::sync::Arc::clone(&queue);
+            let cursor = std::sync::Arc::clone(&cursor);
+            let stop = std::sync::Arc::clone(&stop);
             let pipeline = pipeline_clone(pipeline);
             let tx = progress_tx.clone();
             let connect_index = w;
@@ -628,7 +646,10 @@ where
                 // an error (§16.8: stop before the NEXT conversation).
                 let mut worker_stream: Box<dyn ReadWrite> = match connect(connect_index) {
                     Ok(s) => s,
-                    Err(e) => return (Vec::new(), Some(SyncError::Io(e))),
+                    Err(e) => {
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return (Vec::new(), Some(SyncError::Io(e)));
+                    }
                 };
                 if let Err(e) = (|| -> Result<(), SyncError> {
                     message::TreeWorker {
@@ -646,10 +667,12 @@ where
                     }
                     Ok(())
                 })() {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     return (Vec::new(), Some(e));
                 }
                 let mut outcomes = Vec::new();
-                for rel in &part {
+                while let Some(i) = next_job(&cursor, &stop, queue.len()) {
+                    let rel = &queue[i];
                     let _ = tx.send(SenderEvent::Start);
                     let _ = message::TreeFile {
                         rel_path: rel.clone(),
@@ -674,6 +697,7 @@ where
                             let _ = tx.send(SenderEvent::Done);
                         }
                         Err(e) => {
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = send_error_and_finish(
                                 &mut worker_stream,
                                 ErrorCode::Aborted,
@@ -687,11 +711,13 @@ where
             }));
         }
 
-        // Control connection: partition 0 inline. In parallel mode every
-        // conversation is announced with TREE_FILE — on ALL connections,
-        // control included (the receiver validates membership uniformly).
+        // Control connection: pulls from the same queue inline. In parallel
+        // mode every conversation is announced with TREE_FILE — on ALL
+        // connections, control included (the receiver validates membership
+        // uniformly).
         let mut control_error: Option<SyncError> = None;
-        for rel in partitions[0].iter() {
+        while let Some(idx) = next_job(&cursor, &stop, queue.len()) {
+            let rel = &queue[idx];
             counts.forward_pending(&progress_rx, total, progress);
             progress(TreeProgress::FileStart(counts.start(), total));
             let _ = message::TreeFile {
@@ -717,6 +743,7 @@ where
             ) {
                 Ok(o) => o,
                 Err(e) => {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
                     control_error = Some(e);
                     break;
@@ -743,7 +770,7 @@ where
             let (outcomes, err) = handle
                 .join()
                 .map_err(|_| SyncError::Protocol("worker thread panicked".to_string()))?;
-            let w = w + 1; // partitions skip index 0
+            let w = w + 1; // worker indices start at 1 (0 is control)
             for o in outcomes {
                 match o {
                     SyncOutcome::InSync => in_sync += 1,
@@ -809,6 +836,8 @@ where
     // No deadlock: the sender writes its TREE_BEGIN before blocking on ours.
     progress(TreeProgress::Scanning);
     let (peer_begin, peer_manifest) = read_tree_begin(stream)?;
+    // Shared with worker threads (§16.8) without a deep copy.
+    let peer_manifest = std::sync::Arc::new(peer_manifest);
     let sender_excludes = tree::ExcludeSet::from_patterns(&peer_begin.excludes)
         .map_err(|e| SyncError::Protocol(format!("peer sent bad exclude pattern: {e}")))?;
     let manifest =
@@ -1166,7 +1195,7 @@ where
                     by_size.entry(e.size).or_default().push(e.rel_path.clone());
                 }
             }
-            by_size
+            std::sync::Arc::new(by_size)
         };
         if k <= 1 {
             let ctx = ConvCtx {
@@ -1267,11 +1296,11 @@ where
                 root: PathBuf,
                 checksum: bool,
                 eager: bool,
-                /// D22: census candidates by size.
-                census: CensusIndex,
+                /// D22: census candidates by size (shared, not copied).
+                census: std::sync::Arc<CensusIndex>,
                 /// The sender's manifest (mode/size lookups inside worker
-                /// closures — the outer binding is dropped before threads run).
-                peer_manifest: crate::tree::TreeManifest,
+                /// closures), shared, not copied.
+                peer_manifest: std::sync::Arc<crate::tree::TreeManifest>,
                 pipeline: crate::chunking::PipelineConfig,
             }
             impl Shared {
@@ -1291,8 +1320,8 @@ where
                 root: request.root.clone(),
                 checksum,
                 eager,
-                census,
-                peer_manifest: peer_manifest.clone(),
+                census: std::sync::Arc::clone(&census),
+                peer_manifest: std::sync::Arc::clone(&peer_manifest),
                 pipeline: pipeline_clone(pipeline),
             });
             let serve_connection = {
@@ -1304,8 +1333,8 @@ where
                         }
                         let frame = match framing::read_frame(&mut *s) {
                             Ok(f) => f,
-                            // The sender closed this connection: its partition is
-                            // over (success or failure decided via first_error and
+                            // The sender closed this connection: it has no more
+                            // conversations for it (success or failure decided via first_error and
                             // the remaining set after the joins).
                             Err(framing::FrameError::Eof) => return,
                             Err(e) => {
@@ -1397,7 +1426,7 @@ where
 
             // Control connection: the same service loop inline. The loop ends
             // when the sender's TREE_END arrives here — which the sender sends
-            // only after ALL its conversations (partitions + joined workers)
+            // only after ALL its conversations (its own + joined workers)
             // succeeded, so reaching TREE_END means every conversation it knows
             // of finished; the membership set must be empty then.
             let mut idx = 0usize;
@@ -1617,6 +1646,22 @@ where
                     other
                 )));
             }
+        }
+    }
+
+    // Orphan-index cleanup (D15), batched: once per directory that had a
+    // conversation (single-file `receive` does it per call; per
+    // conversation that was a read_dir per file → O(files²) per
+    // directory). Deleted files' indexes are removed by the pass below.
+    if !dry_run {
+        let mut dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        for rel in &conversation_paths {
+            if let Some(parent) = abs_path(&request.root, rel).parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+        for dir in &dirs {
+            crate::index::remove_orphan_indexes(dir);
         }
     }
 
