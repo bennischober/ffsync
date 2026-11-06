@@ -5,9 +5,15 @@ Splitting and hashing file content: mmap-backed parallel pipeline producing
 delta unit — this module is wire-protocol-relevant (D2, D19).
 
 ## STRUCTURE
-- `pipeline.rs` — `process_file()` (71): memory-maps the file, one chunker
-  thread per core striding 256 MiB regions, hash workers slicing the mmap,
-  bounded crossbeam channels, returns `Receiver<ChunkEvent>`.
+- `pipeline.rs` — `process_file()`: memory-maps the file, chunker threads
+  striding `REGION_SIZE` (256 MiB) regions, hash workers slicing the mmap,
+  bounded crossbeam channels, returns `Receiver<ChunkEvent>`. Thread
+  counts are size-aware (`thread_counts`: one chunker per region, one
+  hash worker per 4 MiB, both capped at `PipelineConfig::hash_workers`),
+  so small files under `--parallel K` don't spawn 2×cores threads each.
+  `REGION_SIZE` is a protocol constant (Protocol.md §4 "Region seams"):
+  it forces a boundary at every multiple and changing it changes the
+  chunk layout. Thread counts never do.
   `scan_file_ordered()` (43) wraps it with offset-sorted output.
 - `chunker.rs` — `Chunker` trait (46); `FixedChunker` (57, baseline) and
   `FastCDCChunker` (82, `fastcdc::v2020`). `cdc_params_for_size()` (28) and
@@ -22,7 +28,7 @@ delta unit — this module is wire-protocol-relevant (D2, D19).
 | Task | Location | Notes |
 |------|----------|-------|
 | New chunking strategy | implement `Chunker` in `chunker.rs` | re-export via `mod.rs` |
-| Pipeline concurrency | `PipelineConfig` (`pipeline.rs:13`) | |
+| Pipeline concurrency | `PipelineConfig` / `thread_counts` (`pipeline.rs`) | `read_buffer_size` is deprecated and ignored (wire-relevant, now `REGION_SIZE`) |
 | CDC policy | `cdc_params_for_size` / `sane_cdc_params` | see ANTI-PATTERNS |
 | Chunk integrity | `chunk_root` (`types.rs`) | shared with the D15 index |
 
@@ -37,8 +43,11 @@ delta unit — this module is wire-protocol-relevant (D2, D19).
 
 ## ANTI-PATTERNS (THIS PROJECT)
 - Modifying the file while the pipeline holds the mapping. The mmap is
-  `unsafe { Mmap::map }` at `pipeline.rs:82` — the crate's only unsafe block
-  (known drift: no `SAFETY:` comment at the site yet).
+  `unsafe { Mmap::map }` in `process_file` — the crate's only unsafe block
+  (its `SAFETY:` comment records the invariant).
+- Changing `REGION_SIZE`: it is part of the chunk-layout definition (a
+  forced boundary every 256 MiB), so every peer and every existing D15
+  index would disagree past the first seam.
 - Hardcoding CDC parameters: they come from `cdc_params_for_size` only (the
   sender-size policy and its HELLO wire contract are the root AGENTS.md's
   CDC gotcha). Files >= 16 MiB must chunk byte-identically to the pre-D19

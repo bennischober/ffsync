@@ -153,9 +153,20 @@ peer's final frame stays readable; later writes report the failure.
    receiver may keep scanning with its own parameters for its manifest
    when its file differs wildly in size; VERIFY correctness is unaffected
    as long as the *re-scan* uses the sender's parameters.
+   **Region seams (protocol constant, not negotiated):** the chunk layout
+   is FastCDC run independently over consecutive 256 MiB regions
+   (`chunking::REGION_SIZE`), so a boundary is forced at every multiple
+   of 256 MiB and each region's chunker starts fresh. The region size is
+   part of the layout definition just like the CDC parameters: a peer
+   using a different region size produces different chunks past the
+   first seam, and the §8.2 root could never agree. It is fixed for all
+   v4 peers; how many threads scan the regions is a local choice and
+   never changes the layout.
 4. Fast path: if `flags.trust_times` is set (default on, D14) **and**
    `file_size`, `file_mtime` **and `file_mtime_nanos`** are equal on both
-   sides, the sender sends NOT_MODIFIED and closes. Both peers are done
+   sides (the receiver's fields describe its **target**, also when a
+   `--from` old file serves the chunks: describing the old file let a
+   from-file equal to the sender's leave the target unwritten), the sender sends NOT_MODIFIED and closes. Both peers are done
    without reading a single file byte. This is rsync's default semantics; it
    trusts mtime+size and can be wrong in the same ways rsync can (2-second
    FAT mtime granularity, network filesystem clocks, mtime-preserving edits).
@@ -323,10 +334,19 @@ layout (same count, same offsets, same lengths — identical files under
 `--checksum`, including periodic content whose repeated hashes collapse in
 the diff map; the sender mirrors the check against the raw manifest chunk
 list). VERIFY guards every path regardless.
+The skip applies only when the manifest describes nothing but the target
+itself. A resuming receiver (resume-temp chunks, §10), one that streamed
+D22 census chunks, and one whose old file is a `--from` source other than
+the target always execute: they commit the temp. The sender cannot always see
+those cases in the chunk list, so it labels the plan InSync only when the
+receiver's HELLO also says the target is exactly that file: `resuming`
+(flag bit 2) clear and the HELLO `file_size` equal to its own. Without
+that, a complete resume temp made the sender report InSync while the
+receiver committed.
 
 ## 9. Diff strategy (D8) — lazy default, eager opt-in
 
-### 9.1 Lazy (v0.1, default)
+### 9.1 Lazy (default)
 
 Receiver finishes its scan before the sender sends anything. Zero wasted
 bytes, one scan-length of latency before the first data byte. Right for slow
@@ -425,19 +445,28 @@ different manifest source. Decided on simulation data (see D10 in
    exactly as in §5–7. PLAN_LOCAL entries carry the hash; the receiver
    resolves each local source per hash (temp before old file) and verifies
    the read against it. The sender needs no state from the previous
-   attempt.
+   attempt. A temp chunk the plan places at the offset it already
+   occupies is verified in place and not rewritten. One the plan
+   **moves** (the sender's file shifted between attempts) is read from
+   the same temp the plan writes into, so an earlier write could clobber
+   its source: every moved temp chunk is first copied once, per hash, to
+   a stash past the temp's end, then read from there. The final trim
+   (§8.1) removes the stash. Before this, a shifted resume failed its own
+   read verify and wasted the attempt.
 4. Verification (§8) is unchanged and is the final oracle: a stale or wrong
    manifest can cost re-sends, never corruption.
-5. **Empty plan on resume:** if the previous attempt died after the last
-   DATA byte, the reconnect plan is empty but the temp is complete; the
-   receiver compares the temp's root against VERIFY and commits it (atomic
-   rename) on match.
+5. **Complete temp on resume:** if the previous attempt died after the
+   last DATA byte, the temp already is the sender's file. The reconnect
+   plan is all-Local and every chunk is already in place: nothing is
+   rewritten, VERIFY matches, and the receiver commits the temp (atomic
+   rename). Both peers report Transferred with 0 wire bytes (§8: a
+   resuming receiver never reports InSync).
 
 **Why re-scan the temp instead of journaling written offsets:** the temp
 file's content *is* the state, re-scanning reuses one code path, and CDC
 re-chunking of correct chunk data reproduces matching hashes except in
 boundary-shift regions (same bounded over-send as §6.2). A write-journal is a
-later optimization, not v0.1 (§13).
+later optimization, not implemented (§13).
 
 ## 11. Progress and observability
 

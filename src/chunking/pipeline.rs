@@ -10,21 +10,62 @@ use super::chunker::{Chunker, FastCDCChunker};
 use super::hasher::{Blake3Hasher, Hasher};
 use super::types::{Chunk, ChunkEvent};
 
+/// Size of the regions the pipeline chunks independently (one chunker per
+/// region, regions striped across the chunker threads). The chunker
+/// restarts at every region start, so a boundary is forced at each
+/// multiple of this size: it is part of the chunk-layout definition, like
+/// the CDC parameters, and both peers must use the same value
+/// (`concept/Protocol.md` §4, "Region seams"). It is a protocol constant,
+/// never negotiated and never configurable.
+pub const REGION_SIZE: usize = 256 * 1024 * 1024;
+
+/// Bytes of file per hash worker below which another worker is not worth
+/// spawning: BLAKE3 hashes several hundred MiB/s per thread, so a thread
+/// over less than this spends a large share of its life being created.
+const BYTES_PER_HASH_WORKER: usize = 4 * 1024 * 1024;
+
+/// Pipeline concurrency settings. Only concurrency lives here: nothing in
+/// this struct changes the chunk layout.
+#[derive(Debug, Clone)]
 pub struct PipelineConfig {
+    /// Ignored. The region size changes where chunks are cut, so it is the
+    /// fixed protocol constant [`REGION_SIZE`]; setting a different value
+    /// here used to produce chunk lists no peer could match.
+    #[deprecated(
+        since = "1.4.0",
+        note = "ignored: the region size is the protocol constant REGION_SIZE"
+    )]
     pub read_buffer_size: usize,
+    /// Capacity of the bounded work and result channels.
     pub chunk_queue_size: usize,
+    /// Upper bound on hash workers (and on chunker threads) per scan. A
+    /// scan uses fewer when the file is small; see [`process_file`].
     pub hash_workers: usize,
 }
 
 impl Default for PipelineConfig {
+    #[allow(deprecated)] // the field still has to be initialized
     fn default() -> Self {
         let cores = num_cpus::get();
         Self {
-            read_buffer_size: 256 * 1024 * 1024,
+            read_buffer_size: REGION_SIZE,
             chunk_queue_size: 2000,
             hash_workers: cores,
         }
     }
+}
+
+/// Threads one scan of a `total_size`-byte file uses: `(chunker threads,
+/// hash workers)`. Chunker threads beyond the region count would exit
+/// without work, and hash workers beyond one per
+/// [`BYTES_PER_HASH_WORKER`] cost more to spawn than they save, which
+/// added up in tree sessions (every small file paid for 2 × cores
+/// threads). The counts never affect the chunk layout: regions are fixed.
+fn thread_counts(total_size: usize, max_workers: usize) -> (usize, usize) {
+    let max_workers = max_workers.max(1);
+    let regions = total_size.div_ceil(REGION_SIZE).max(1);
+    let hash = total_size.div_ceil(BYTES_PER_HASH_WORKER).max(1);
+    (regions.min(max_workers), hash.min(max_workers))
 }
 
 struct ChunkWork {
@@ -86,8 +127,8 @@ where
     let (result_tx, result_rx) = channel::bounded(config.chunk_queue_size);
 
     let total_size = mmap.len();
-    let chunk_threads = config.hash_workers;
-    let region_size = config.read_buffer_size;
+    let (chunk_threads, hash_workers) = thread_counts(total_size, config.hash_workers);
+    let region_size = REGION_SIZE;
 
     for thread_id in 0..chunk_threads {
         let mmap_clone = Arc::clone(&mmap);
@@ -121,7 +162,6 @@ where
     drop(chunk_tx);
 
     let hasher = Arc::new(hasher);
-    let hash_workers = config.hash_workers;
 
     for _ in 0..hash_workers {
         let chunk_rx = chunk_rx.clone();
@@ -154,4 +194,27 @@ where
     drop(result_tx);
 
     Ok(result_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_files_get_one_thread_of_each_kind() {
+        assert_eq!(thread_counts(0, 16), (1, 1));
+        assert_eq!(thread_counts(4096, 16), (1, 1));
+        assert_eq!(thread_counts(BYTES_PER_HASH_WORKER, 16), (1, 1));
+    }
+
+    #[test]
+    fn thread_counts_grow_with_size_up_to_the_cap() {
+        assert_eq!(thread_counts(BYTES_PER_HASH_WORKER + 1, 16), (1, 2));
+        assert_eq!(thread_counts(64 * 1024 * 1024, 16), (1, 16));
+        assert_eq!(thread_counts(64 * 1024 * 1024, 4), (1, 4));
+        assert_eq!(thread_counts(3 * REGION_SIZE, 16), (3, 16));
+        assert_eq!(thread_counts(100 * REGION_SIZE, 16), (16, 16));
+        // A zero cap still scans.
+        assert_eq!(thread_counts(4096, 0), (1, 1));
+    }
 }

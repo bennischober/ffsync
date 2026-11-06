@@ -148,8 +148,9 @@ pre-existing.
 - `src/chunking/` — the core data pipeline. The public API is re-exported from
   `mod.rs`.
   - `pipeline.rs` — `process_file()` is the entry point: it memory-maps the
-    file (`memmap2`), spawns one chunker thread per core (each striding over
-    256 MiB regions), and pushes `(offset, length)` work items through bounded
+    file (`memmap2`), spawns chunker threads striding over 256 MiB regions
+    (`REGION_SIZE`, a protocol constant — Protocol.md §4; thread counts are
+    size-aware and capped at the core count), and pushes `(offset, length)` work items through bounded
     `crossbeam` channels to hash-worker threads, which slice the mmap directly.
     Returns a `Receiver<ChunkEvent>`.
   - `chunker.rs` — `Chunker` trait with two implementations: `FixedChunker`

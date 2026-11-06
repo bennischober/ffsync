@@ -831,7 +831,7 @@ fn run_disconnect_simulation(
     }
     println!();
     println!(
-        "Reading: 'cold restart' is what v0.1 does today (re-send the full delta);\
+        "Reading: 'cold restart' is a retry without resume (re-send the full delta);\
 \n'temp-only' resumes from the temp file re-scan; 'union' also matches the old\
 \nfile's chunks (temp-first). Completion 'yes' proves the partial temp state\
 \nis recoverable end-to-end."
@@ -859,8 +859,8 @@ fn run_warm_simulation(
     println!("==== warm-start index simulation (D15) ====");
     let size = fs::metadata(file)?.len();
 
-    // Cold pass: the real scan (what v0.1 pays on every run) + index write
-    // (what v0.2 pays once, at commit).
+    // Cold pass: the real scan (what every run pays without an index) +
+    // index write (paid once, at commit).
     let (scan_stats, chunks) = scan_file(file, pipeline, cdc)?;
     let index = FileIndex::from_scan(
         chunks.clone(),
