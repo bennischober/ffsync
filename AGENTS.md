@@ -367,6 +367,21 @@ pre-existing.
   driver) — route them through the module's `block_on`, and give
   `client_session` its bounded handshake timeout (quinn retransmits
   Initials forever; a dead peer must fail loudly, §17.5).
+- Every CLI connection is wrapped ONCE in `protocol::BufStream` (64 KiB
+  read + write buffers, `buffered()` in `main.rs`); the bench wraps its
+  ends the same way. Liveness rests on flush-before-blocking-read: the
+  state machines flush at each request/response step, and the buffer
+  flushes itself when a read must wait. Never re-wrap a live connection
+  (read-ahead bytes belong to the next frame), never write to the inner
+  stream past the buffer, and keep per-frame flushes out of hot loops
+  (manifest/plan entries) — one flush per phase is the contract (§3).
+- Eager senders (§9.2) DECIDE and compress during the manifest exchange
+  but WRITE the DATA frames only after the receiver's MANIFEST_DONE: the
+  receiver streams its manifest without reading, so writing earlier
+  deadlocks on any transport with less buffering than the eager bytes +
+  remaining manifest. Held bytes are capped at `EAGER_BUF_CAP` (= the
+  receiver's cap). Do not "optimize" the writes back into the manifest
+  loop; `eager_does_not_deadlock_on_small_transport_buffers` pins it.
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
 - The identity file (`identity.bin`) holds the private key: `0600` on unix,

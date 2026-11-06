@@ -10,6 +10,10 @@ use std::io::{self, Read, Write};
 /// Maximum payload size of a single frame.
 pub const MAX_PAYLOAD: u32 = 64 * 1024 * 1024;
 
+/// Payloads up to this size are encoded with a single write (see
+/// [`Frame::encode`]).
+const COALESCE_LIMIT: usize = 64 * 1024;
+
 /// Frame type byte for `HELLO`.
 pub const T_HELLO: u8 = 0x01;
 /// Frame type byte for `MANIFEST_CHUNK`.
@@ -70,6 +74,13 @@ impl Frame {
     }
 
     /// Encodes the frame into `out`.
+    ///
+    /// A frame up to [`COALESCE_LIMIT`] payload bytes goes out as ONE
+    /// `write_all` (header and payload together): on an unbuffered stream
+    /// three writes per frame meant three syscalls, three TLS records and —
+    /// with `TCP_NODELAY` — up to three segments for a 49-byte manifest
+    /// entry. Larger payloads keep the two-write form instead of copying
+    /// megabytes to prepend five bytes.
     pub fn encode(&self, out: &mut (impl Write + ?Sized)) -> io::Result<()> {
         if self.payload.len() as u64 > MAX_PAYLOAD as u64 {
             return Err(io::Error::new(
@@ -81,9 +92,21 @@ impl Frame {
                 ),
             ));
         }
-        out.write_all(&[self.ftype])?;
-        out.write_all(&(self.payload.len() as u32).to_le_bytes())?;
-        out.write_all(&self.payload)
+        let header = self.header();
+        if self.payload.len() <= COALESCE_LIMIT {
+            let mut buf = Vec::with_capacity(self.encoded_len());
+            buf.extend_from_slice(&header);
+            buf.extend_from_slice(&self.payload);
+            out.write_all(&buf)
+        } else {
+            out.write_all(&header)?;
+            out.write_all(&self.payload)
+        }
+    }
+
+    fn header(&self) -> [u8; 5] {
+        let len = (self.payload.len() as u32).to_le_bytes();
+        [self.ftype, len[0], len[1], len[2], len[3]]
     }
 
     /// Encoded size in bytes (for progress accounting).
@@ -239,6 +262,30 @@ mod tests {
             read_frame(&mut cursor),
             Err(FrameError::Truncated)
         ));
+    }
+
+    #[test]
+    fn small_frames_are_one_write_large_frames_two() {
+        struct Count(Vec<usize>);
+        impl Write for Count {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.push(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut c = Count(Vec::new());
+        Frame::new(T_MANIFEST_CHUNK, vec![1; 44])
+            .encode(&mut c)
+            .unwrap();
+        assert_eq!(c.0, vec![49]);
+        let mut c = Count(Vec::new());
+        Frame::new(T_DATA, vec![1; COALESCE_LIMIT + 1])
+            .encode(&mut c)
+            .unwrap();
+        assert_eq!(c.0, vec![5, COALESCE_LIMIT + 1]);
     }
 
     #[test]

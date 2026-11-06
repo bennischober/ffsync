@@ -118,6 +118,23 @@ Error codes: 1=version, 2=role conflict, 3=bad frame, 4=hash mismatch,
 5=io, 6=aborted. Any ERROR frame is terminal: the sender of ERROR closes the
 connection after flushing; the peer must treat the transfer as failed.
 
+**Write coalescing (implementation rule, no wire effect).** Frames are a
+byte stream; how they are cut into writes is invisible to the peer. A frame
+whose payload fits in 64 KiB is encoded as ONE write (header + payload),
+and the CLI wraps every connection in a 64 KiB read/write buffer
+(`BufStream`, 2026-11-06), so manifest and plan entries (~50 B each)
+leave in buffer-sized writes rather than one syscall, TLS record and
+(with `TCP_NODELAY`) TCP segment per frame — over QUIC, one runtime round
+trip per frame. The liveness rule that makes buffering safe: **a peer
+flushes before any blocking read whose answer depends on its pending
+frames.** The state machines flush at every such step explicitly (HELLO,
+MANIFEST_DONE, PLAN_DONE, end of DATA, VERIFY, COMMIT_ACK, the tree
+frames); the buffer also flushes on its own whenever a read must wait for
+the peer, so a missed flush degrades latency, never liveness. A flush
+that fails there (the peer already closed its read side after a final
+frame, e.g. the §4 fast path's NOT_MODIFIED) does not fail the read — the
+peer's final frame stays readable; later writes report the failure.
+
 ## 4. Handshake and negotiation
 
 1. Both peers connect and immediately send HELLO.
@@ -148,9 +165,8 @@ connection after flushing; the peer must treat the transfer as failed.
    sub-second mtimes for the same reason). `--checksum` mode clears this
    flag and forces full verification.
 
-Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2 — designed below;
-still must be 0 on the wire until §9.2 is implemented, and a peer MUST
-reject a HELLO that sets it), bit 2 `resuming` (informational, §10), bit 3
+Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2, implemented: the
+sender's opt-in offer, mirrored by a receiver that also opted in), bit 2 `resuming` (informational, §10), bit 3
 `dry_run` (§7.1, implemented in v0.8 work: the sender offers a preview
 session; the receiver accepts with the DRY_RUN_ACK marker before any
 manifest/plan traffic). Unknown bits are rejected at decode (strict
@@ -301,7 +317,7 @@ layout (same count, same offsets, same lengths — identical files under
 the diff map; the sender mirrors the check against the raw manifest chunk
 list). VERIFY guards every path regardless.
 
-## 9. Diff strategy (D8) — lazy now, eager reserved
+## 9. Diff strategy (D8) — lazy default, eager opt-in
 
 ### 9.1 Lazy (v0.1, default)
 
@@ -309,7 +325,7 @@ Receiver finishes its scan before the sender sends anything. Zero wasted
 bytes, one scan-length of latency before the first data byte. Right for slow
 links, where over-sending is fatal.
 
-### 9.2 Eager (designed, not yet implemented — flag bit 1)
+### 9.2 Eager (implemented, opt-in — flag bit 1)
 
 Sender diffs against the *partial* manifest set and streams DATA for hashes
 confirmed missing so far. Bytes start moving during the scan. A late manifest
@@ -344,6 +360,26 @@ as today) under a fixed 64 MiB cap (§12 spirit). Overflow is a loud ERROR
 and a lazy retry with a clean temp — never a spill file, never a silent
 degradation. (This resolves §13 question 2.)
 
+**Transmission timing: decide early, write after MANIFEST_DONE.** The
+receiver streams its whole manifest without reading (§5). A sender that
+WRITES eager DATA while it still reads the manifest blocks as soon as the
+send→recv buffers fill, stops reading, and so blocks the receiver's
+manifest writes in turn — a deadlock on any transport whose buffers hold
+less than the eager bytes plus the rest of the manifest (a large file
+over real TCP; found 2026-11-06, pinned by
+`eager_does_not_deadlock_on_small_transport_buffers`). The sender
+therefore makes every eager decision during the manifest exchange (the
+gate above) and reads + compresses the chunk right then, but HOLDS the
+DATA frames and writes them after the receiver's MANIFEST_DONE, ahead of
+the PLAN. The receiver sees the identical frame sequence (it reads
+nothing before its own MANIFEST_DONE either way), so this is no wire
+change. Held bytes are capped at the receiver's buffer cap (64 MiB of
+compressed payload): once held frames reach it, the remaining chunks go
+the lazy way (plan + §7), so a compliant sender never trips the
+receiver's overflow ERROR. What eager still buys is the overlap of the
+sender's chunk reads and zstd work with the receiver's scan and the
+manifest transfer.
+
 **Ordering and resume.** Writes happen in arrival order under eager —
 D10's locals-first ordering is a lazy-mode property (§7), and resume is
 unaffected because the temp re-scan is content-addressed (§10).
@@ -354,7 +390,10 @@ sessions over the RTT-modeled duplex; over-send was 0 bytes in every run
 (the §6.2 position gate rescues late matches exactly as designed), and
 eager cut wall time 18–33% at 0 ms RTT and 12–18% at 30 ms RTT (medians
 455→368 ms and 596→488 ms on the 128 MiB modified fixture, 3 paired runs
-each). The knob is `--eager` on both peers; a declining peer fails the
+each). Re-measured 2026-11-06 after the transmission-timing fix above
+(both ends `BufStream`-wrapped like the CLI, 3 paired runs): over-send
+0 B, medians 479→381 ms (−20%) at 0 ms RTT and 551→423 ms (−23%) at
+30 ms RTT. The knob is `--eager` on both peers; a declining peer fails the
 session loudly (the sender checks the receiver's HELLO mirror). Wire
 contract notes: eager offers are deduplicated by hash (repeated content
 chunks are offered once; the receiver's by-hash buffer is a cache that
@@ -435,8 +474,8 @@ origin, D5):
 1. **Index staleness policy** (§14.1): exact trust rules for cross-run
    manifests; relationship to mtime granularity problems.
 2. **Eager-mode buffer cap** (§9.2): resolved by design — fixed 64 MiB cap,
-   overflow = loud ERROR + lazy retry (§9.2). Implementation of eager mode
-   itself remains open, gated on the eager-mode bench cell.
+   overflow = loud ERROR + lazy retry (§9.2). Eager mode is implemented
+   (§9.2 Status); the sender caps its held offers at the same bound.
 3. **Resume write-journal** vs. temp re-scan: at what file sizes does the
    re-scan cost matter?
 4. **zstd batching:** per-chunk frames waste some compression ratio at ~1 MiB
@@ -454,8 +493,8 @@ origin, D5):
 1. **Persistent index:** IMPLEMENTED (D15, v0.4 — `FFSYIX02` sidecar
    files; the INDEX-frame idea was dropped in favor of the on-disk
    sidecar, same trust model: size+mtime+CDC-parameter validation).
-2. **Eager diff:** DESIGNED, not implemented (§9.2; gated on the
-   eager-mode bench cell — D8's doctrine).
+2. **Eager diff:** IMPLEMENTED (§9.2, opt-in `--eager`; the bench cell
+   measured it before it shipped — D8's doctrine; tree sessions §16.11).
 3. **TLS:** IMPLEMENTED (D16, v0.5 — rustls TLS 1.3, mutual TOFU
    fingerprint pinning; QUIC followed in v0.6, §17).
 4. **Parallel chunk streams:** IMPLEMENTED (v0.7, §16.8 — per-file

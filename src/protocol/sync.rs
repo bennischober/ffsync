@@ -25,12 +25,17 @@ use crate::chunking::{
     chunk_root, process_file, sane_cdc_params,
 };
 use crate::index::{FileIndex, load_index, load_index_with_cdc};
-use crate::protocol::framing::{self, FrameError};
+use crate::protocol::framing::{self, Frame, FrameError};
 use crate::protocol::message::{
     self, ErrorCode, FLAG_RESUMING, FLAG_TRUST_TIMES, Hello, ManifestChunk, Message, MessageError,
     PlanEntry, Role,
 };
 use crate::reconstruction::{ChunkSource, FileExt, ReconstructionTask, Reconstructor};
+
+/// §9.2: the bound on pre-plan eager DATA (compressed payload bytes). The
+/// receiver buffers at most this much; the sender holds and offers at most
+/// this much, so a compliant pair never hits the receiver's overflow ERROR.
+const EAGER_BUF_CAP: usize = 64 * 1024 * 1024;
 
 // Reusable per-thread zstd decompression context.
 //
@@ -527,60 +532,69 @@ where
     // without a match (or the manifest is done); elsewhere a late match
     // still rescues the chunk. Over-send is bounded near modification
     // regions, exactly like the boundary-shift fallback.
+    //
+    // Offers are PREPARED (read + compressed) during the manifest exchange
+    // but HELD until MANIFEST_DONE: the receiver streams its whole
+    // manifest without reading, so a sender writing DATA meanwhile blocks
+    // once the forward buffers fill, stops reading, and blocks the
+    // receiver's manifest writes in turn — a deadlock on any transport
+    // whose buffers are smaller than the eager bytes plus the remaining
+    // manifest (large files over TCP). Holding keeps the sender's reads
+    // non-blocking-safe (the receiver only writes in this phase) and the
+    // wire contract unchanged (eager DATA after the receiver's DONE was
+    // always legal). The held bytes are capped at the receiver's buffer
+    // cap: past it, chunks stay for the normal data phase, so a compliant
+    // sender never trips the receiver's overflow ERROR.
     let mut eager_file: Option<File> = None;
     let mut eager_compressor: Option<zstd::bulk::Compressor<'static>> = None;
-    let mut eager_sent: u64 = 0;
+    let mut eager_held: Vec<(Frame, u64)> = Vec::new();
+    let mut eager_held_bytes: usize = 0;
     let mut eager_scan: usize = 0; // next un-offered source chunk (offset-sorted)
     let mut eager_offered: std::collections::HashSet<Hash> = std::collections::HashSet::new();
-    // §9.2: the eager DATA rides the same Transferring progress as the plan
-    // loop's data phase (total = the plan's remote bytes; the CLI's
-    // display/kill logic counts eager bytes too). The total is unknown
-    // before the plan exists — the sender's own chunk list IS the upper
-    // bound (every source chunk could be remote), so use its byte size.
-    // Emitted by the offer closure below; 0 bytes when the session stays lazy.
-    let remote_total_hint: u64 = source_chunks.iter().map(|c| c.length as u64).sum();
     let mut offer_eager_chunk = |chunk: &Chunk,
                                  manifest: &HashMap<Hash, u64>,
                                  consumed_upto: u64,
-                                 manifest_done: bool,
-                                 eager_sent: u64,
-                                 stream: &mut dyn Write|
-     -> Result<u64, SyncError> {
-        if !eager_active {
-            return Ok(0);
-        }
-        let covered = manifest.contains_key(&chunk.hash);
-        if covered || (!manifest_done && chunk.offset + 2 * cdc.1 as u64 > consumed_upto) {
-            return Ok(0); // still rescuable, or already covered
-        }
+                                 manifest_done: bool|
+     -> Result<(), SyncError> {
         // A hash repeated in the source is offered once: the receiver
         // buffers by hash and serves every plan occurrence from it.
-        if eager_offered.contains(&chunk.hash) {
-            return Ok(0);
+        if !eager_active || eager_offered.contains(&chunk.hash) {
+            return Ok(());
+        }
+        let covered = manifest.contains_key(&chunk.hash);
+        if covered
+            || (!manifest_done && chunk.offset.saturating_add(2 * cdc.1 as u64) > consumed_upto)
+        {
+            return Ok(()); // still rescuable, or already covered
+        }
+        if eager_held_bytes >= EAGER_BUF_CAP {
+            return Ok(()); // the normal data phase sends it
         }
         // I/O and zstd setup failures are session errors, never panics.
-        if eager_file.is_none() {
-            eager_file = Some(File::open(&request.path)?);
-        }
-        if eager_compressor.is_none() {
-            eager_compressor = Some(zstd::bulk::Compressor::new(3)?);
-        }
-        let (Some(file), Some(compressor)) = (eager_file.as_mut(), eager_compressor.as_mut())
-        else {
-            unreachable!("eager file and compressor initialized above");
+        let file = match &mut eager_file {
+            Some(f) => f,
+            None => eager_file.insert(File::open(&request.path)?),
         };
-        let mut buf = Vec::with_capacity(chunk.length);
+        let compressor = match &mut eager_compressor {
+            Some(c) => c,
+            None => eager_compressor.insert(zstd::bulk::Compressor::new(3)?),
+        };
+        let mut buf = vec![0u8; chunk.length];
         use std::io::{Read as _, Seek as _};
         file.seek(io::SeekFrom::Start(chunk.offset))?;
-        buf.resize(chunk.length, 0);
         file.read_exact(&mut buf)?;
         let compressed = compressor.compress(&buf)?;
-        message::encode_data(chunk.hash, &compressed)?.encode(stream)?;
-        stream.flush()?;
+        if eager_held_bytes + compressed.len() > EAGER_BUF_CAP {
+            eager_held_bytes = EAGER_BUF_CAP; // stop offering; lazy from here
+            return Ok(());
+        }
+        eager_held_bytes += compressed.len();
+        eager_held.push((
+            message::encode_data(chunk.hash, &compressed)?,
+            chunk.length as u64,
+        ));
         eager_offered.insert(chunk.hash);
-        let sent_now = eager_sent + chunk.length as u64;
-        progress(Progress::Transferring(sent_now, remote_total_hint));
-        Ok(chunk.length as u64)
+        Ok(())
     };
     loop {
         let frame = framing::read_frame(stream)?;
@@ -597,21 +611,17 @@ where
                     manifest_overflow = true;
                 }
                 let consumed = entry.offset.saturating_add(entry.length as u64);
-                let ready = source_chunks[eager_scan..]
-                    .iter()
-                    .take_while(|c| c.offset < consumed)
-                    .count();
-                for chunk in &source_chunks[eager_scan..eager_scan + ready] {
-                    let offered =
-                        offer_eager_chunk(chunk, &manifest, consumed, false, eager_sent, stream)?;
-                    eager_sent += offered;
+                while let Some(chunk) = source_chunks.get(eager_scan) {
+                    if chunk.offset >= consumed {
+                        break;
+                    }
+                    offer_eager_chunk(chunk, &manifest, consumed, false)?;
+                    eager_scan += 1;
                 }
-                eager_scan += ready;
             }
             framing::T_MANIFEST_DONE => {
                 for chunk in &source_chunks[eager_scan..] {
-                    let offered = offer_eager_chunk(chunk, &manifest, 0, true, eager_sent, stream)?;
-                    eager_sent += offered;
+                    offer_eager_chunk(chunk, &manifest, 0, true)?;
                 }
                 break;
             }
@@ -623,6 +633,20 @@ where
                 ));
             }
         }
+    }
+    // §9.2: the receiver has finished writing (its DONE is read) and now
+    // only reads until PLAN_DONE — the held offers can go out. They ride
+    // the same Transferring progress as the plan loop's data phase (total
+    // unknown before the plan: the source size is the upper bound).
+    let mut eager_sent: u64 = 0;
+    if !eager_held.is_empty() {
+        let remote_total_hint: u64 = source_chunks.iter().map(|c| c.length as u64).sum();
+        for (frame, raw_len) in eager_held.drain(..) {
+            frame.encode(stream)?;
+            eager_sent += raw_len;
+            progress(Progress::Transferring(eager_sent, remote_total_hint));
+        }
+        stream.flush()?;
     }
 
     // ---- Plan generation (§6, D12 exact match) ----
@@ -1140,15 +1164,19 @@ where
     // failure means the next readable frame is NOT_MODIFIED (handled in the
     // plan loop) — or nothing, in which case the plan loop surfaces the
     // real error.
-    // §9.2: an eager session interleaves DATA frames into the manifest
-    // stream (the sender's position gate, §6.2). Buffer them by hash;
-    // the plan's Remote arm consumes from the buffer instead of the wire.
-    // Cap: 64 MiB (§12 spirit) — overflow is a loud ERROR + lazy retry,
-    // never a spill file.
+    // One flush at MANIFEST_DONE, not per entry: on a buffered stream
+    // (`BufStream`) the entries then leave in buffer-sized writes instead
+    // of one syscall / TLS record / segment per 49-byte frame.
+    // §9.2: in an eager session the sender's DATA offers (decided by its
+    // position gate, §6.2, during our manifest stream) arrive after our
+    // MANIFEST_DONE, ahead of the plan. Buffer them by hash; the plan's
+    // Remote arm consumes from the buffer instead of the wire.
+    // Cap: EAGER_BUF_CAP (§12 spirit) — overflow is a loud ERROR + lazy
+    // retry, never a spill file. A compliant sender caps its offers at the
+    // same bound, so only a misbehaving peer trips it.
     let eager_active = request.eager && peer.flags & message::FLAG_EAGER != 0;
     let mut eager_buf: HashMap<Hash, Vec<u8>> = HashMap::new();
     let mut eager_bytes: usize = 0;
-    const EAGER_BUF_CAP: usize = 64 * 1024 * 1024;
     for chunk in &temp_chunks {
         let frame = message::ManifestChunk {
             hash: chunk.hash,
@@ -1156,7 +1184,7 @@ where
             length: chunk.length as u32,
         }
         .into_frame()?;
-        if frame.encode(stream).and_then(|_| stream.flush()).is_err() {
+        if frame.encode(stream).is_err() {
             break;
         }
     }
@@ -1171,7 +1199,7 @@ where
             length: chunk.length as u32,
         }
         .into_frame()?;
-        if frame.encode(stream).and_then(|_| stream.flush()).is_err() {
+        if frame.encode(stream).is_err() {
             break;
         }
     }
@@ -1205,7 +1233,7 @@ where
                 length: chunk.length as u32,
             }
             .into_frame()?;
-            if frame.encode(stream).and_then(|_| stream.flush()).is_err() {
+            if frame.encode(stream).is_err() {
                 break;
             }
         }
@@ -1218,7 +1246,6 @@ where
     {
         // Sender is gone; the plan loop will read NOT_MODIFIED or EOF.
     }
-    let _ = stream.flush();
 
     // ---- Receive plan (§6) ----
     let mut plan: Vec<PlanEntry> = Vec::new();
@@ -1344,7 +1371,6 @@ where
             peer.file_size == 0 || (!plan.is_empty() && !plan_reproduces_local_layout);
         if would_change {
             message::encode_empty(framing::T_NOT_MODIFIED)?.encode(stream)?;
-            stream.flush()?;
             message::encode_empty(framing::T_DRY_RUN_ACK)?.encode(stream)?;
             stream.flush()?;
             progress(Progress::WouldChange);

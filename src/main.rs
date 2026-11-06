@@ -391,7 +391,7 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
         )));
     }
     let (host, port) = parse_host_port(&addr);
-    let mut stream: Box<dyn ReadWrite> = if quic {
+    let stream: Box<dyn ReadWrite> = if quic {
         println!("connecting to {host}:{port} (QUIC) ...");
         let server_addr = resolve_addr(&host, port)?;
         let (identity, created) = ffsync::transport::Identity::load_or_create()?;
@@ -440,6 +440,8 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
             Box::new(tls)
         }
     };
+
+    let mut stream = buffered(stream);
 
     let display = &mut ProgressDisplay::new();
     let request = SendRequest {
@@ -542,7 +544,7 @@ fn run_receive(
         println!("listening on {bound} ...");
     }
     let mut quic_receive_session: Option<ffsync::transport::quic::QuicSession> = None;
-    let mut stream: Box<dyn ReadWrite> = match listener {
+    let stream: Box<dyn ReadWrite> = match listener {
         Listener::Tcp(listener) => {
             let (tcp, peer) = listener.accept()?;
             println!("peer connected: {peer}");
@@ -591,6 +593,8 @@ fn run_receive(
             Box::new(quic_stream)
         }
     };
+
+    let mut stream = buffered(stream);
 
     let display = &mut ProgressDisplay::new();
     let request = ReceiveRequest {
@@ -680,7 +684,7 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
                 let s = session.open_stream().map_err(|e| {
                     std::io::Error::other(format!("cannot open worker {index}: {e}"))
                 })?;
-                Ok(Box::new(s))
+                Ok(buffered(Box::new(s)))
             });
         quic_wait = Some(session_for_wait);
         (Box::new(control) as Box<dyn ReadWrite>, connect_worker)
@@ -706,13 +710,13 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
             })?;
             tcp.set_nodelay(true).ok();
             set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-            authenticate_worker(tcp, &host, true, worker_auth.as_ref())
+            authenticate_worker(tcp, &host, true, worker_auth.as_ref()).map(buffered)
         };
         let connect_worker: Box<dyn Fn(u16) -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
             Box::new(connect_worker);
         (stream, connect_worker)
     };
-    let mut stream = stream;
+    let mut stream = buffered(stream);
     let request = TreeSendRequest {
         root,
         force_checksum,
@@ -810,6 +814,7 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
                     tcp.set_nodelay(true).ok();
                     set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
                     authenticate_worker(tcp, &wpeer.to_string(), false, worker_auth.as_ref())
+                        .map(buffered)
                 });
             (
                 stream,
@@ -849,7 +854,7 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
                         let s = session.accept_stream().map_err(|e| {
                             std::io::Error::other(format!("cannot accept worker: {e}"))
                         })?;
-                        Ok(Box::new(s))
+                        Ok(buffered(Box::new(s)))
                     }
                 });
             (
@@ -860,7 +865,7 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
             )
         }
     };
-    let mut stream = stream;
+    let mut stream = buffered(stream);
     let request = TreeReceiveRequest {
         root,
         force_checksum,
@@ -891,6 +896,15 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
         session.wait_for_peer_close(Duration::from_secs(10));
     }
     Ok(())
+}
+
+/// Wraps a connection in the protocol's write-coalescing, read-ahead
+/// buffer (`BufStream`): manifest and plan entries (~50 bytes each) leave in
+/// 64 KiB writes instead of one syscall / TLS record / TCP segment — or, over
+/// QUIC, one runtime round trip — per frame. Applied once per connection,
+/// for its whole lifetime (read-ahead bytes belong to the next frame).
+fn buffered(stream: Box<dyn ReadWrite>) -> Box<dyn ReadWrite> {
+    Box::new(ffsync::protocol::BufStream::new(stream))
 }
 
 /// What a §16.8 worker connection must match: this session's identity and
