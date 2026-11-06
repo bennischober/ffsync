@@ -3,9 +3,10 @@
 //! Both sides are plain functions over a generic duplex stream so the same
 //! code runs over TCP, over an in-memory duplex pair, or inside tests.
 //!
-//! Flow (lazy mode, v0.1):
+//! Flow (lazy mode, the default; `--eager` overlaps steps 2 and 4, §9.2):
 //! 1. both peers send HELLO (§4), validate, optionally take the
-//!    size+mtime fast path (D11),
+//!    size+mtime fast path (D11; the receiver's HELLO describes its
+//!    target, also under `--from`),
 //! 2. receiver streams its manifest (§5); sender scans its own file
 //!    concurrently and consumes the manifest into a hash set,
 //! 3. sender diffs and streams the plan (§6, D12 exact-match),
@@ -313,7 +314,8 @@ impl From<MessageError> for SyncError {
 /// Runs the sender side of a sync over `stream`.
 ///
 /// `stream` must be a full-duplex ordered byte stream; reads consume what the
-/// peer writes and vice versa. Single-threaded by design (v0.1 lazy mode).
+/// peer writes and vice versa. Single-threaded by design: one conversation
+/// per stream (§16.8 parallel sessions run one `send` per connection).
 pub fn send<S>(
     stream: &mut S,
     request: &SendRequest,
@@ -677,7 +679,9 @@ where
         }
     }
 
-    // Layout-reproduction check (mirrors the receiver's decision, §8): an
+    // Layout-reproduction check (mirrors the receiver's decision, §8) —
+    // only the label fallback for a pre-D24 receiver, whose COMMIT_ACK
+    // carries no outcome byte; a current receiver reports what it did. An
     // all-Local plan whose target spans equal the receiver's raw chunk spans
     // (same count, same offsets, same lengths — hash equality implies length
     // equality) means the receiver's file is already chunked exactly like
@@ -689,7 +693,20 @@ where
     // Any other all-Local plan (Locals dedup'd across positions — a prefix
     // or shifted region) executes on the receiver and reports Transferred
     // with 0 wire bytes.
+    //
+    // The positional list is the receiver's whole streamed manifest, which
+    // can carry more than its old file: resume-temp chunks (D10) and D22
+    // census chunks. A receiver that streamed either never takes the
+    // no-rewrite shortcut (it commits the temp or the census copy), so the
+    // label must not say InSync just because those entries line up. Two
+    // HELLO facts rule that out without new wire state: a resuming
+    // receiver says so (flag bit 2, and it always executes), and an old
+    // file that already is our layout has our size (the receiver's HELLO
+    // size is its old file's; census- or temp-only manifests come from a
+    // receiver whose old file is missing or differs).
     let layout_reproduced = !plan.is_empty()
+        && peer.flags & FLAG_RESUMING == 0
+        && peer.file_size == file_size
         && !manifest_overflow
         && plan.len() == manifest_chunks.len()
         && plan
@@ -775,6 +792,10 @@ where
     let frame = framing::read_frame(stream)?;
     match frame.ftype {
         framing::T_COMMIT_ACK => {
+            // D24: a current receiver says whether it wrote the target;
+            // decode before anything is persisted so a malformed ACK fails
+            // the sync without touching our index.
+            let reported_written = message::decode_commit_ack(&frame.payload)?;
             // §7.1: in dry-run mode COMMIT_ACK is the receiver's "nothing
             // would change" report (no temp was created, no index is
             // written). Normal mode: commit succeeded — persist our chunk
@@ -790,12 +811,19 @@ where
                 );
                 let _ = crate::index::write_index(&request.path, &index);
             }
-            // InSync is for plans that changed nothing on the receiver: the
-            // zero-entry plan, or an all-Local plan that reproduced the
-            // receiver's chunk layout (no rewrite). Any executed plan —
-            // including an all-Local one that repositioned chunks — reports
+            // InSync is for syncs that wrote nothing on the receiver; any
+            // write — an executed plan, including an all-Local one that
+            // repositioned chunks, or an empty-file commit — reports
             // Transferred (with 0 wire bytes when no Remote entry existed).
-            if plan.is_empty() || layout_reproduced {
+            // D24: the receiver's outcome byte decides. Only a pre-D24
+            // receiver (empty COMMIT_ACK) leaves us predicting from the
+            // plan: the zero-entry plan or a layout-reproducing all-Local
+            // plan means no rewrite — wrong for a --from receiver (its
+            // manifest is not its target) and for an empty-file commit.
+            // Bytes we sent were written, whatever the ACK claims.
+            let written =
+                sent > 0 || reported_written.unwrap_or(!(plan.is_empty() || layout_reproduced));
+            if !written {
                 Ok(SyncOutcome::InSync)
             } else {
                 Ok(SyncOutcome::Transferred {
@@ -908,7 +936,18 @@ where
     // from its HELLO). ----
     let local_meta = std::fs::metadata(&request.local_source).ok();
     let local_size = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let local_mtime = local_meta.as_ref().and_then(|m| m.modified().ok());
+    // HELLO describes the TARGET: the §4 fast path asks "is the target
+    // already the sender's file?". With --from (D21) the old file is only a
+    // chunk source; reporting its metadata let a from-file equal to the
+    // sender's take the fast path (or the no-rewrite shortcut) and leave
+    // the target unwritten while both peers reported InSync.
+    let target_meta = if request.local_source == request.path {
+        local_meta.clone()
+    } else {
+        std::fs::metadata(&request.path).ok()
+    };
+    let hello_size = target_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let hello_mtime = target_meta.as_ref().and_then(|m| m.modified().ok());
 
     // ---- HELLO ----
     let mut flags = if request.force_checksum {
@@ -939,9 +978,9 @@ where
         cdc_min: cdc_params_for_size(local_size).0 as u32,
         cdc_avg: cdc_params_for_size(local_size).1 as u32,
         cdc_max: cdc_params_for_size(local_size).2 as u32,
-        file_size: local_size,
-        file_mtime: unix_secs(local_mtime),
-        file_mtime_nanos: local_mtime
+        file_size: hello_size,
+        file_mtime: unix_secs(hello_mtime),
+        file_mtime_nanos: hello_mtime
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.subsec_nanos())
             .unwrap_or(0),
@@ -1084,6 +1123,9 @@ where
     // validates describes exactly those bytes (D15's model), so the offer
     // is sound; the read stays hash-verified (D12) as belt-and-braces.
     // Precedence: Temp > own old file > census (first insert wins).
+    // Each index is loaded and validated once; the manifest stream below
+    // reuses the validated chunk lists.
+    let mut census: Vec<(&std::path::Path, Vec<Chunk>)> = Vec::new();
     for src in &request.extra_sources {
         if src == &request.local_source {
             continue;
@@ -1094,8 +1136,11 @@ where
         if idx.validate(src, cdc_u32).is_none() {
             continue;
         }
-        let file = src.clone();
-        for c in &idx.chunks {
+        census.push((src.as_path(), idx.chunks));
+    }
+    for (src, chunks) in &census {
+        let file = src.to_path_buf();
+        for c in chunks {
             manifest_map.entry(c.hash).or_insert(LocalOrigin::Foreign {
                 file: file.clone(),
                 offset: c.offset,
@@ -1171,7 +1216,10 @@ where
     // agree only when the two lists are the same list — otherwise the
     // shortcut is off and the plan executes (a no-op rewrite at worst),
     // so both peers report Transferred instead of disagreeing.
-    let mut extra_entries_streamed = !temp_chunks.is_empty();
+    // A resuming receiver counts as "extra" even when its temp scanned to
+    // nothing: its HELLO carried FLAG_RESUMING, which is what the sender
+    // keys its label on.
+    let mut extra_entries_streamed = resuming;
     for chunk in &temp_chunks {
         let frame = message::ManifestChunk {
             hash: chunk.hash,
@@ -1203,23 +1251,16 @@ where
     // entries the sender never sees cannot become Local plan entries).
     // The map's precedence already decided which origin serves each hash;
     // here only not-yet-offered hashes are streamed, temp/old-file first.
-    let offered: HashSet<Hash> = temp_chunks
+    let mut offered: HashSet<Hash> = temp_chunks
         .iter()
         .chain(local_chunks.iter())
         .map(|c| c.hash)
         .collect();
-    for src in &request.extra_sources {
-        if src == &request.local_source {
-            continue;
-        }
-        let Some(idx) = load_index(src) else {
-            continue;
-        };
-        if idx.validate(src, cdc_u32).is_none() {
-            continue;
-        }
-        for chunk in &idx.chunks {
-            if offered.contains(&chunk.hash) {
+    for (_, chunks) in &census {
+        for chunk in chunks {
+            // Insert as we stream: a hash shared by two census sources is
+            // offered once.
+            if !offered.insert(chunk.hash) {
                 continue;
             }
             extra_entries_streamed = true;
@@ -1344,7 +1385,10 @@ where
     // already detected at the marker: they stream a manifest where a §7.1
     // peer sends DRY_RUN_ACK, so nothing reaches this branch unless both
     // peers implement the mode.
+    // --from (D21): the old file reproducing the sender's layout says
+    // nothing about the target, which must still be written.
     let plan_reproduces_local_layout = !extra_entries_streamed
+        && request.local_source == request.path
         && !plan.is_empty()
         && plan.iter().all(|e| matches!(e, PlanEntry::Local { .. }))
         && plan.len() == local_chunks.len()
@@ -1372,7 +1416,7 @@ where
         // Would NOT change (empty plan, or an all-Local plan that already
         // reproduces the receiver's layout): answer COMMIT_ACK like the
         // normal empty-plan path — the dry-run sender reads it as InSync.
-        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        message::encode_commit_ack(false)?.encode(stream)?;
         stream.flush()?;
         progress(Progress::NothingToDo);
         return Ok(SyncOutcome::InSync);
@@ -1435,6 +1479,62 @@ where
         // conversation reads the old-name file's bytes through here).
         let mut temp_read: Option<File> = None;
         let mut foreign_reads: HashMap<PathBuf, File> = HashMap::new();
+        // D10 resume moves: a Temp-origin chunk is read from the same temp
+        // the plan writes into. One that already sits at its target offset
+        // is left in place (read-verified, never rewritten). One that must
+        // MOVE could have its source clobbered by an earlier write in plan
+        // order (the sender's file shifted between attempts), so every
+        // moved chunk is first copied once, per hash, to a stash past the
+        // temp's end — no plan write reaches there — and read back from
+        // it. `set_final_len` below trims the stash away; a disconnect
+        // before that leaves it as an ordinary temp tail for the next
+        // resume (scanned, harmless).
+        let mut stash: HashMap<Hash, u64> = HashMap::new();
+        if resuming {
+            let mut stash_end = std::fs::metadata(&temp_path)?.len().max(target_size);
+            for entry in &plan {
+                let PlanEntry::Local {
+                    target_offset,
+                    length,
+                    hash,
+                    ..
+                } = *entry
+                else {
+                    continue;
+                };
+                let Some(LocalOrigin::Temp {
+                    offset,
+                    length: origin_len,
+                }) = manifest_map.get(&hash)
+                else {
+                    continue;
+                };
+                // A length mismatch is rejected by the main loop below.
+                if *offset == target_offset
+                    || *origin_len != length as usize
+                    || stash.contains_key(&hash)
+                {
+                    continue;
+                }
+                if temp_read.is_none() {
+                    temp_read = Some(File::open(&temp_path)?);
+                }
+                let source_file = temp_read.as_mut().expect("temp read handle just opened");
+                scratch.clear();
+                scratch.resize(length as usize, 0);
+                source_file.read_full_at(&mut scratch, *offset)?;
+                let task = ReconstructionTask {
+                    target_offset: stash_end,
+                    source: ChunkSource {
+                        offset: 0,
+                        length: length as usize,
+                    },
+                };
+                reconstructor.write_chunk(&task, &scratch)?;
+                stash.insert(hash, stash_end);
+                stash_end += length as u64;
+            }
+        }
         let locals = plan.iter().filter(|e| matches!(e, PlanEntry::Local { .. }));
         let remotes = plan
             .iter()
@@ -1469,6 +1569,11 @@ where
                             "plan chunk length does not match our manifest entry",
                         ));
                     }
+                    // In place: a Temp chunk already at its target offset.
+                    // No other entry writes that span, so the bytes are
+                    // still there; verify them and skip the rewrite.
+                    let in_place =
+                        matches!(origin, LocalOrigin::Temp { .. }) && offset == target_offset;
                     match origin {
                         LocalOrigin::Temp { .. } => {
                             if temp_read.is_none() {
@@ -1476,9 +1581,14 @@ where
                             }
                             let source_file =
                                 temp_read.as_mut().expect("temp read handle just opened");
+                            let read_at = if in_place {
+                                offset
+                            } else {
+                                stash.get(&hash).copied().unwrap_or(offset)
+                            };
                             scratch.clear();
                             scratch.resize(length as usize, 0);
-                            source_file.read_full_at(&mut scratch[..length as usize], offset)?;
+                            source_file.read_full_at(&mut scratch[..length as usize], read_at)?;
                         }
                         LocalOrigin::Foreign { file, .. } => {
                             let source_file = match foreign_reads.get_mut(file) {
@@ -1535,7 +1645,9 @@ where
                     // `scratch` holds the verified bytes; write them straight
                     // from it (no clone — the old `&mut buf, Option<&data>`
                     // signature forced a full-chunk copy per Local entry).
-                    reconstructor.write_chunk(&task, &scratch)?;
+                    if !in_place {
+                        reconstructor.write_chunk(&task, &scratch)?;
+                    }
                 }
                 PlanEntry::Remote {
                     target_offset,
@@ -1657,7 +1769,7 @@ where
                 ),
             );
         }
-        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        message::encode_commit_ack(true)?.encode(stream)?;
         stream.flush()?;
         return Ok(SyncOutcome::Transferred {
             bytes: received,
@@ -1711,7 +1823,7 @@ where
                 cdc_u32,
             ),
         );
-        message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+        message::encode_commit_ack(true)?.encode(stream)?;
         stream.flush()?;
         progress(Progress::CreatedEmpty);
         return Ok(SyncOutcome::Transferred {
@@ -1762,7 +1874,7 @@ where
                     ),
                 );
             }
-            message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+            message::encode_commit_ack(false)?.encode(stream)?;
             stream.flush()?;
             progress(Progress::NothingToDo);
             Ok(SyncOutcome::InSync)
@@ -1803,7 +1915,7 @@ where
                         cdc_u32,
                     ),
                 );
-                message::encode_empty(framing::T_COMMIT_ACK)?.encode(stream)?;
+                message::encode_commit_ack(true)?.encode(stream)?;
                 stream.flush()?;
                 progress(Progress::CreatedEmpty);
                 return Ok(SyncOutcome::Transferred {

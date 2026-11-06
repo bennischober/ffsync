@@ -2,6 +2,29 @@
 
 All notable changes to ffsync are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `chunking::REGION_SIZE`: the 256 MiB region size as a public protocol constant.
+- **COMMIT_ACK reports what the receiver did** (D24). The frame now carries one outcome byte (target written or not), and the sender takes its InSync/Transferred label from it instead of predicting. No version bump: released senders ignore the byte, and with a pre-1.4 receiver (empty COMMIT_ACK) the sender keeps predicting as before. Library: `message::encode_commit_ack`, `message::decode_commit_ack`.
+
+### Fixed
+
+- **`receive --from <old>` could leave the target unwritten.** When the old file already matched the sender's file (same size and mtime, or same content under `--checksum`), both peers reported InSync and the target was never written. The receiver's HELLO now describes its target, and a `--from` old file never takes the no-rewrite shortcut.
+- **Resume after the sender's file shifted.** A leftover temp whose chunks belong at other offsets (bytes inserted or removed between attempts) failed its own read verification, because an earlier write overwrote a chunk that a later one still needed. The attempt was wasted and the temp deleted. Moved temp chunks are now stashed before any write, so the resume converges in one attempt. Temp chunks that are already in place are verified and no longer rewritten.
+- A complete resume temp no longer makes the sender report InSync while the receiver commits the temp. Both now report Transferred.
+- The sender's summary now matches the receiver's in two more cases: `receive --from` when the target already exists at the sender's size, and an empty sender file truncating a non-empty target. The sender used to report InSync while the receiver wrote the target. Both peers need 1.4.0 for this.
+
+### Changed
+
+- **Scanning small files uses far fewer threads.** Every file scan started one chunker thread and one hash worker per core, so a `--parallel` tree of small files spawned about 2×cores threads per file on every connection. Thread counts now scale with the file size (one chunker per 256 MiB region, one hash worker per 4 MiB), capped at the configured worker count. Chunk layouts are unchanged. In a local measurement, scanning 2000 files of 8 KiB each took 0.5 s instead of 3.5 s.
+- The D22 rename census loads and validates each source index once per conversation instead of twice.
+
+### Deprecated
+
+- `PipelineConfig::read_buffer_size` is ignored. The region size is part of the chunk layout (a chunk boundary is forced at every multiple of it), so a non-default value produced chunks that no other peer could match. It is now the fixed protocol constant `chunking::REGION_SIZE`. The field will be removed in 2.0.
+
 ## [1.3.0] - 2026-11-06
 
 A hardening and performance release from a full code review. The wire protocol stays at v4 and 1.2.x peers interoperate. One on-disk change: resume temps are now named `<file>.ffsync-tmp`, so a partial transfer left by 1.2.x restarts instead of resuming (its old temp is cleaned up as an orphan).
@@ -235,6 +258,7 @@ First working implementation: single-file sync between two peers over TCP.
 - The chunk-tree root (file identity for verification and change detection) is a domain-separated BLAKE3 over the ordered chunk-hash list — not the standard BLAKE3 file hash (its internal tree is over fixed 1024-byte blocks, not CDC chunk boundaries).
 - rsync remains faster on delta ratio for small localized edits (fine-grained fixed blocks); ffsync's advantage is the parallel scan (~3.8x cold start on the 72.7 GiB reference file) and resumability.
 
+[Unreleased]: https://github.com/bennischober/ffsync/compare/v1.3.0...HEAD
 [1.3.0]: https://github.com/bennischober/ffsync/releases/tag/v1.3.0
 [1.2.0]: https://github.com/bennischober/ffsync/releases/tag/v1.2.0
 [1.1.0]: https://github.com/bennischober/ffsync/releases/tag/v1.1.0

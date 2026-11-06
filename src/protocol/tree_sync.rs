@@ -58,16 +58,6 @@ enum ConvEvent {
     Done(#[allow(dead_code)] String, SyncOutcome),
 }
 
-/// Clones the pipeline config (worker threads need their own value; the
-/// config is a cheap plain-data struct).
-fn pipeline_clone(p: &crate::chunking::PipelineConfig) -> crate::chunking::PipelineConfig {
-    crate::chunking::PipelineConfig {
-        read_buffer_size: p.read_buffer_size,
-        chunk_queue_size: p.chunk_queue_size,
-        hash_workers: p.hash_workers,
-    }
-}
-
 /// Tree-level progress events (bridged to the CLI display).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeProgress {
@@ -638,7 +628,7 @@ where
             let queue = std::sync::Arc::clone(&queue);
             let cursor = std::sync::Arc::clone(&cursor);
             let stop = std::sync::Arc::clone(&stop);
-            let pipeline = pipeline_clone(pipeline);
+            let pipeline = pipeline.clone();
             let tx = progress_tx.clone();
             let connect_index = w;
             handles.push(std::thread::spawn(move || {
@@ -1322,7 +1312,7 @@ where
                 eager,
                 census: std::sync::Arc::clone(&census),
                 peer_manifest: std::sync::Arc::clone(&peer_manifest),
-                pipeline: pipeline_clone(pipeline),
+                pipeline: pipeline.clone(),
             });
             let serve_connection = {
                 let shared = std::sync::Arc::clone(&shared);

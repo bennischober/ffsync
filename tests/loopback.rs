@@ -1212,9 +1212,9 @@ mod tests {
         let target = fx.path("target.bin");
         create_file(&target, &new_data);
 
-        // Sync where the sender's content equals the OLD file (so the plan
-        // is empty relative to the from-file's manifest), receiver converges
-        // to... nothing (already InSync relative to from.bin).
+        // Sync where the sender's content equals the OLD file: every chunk
+        // is Local, and the target is still rewritten from from.bin (the
+        // from-file matching the sender says nothing about the target).
         let (s, r) = run_sync(
             SendRequest {
                 path: from_file.clone(),
@@ -1238,6 +1238,10 @@ mod tests {
         );
         let _s = s.expect("sender ok");
         let _r = r.expect("receiver ok");
+        assert!(
+            read_file(&target) == old_data,
+            "target converges to the sender's file"
+        );
 
         // The from-file's index is fine (it describes from.bin), but the
         // TARGET must not have an index written from another file's content.
@@ -1727,6 +1731,280 @@ mod tests {
             idx.validate(&target, idx.cdc).is_some(),
             "and it validates against the target"
         );
+    }
+
+    #[test]
+    fn resume_with_shifted_temp_content_converges() {
+        // The sender's file changed between attempts: 64 KiB were inserted
+        // at the front, so every chunk the leftover temp holds belongs
+        // 64 KiB further right. The receiver reads those chunks from the
+        // temp and writes them into the same temp. Written in plan order,
+        // the first move clobbered the source of a later one; the read
+        // verify caught it (HashMismatch, temp removed) and the whole
+        // attempt was wasted. Moved temp chunks are now stashed before any
+        // write, so the resume converges in one attempt.
+        use ffsync::protocol::sync::SyncOutcome;
+        let fx = Fixture::new("resumeshift");
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect()
+        };
+        let body = noise(3 * 1024 * 1024);
+        let mut src_data = noise(64 * 1024);
+        src_data.extend_from_slice(&body);
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+        create_file(&target, &noise(512 * 1024));
+        // The previous attempt's temp: the old sender content at its old
+        // offsets.
+        let temp_path = ffsync::reconstruction::Reconstructor::temp_path_for(&target);
+        create_file(&temp_path, &body);
+
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: false,
+                tree: false,
+                dry_run: false,
+                eager: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: false,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager: false,
+                extra_sources: Vec::new(),
+            },
+        );
+        let s = s.expect("sender ok");
+        let r = r.expect("receiver ok");
+        match (&s, &r) {
+            (SyncOutcome::Transferred { bytes, .. }, SyncOutcome::Transferred { .. }) => assert!(
+                (*bytes as usize) < src_data.len() / 2,
+                "the temp's chunks must be reused, not re-sent: {bytes} bytes"
+            ),
+            other => panic!("expected a transfer on both sides: {other:?}"),
+        }
+        assert!(read_file(&target) == src_data, "resume converges");
+        assert!(!temp_path.exists(), "temp committed");
+    }
+
+    #[test]
+    fn from_file_equal_to_sender_still_writes_the_target() {
+        // `receive target --from old` where old already IS the sender's
+        // file: the receiver's HELLO described old.bin, so the §4 fast
+        // path (same size + mtime) or, under --checksum, the no-rewrite
+        // shortcut reported InSync and the target was never created.
+        // With the target present at the sender's size, the sender's
+        // InSync prediction (the plan reproduces the manifest, the HELLO
+        // size matches) could not see the --from source and disagreed
+        // with the receiver's Transferred; the D24 COMMIT_ACK outcome byte
+        // makes the receiver's answer decide.
+        use ffsync::protocol::sync::SyncOutcome;
+        for target_exists in [false, true] {
+            for checksum in [false, true] {
+                let case = format!("target_exists={target_exists} checksum={checksum}");
+                let fx = Fixture::new(&format!(
+                    "fromeq{}{}",
+                    if target_exists { "t" } else { "" },
+                    if checksum { "ck" } else { "" }
+                ));
+                let data: Vec<u8> = (0..300 * 1024u32)
+                    .map(|i| (i as u8).wrapping_mul(29).wrapping_add((i / 3000) as u8))
+                    .collect();
+                create_file(fx.source(), &data);
+                // Same bytes and same mtime as the sender's file.
+                let from_file = fx.path("old.bin");
+                std::fs::copy(fx.source(), &from_file).unwrap();
+                let mtime = std::fs::metadata(fx.source()).unwrap().modified().unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&from_file)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+                let target = fx.path("target.bin");
+                if target_exists {
+                    // Same size, different content, backdated so the §4
+                    // fast path cannot fire on the target's metadata.
+                    create_file(&target, &vec![0x3Cu8; data.len()]);
+                    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&target)
+                        .unwrap()
+                        .set_modified(old)
+                        .unwrap();
+                }
+
+                let (s, r) = run_sync(
+                    SendRequest {
+                        path: fx.source().to_path_buf(),
+                        display_path: "source.bin".into(),
+                        mtime: None,
+                        force_checksum: checksum,
+                        tree: false,
+                        dry_run: false,
+                        eager: false,
+                    },
+                    ReceiveRequest {
+                        path: target.clone(),
+                        local_source: from_file.clone(),
+                        force_checksum: checksum,
+                        tree: false,
+                        apply_mode: None,
+                        apply_mtime: None,
+                        eager: false,
+                        extra_sources: Vec::new(),
+                    },
+                );
+                let s = s.expect("sender ok");
+                let r = r.expect("receiver ok");
+                assert!(
+                    matches!(s, SyncOutcome::Transferred { bytes: 0, .. })
+                        && matches!(r, SyncOutcome::Transferred { .. }),
+                    "{case}: both peers report the local rewrite: {s:?} / {r:?}"
+                );
+                assert!(read_file(&target) == data, "{case}: target written");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_sender_file_reports_the_same_outcome_on_both_peers() {
+        // An empty sender file yields an empty plan, which the sender
+        // labelled InSync while the receiver committed an empty file
+        // (truncating its old content) and reported Transferred. D24:
+        // the COMMIT_ACK outcome byte carries the receiver's answer.
+        use ffsync::protocol::sync::SyncOutcome;
+        let fx = Fixture::new("emptysrc");
+        create_file(fx.source(), &[]);
+        let target = fx.path("target.bin");
+        create_file(&target, &vec![0x77u8; 100 * 1024]);
+
+        let (s, r) = run_sync(
+            SendRequest {
+                path: fx.source().to_path_buf(),
+                display_path: "source.bin".into(),
+                mtime: None,
+                force_checksum: false,
+                tree: false,
+                dry_run: false,
+                eager: false,
+            },
+            ReceiveRequest {
+                path: target.clone(),
+                local_source: target.clone(),
+                force_checksum: false,
+                tree: false,
+                apply_mode: None,
+                apply_mtime: None,
+                eager: false,
+                extra_sources: Vec::new(),
+            },
+        );
+        let s = s.expect("sender ok");
+        let r = r.expect("receiver ok");
+        assert!(
+            matches!(
+                s,
+                SyncOutcome::Transferred {
+                    bytes: 0,
+                    chunks: 0
+                }
+            ) && matches!(
+                r,
+                SyncOutcome::Transferred {
+                    bytes: 0,
+                    chunks: 0
+                }
+            ),
+            "outcomes must agree: {s:?} / {r:?}"
+        );
+        assert!(read_file(&target).is_empty(), "target truncated");
+    }
+
+    #[test]
+    fn complete_resume_temp_reports_the_same_outcome_on_both_peers() {
+        // The leftover temp already holds the sender's whole file. The
+        // receiver commits it (a real change to the target), but the
+        // sender saw an all-Local plan that lined up with the streamed
+        // temp chunks and reported InSync. Both now say Transferred.
+        use ffsync::protocol::sync::SyncOutcome;
+        for target_exists in [false, true] {
+            let fx = Fixture::new(if target_exists {
+                "fulltempold"
+            } else {
+                "fulltemp"
+            });
+            let data: Vec<u8> = (0..400 * 1024u32)
+                .map(|i| (i as u8).wrapping_mul(41).wrapping_add((i / 5000) as u8))
+                .collect();
+            create_file(fx.source(), &data);
+            let target = fx.path("target.bin");
+            if target_exists {
+                // Same size, different content: only FLAG_RESUMING tells
+                // the sender that the receiver will commit the temp.
+                create_file(&target, &vec![0x5Au8; data.len()]);
+                // Backdated: an equal mtime (same clock tick on Windows)
+                // would take the §4 fast path before any plan exists.
+                let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&target)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+            let temp_path = ffsync::reconstruction::Reconstructor::temp_path_for(&target);
+            create_file(&temp_path, &data);
+
+            let (s, r) = run_sync(
+                SendRequest {
+                    path: fx.source().to_path_buf(),
+                    display_path: "source.bin".into(),
+                    mtime: None,
+                    force_checksum: false,
+                    tree: false,
+                    dry_run: false,
+                    eager: false,
+                },
+                ReceiveRequest {
+                    path: target.clone(),
+                    local_source: target.clone(),
+                    force_checksum: false,
+                    tree: false,
+                    apply_mode: None,
+                    apply_mtime: None,
+                    eager: false,
+                    extra_sources: Vec::new(),
+                },
+            );
+            let s = s.expect("sender ok");
+            let r = r.expect("receiver ok");
+            assert!(
+                matches!(s, SyncOutcome::Transferred { bytes: 0, .. })
+                    && matches!(r, SyncOutcome::Transferred { .. }),
+                "target_exists={target_exists}: outcomes must agree: {s:?} / {r:?}"
+            );
+            assert!(
+                read_file(&target) == data,
+                "target_exists={target_exists}: converges"
+            );
+            assert!(!temp_path.exists());
+        }
     }
 
     #[test]

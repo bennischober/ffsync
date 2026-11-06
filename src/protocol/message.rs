@@ -386,8 +386,8 @@ impl Message for PlanEntry {
     }
 }
 
-/// Frames with empty payloads: MANIFEST_DONE, PLAN_DONE, COMMIT_ACK,
-/// NOT_MODIFIED.
+/// Frames with empty payloads: MANIFEST_DONE, PLAN_DONE, NOT_MODIFIED (and
+/// COMMIT_ACK from pre-D24 receivers — see [`encode_commit_ack`]).
 pub fn encode_empty(ftype: u8) -> io::Result<Frame> {
     Ok(Frame::new(ftype, Vec::new()))
 }
@@ -408,6 +408,40 @@ pub fn read_empty(inp: &mut impl Read, ftype: u8) -> Result<(), MessageError> {
 pub fn read_typed<M: Message>(inp: &mut impl Read) -> Result<M, MessageError> {
     let frame = read_frame_or_error(inp)?;
     M::from_frame(frame)
+}
+
+/// COMMIT_ACK outcome byte (§8, D24): the receiver did not write the
+/// target's content (it already was the sender's file).
+pub const COMMIT_UNCHANGED: u8 = 0;
+/// COMMIT_ACK outcome byte (§8, D24): the receiver wrote the target.
+pub const COMMIT_WRITTEN: u8 = 1;
+
+/// COMMIT_ACK frame (§8, D24): one outcome byte saying whether the receiver
+/// wrote the target, so the sender's label reports what the receiver did
+/// instead of predicting it. Pre-D24 senders read only the frame type.
+pub fn encode_commit_ack(written: bool) -> io::Result<Frame> {
+    let byte = if written {
+        COMMIT_WRITTEN
+    } else {
+        COMMIT_UNCHANGED
+    };
+    Ok(Frame::new(framing::T_COMMIT_ACK, vec![byte]))
+}
+
+/// Decodes a COMMIT_ACK payload (§8, D24): `Some(written)` for a one-byte
+/// outcome, `None` for the empty payload of a pre-D24 receiver (the sender
+/// then falls back to predicting the label). Any other payload is
+/// malformed.
+pub fn decode_commit_ack(payload: &[u8]) -> Result<Option<bool>, MessageError> {
+    match payload {
+        [] => Ok(None),
+        [COMMIT_UNCHANGED] => Ok(Some(false)),
+        [COMMIT_WRITTEN] => Ok(Some(true)),
+        [_] => Err(MessageError::Malformed("unknown COMMIT_ACK outcome")),
+        _ => Err(MessageError::Malformed(
+            "COMMIT_ACK payload must be 0 or 1 byte",
+        )),
+    }
 }
 
 /// VERIFY frame payload: the sender's 32-byte root hash.
@@ -942,6 +976,26 @@ mod tests {
         frame.encode(&mut buf).unwrap();
         let mut cursor = Cursor::new(buf);
         assert!(read_empty(&mut cursor, framing::T_MANIFEST_DONE).is_err());
+    }
+
+    #[test]
+    fn commit_ack_outcome_round_trip() {
+        for written in [false, true] {
+            let frame = encode_commit_ack(written).unwrap();
+            assert_eq!(frame.ftype, framing::T_COMMIT_ACK);
+            assert_eq!(decode_commit_ack(&frame.payload).unwrap(), Some(written));
+        }
+        // Pre-D24 receivers send an empty COMMIT_ACK: no outcome.
+        assert_eq!(decode_commit_ack(&[]).unwrap(), None);
+        // Strict: unknown outcome values and longer payloads are rejected.
+        assert!(matches!(
+            decode_commit_ack(&[2]),
+            Err(MessageError::Malformed(_))
+        ));
+        assert!(matches!(
+            decode_commit_ack(&[1, 0]),
+            Err(MessageError::Malformed(_))
+        ));
     }
 
     #[test]

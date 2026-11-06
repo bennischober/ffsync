@@ -74,5 +74,6 @@ fn decoders_survive_adversarial_payloads() {
             let _ = TreeWorker::from_frame(f.clone());
             let _ = read_error_payload(&f);
         }
+        let _ = decode_commit_ack(g); // D24 outcome byte
     }
 }

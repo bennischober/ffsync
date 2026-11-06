@@ -148,8 +148,9 @@ pre-existing.
 - `src/chunking/` — the core data pipeline. The public API is re-exported from
   `mod.rs`.
   - `pipeline.rs` — `process_file()` is the entry point: it memory-maps the
-    file (`memmap2`), spawns one chunker thread per core (each striding over
-    256 MiB regions), and pushes `(offset, length)` work items through bounded
+    file (`memmap2`), spawns chunker threads striding over 256 MiB regions
+    (`REGION_SIZE`, a protocol constant — Protocol.md §4; thread counts are
+    size-aware and capped at the core count), and pushes `(offset, length)` work items through bounded
     `crossbeam` channels to hash-worker threads, which slice the mmap directly.
     Returns a `Receiver<ChunkEvent>`.
   - `chunker.rs` — `Chunker` trait with two implementations: `FixedChunker`
@@ -393,6 +394,12 @@ pre-existing.
   remaining manifest. Held bytes are capped at `EAGER_BUF_CAP` (= the
   receiver's cap). Do not "optimize" the writes back into the manifest
   loop; `eager_does_not_deadlock_on_small_transport_buffers` pins it.
+- COMMIT_ACK carries the receiver's outcome byte (D24, §8): every
+  receiver COMMIT_ACK send must pass `encode_commit_ack(written)` with
+  `written` matching the label it returns (Transferred ⇔ true). The
+  sender's layout-reproduction check is only the fallback for pre-D24
+  receivers (empty payload) — do not "simplify" it away, and do not let
+  it override a present byte.
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
 - The identity file (`identity.bin`) holds the private key: `0600` on unix,
