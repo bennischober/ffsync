@@ -164,6 +164,13 @@ peer's final frame stays readable; later writes report the failure.
    no-op (v0.2, found by the D15 index tests; modern rsync compares
    sub-second mtimes for the same reason). `--checksum` mode clears this
    flag and forces full verification.
+   **Comparison granularity (D23):** the nanosecond fields are compared
+   at **100 ns** (`nanos / 100` equal), not bit-exactly. NTFS stores
+   mtimes in 100 ns ticks, so a Linux sender's `…789` ns arrives on a
+   Windows receiver as `…700` after the §16.6 mtime write — an exact
+   compare would re-check that file on every session forever. 100 ns is
+   the finest granularity any supported platform stores, so this never
+   loosens a comparison any filesystem could actually distinguish.
 
 Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2, implemented: the
 sender's opt-in offer, mirrored by a receiver that also opted in), bit 2 `resuming` (informational, §10), bit 3
@@ -594,8 +601,9 @@ metadata fast path on any file), bit 1 `no_delete` (§16.5).
 Both peers, after exchanging TREE_BEGINs, compute locally:
 
 - **skip**: same rel_path on both sides, both files, same size, same
-  mtime secs + nanos (and neither side set `checksum`) — exactly the §4
-  fast-path rule, applied per file from metadata alone. Also: same path
+  mtime secs + nanos at 100 ns granularity (and neither side set
+  `checksum`) — exactly the §4 fast-path rule, applied per file from
+  metadata alone. Also: same path
   and both dirs.
 - **sync**: same path, both files, size or mtime differs (or `checksum`
   set) → per-file conversation (its VERIFY is the medium diff; the
@@ -691,6 +699,26 @@ the TREE_END reply.
 
 Delete safety is bounded by the same trust decision as every write in the
 session: the receiver already pinned the sender's fingerprint (D16).
+
+**Case-insensitive receivers (D23).** Triage compares paths
+byte-exactly, but on a case-insensitive filesystem (NTFS, APFS default)
+`README.md` and `Readme.md` are one file. A sender-side case-only rename
+therefore triages as *transfer `Readme.md`* + *delete `README.md`*: the
+conversation overwrites the shared file and the delete pass then removes
+it through the old spelling — the just-synced file is lost. The receiver
+guards both halves locally (no wire change, triage untouched):
+
+- **Delete pass:** a delete target whose case-folded path matches a
+  sender path **and** is the same filesystem entry (dev+inode on unix,
+  canonical path elsewhere) is skipped — it is not counted, and dry-run
+  does not report it. The fold only nominates candidates; the identity
+  check decides, so a case-sensitive receiver with two genuinely
+  distinct entries deletes as before.
+- **Directories:** before creating a sender directory whose case-variant
+  already exists as the same entry, the receiver renames the variant to
+  the sender's spelling, so files under it keep their path.
+- **Ambiguous sender trees:** sender paths differing only in case cannot
+  coexist on such a receiver; the receiver warns (last writer wins).
 
 ### 16.6 mtime preservation (v3, load-bearing for trees)
 

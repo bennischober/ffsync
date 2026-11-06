@@ -1119,3 +1119,52 @@ built from the receiver's own disk — nothing to guard on the wire).
 documentation amendment — the manifest's meaning "I have these chunks"
 is unchanged; where the bytes live has always been the receiver's
 business, per the D10 union-manifest precedent).
+
+## D23 — mtime granularity and case-insensitive receivers (2026-11-06)
+
+**Problem.** Two cross-platform issues in the metadata fast path and the
+tree delete pass, found in the 2026-11 code review:
+
+1. **mtime precision.** NTFS stores mtimes in 100 ns ticks. A Linux
+   sender's nanosecond mtime (`…789`) is written to a Windows receiver
+   at commit (§16.6) and reads back as `…700`. The exact-nanosecond
+   compare (§4, §16.3) then never matches: every Linux→Windows tree
+   sync re-checks every synced file, forever (correct, but the fast path
+   is dead).
+2. **Case-only renames lose data.** Triage compares paths byte-exactly.
+   On a case-insensitive receiver, a sender rename `README.md` →
+   `Readme.md` triages as transfer + delete of what is the same file;
+   the delete pass runs last and removes the freshly synced file.
+   Reproduced by `tree_case_only_rename_keeps_synced_content` (the
+   receiver root ends up empty on the pre-fix code).
+
+**Decision.**
+
+1. Compare mtimes at **100 ns** (`tree::mtimes_match`, used by both the
+   single-file fast path and tree triage). 100 ns is the finest
+   granularity any supported platform stores, so nothing a filesystem
+   can distinguish is folded together. The index validation (D15) keeps
+   its exact compare — both sides of it are the same local filesystem.
+   Coarser filesystems (HFS+ 1 s, FAT 2 s) still re-check; that costs a
+   VERIFY, never correctness, and widening the window further would let
+   same-tick rewrites pass as unchanged.
+2. **Receiver-local case guard**, no wire change: the delete pass skips
+   targets that case-fold to a sender path *and* are the same
+   filesystem entry (`tree::same_file`); a sender directory whose
+   case-variant exists as the same entry is renamed to the sender's
+   spelling before use; sender trees with case-only collisions get a
+   warning. The fold (`str::to_lowercase`) only nominates candidates —
+   identity decides — so the guard is inert on case-sensitive
+   filesystems and Unicode folding differences cost at most a missed
+   optimisation, never a wrong skip.
+
+**Rejected.** Folding case in triage itself: triage must stay identical
+on both peers, and the receiver's filesystem semantics are not the
+sender's business (a Linux sender may legitimately hold both spellings).
+Probing case sensitivity per directory up front: the identity check per
+candidate is cheaper and exact.
+
+**Also.** `.ffsync-index-tmp` (the D15 index writer's temp) joined the
+sidecar filter (`tree::is_sidecar`). A writer killed mid-index left the
+temp in the *source* tree, where the next index write consumed it and
+the sender aborted with "sender file vanished".

@@ -475,8 +475,10 @@ where
     if trust
         && hello_size == peer.file_size
         && hello_mtime != 0
-        && hello_mtime == peer.file_mtime
-        && hello_mtime_nanos == peer.file_mtime_nanos
+        && crate::tree::mtimes_match(
+            (hello_mtime, hello_mtime_nanos),
+            (peer.file_mtime, peer.file_mtime_nanos),
+        )
     {
         message::encode_empty(framing::T_NOT_MODIFIED)?.encode(stream)?;
         stream.flush()?;

@@ -279,8 +279,17 @@ pre-existing.
 - Sub-second mtime is load-bearing in two places: the index validation and
   the §4 wire fast path (HELLO `file_mtime_nanos`, protocol v2). Whole-second
   comparisons let a same-second same-size rewrite pass as unchanged — a
-  silent wrong-content sync. Any new metadata-based fast path must compare
-  at the finest available granularity.
+  silent wrong-content sync. Peer-vs-peer comparisons (§4 fast path, tree
+  triage) go through `tree::mtimes_match`, which compares at **100 ns** —
+  NTFS's tick; an exact-ns compare made every Linux→Windows sync re-check
+  forever (D23). The index validation stays exact (same local FS). Never
+  widen beyond 100 ns, never compare whole seconds.
+- Case-insensitive receivers (D23): triage compares paths byte-exactly by
+  design (identical on both peers); the receiver's delete pass and
+  CreateDir branch guard case-only renames with `tree::case_fold`
+  (nominates) + `tree::same_file` (decides). Do not drop the identity
+  check — on a case-sensitive FS two spellings are two files and the
+  delete must run.
 - mtime preservation on commit (§16.6, v3) is what makes tree syncs skip:
   the receiver sets the target's mtime to the sender's *before* writing the
   D15 index (order: rename → set_modified → stat → write_index). Reversing
@@ -318,7 +327,8 @@ pre-existing.
   ancestor junction on Windows needs no privilege and was a plausible
   infinite loop); file symlinks are followed, dangling ones warn+skip.
   Classification goes through symlink metadata, not the target's.
-- Tree manifests must exclude `*.ffsync-index` / `*.ffsync-tmp` — they are
+- Tree manifests must exclude `*.ffsync-index` / `*.ffsync-index-tmp` /
+  `*.ffsync-tmp` (`tree::is_sidecar`) — they are
   ffsync's own bookkeeping; syncing them would sync internal state and
   desync warm starts (an index written at commit changes mtime → re-sync
   loop). The scan filter in `src/tree.rs` is the single place this lives.
