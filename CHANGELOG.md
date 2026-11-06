@@ -4,6 +4,126 @@ All notable changes to ffsync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-06
+
+A hardening and performance release from a full code review. The wire
+protocol stays at v4 and 1.2.x peers interoperate. One on-disk change:
+resume temps are now named `<file>.ffsync-tmp`, so a partial transfer
+left by 1.2.x restarts instead of resuming (its old temp is cleaned up as
+an orphan).
+
+### Added
+
+- **`receive --bind <ip>`** (default `0.0.0.0`; `--bind ::` for IPv6).
+  The listening line prints the address it actually bound. The QUIC
+  client resolves DNS names and IPv6 literals and binds the matching
+  address family, so it can reach IPv6 peers.
+- `protocol::BufStream`: 64 KiB read and write buffers on every
+  connection (control and workers, TCP/TLS/QUIC). Small frames go out as
+  one write instead of three.
+- Library additions: `tree::mtimes_match`, `tree::is_sidecar`,
+  `tree::case_fold`, `tree::same_file`, `index::remove_orphan_indexes`,
+  `Reconstructor::set_final_len`, `message::split_data_payload`, and the
+  provided `FileExt` methods `read_full_at` / `read_exact_at` /
+  `write_all_at`.
+
+### Fixed
+
+- **Data loss on case-only renames (D23).** On a case-insensitive
+  receiver (NTFS, default APFS), renaming `README.md` → `Readme.md` (or a
+  directory `docs` → `Docs`) synced the file and then deleted it through
+  its old spelling in the delete pass. The receiver now keeps any target
+  that is the same filesystem entry as a sender path, renames
+  case-variant directories to the sender's spelling, and warns about
+  sender paths that differ only in case.
+- **`--eager` deadlock on real transports.** The eager sender wrote DATA
+  while the receiver was still streaming its manifest, which hung large
+  modified files over TCP. Offers are now prepared during the manifest
+  exchange and sent after MANIFEST_DONE, capped at the receiver's 64 MiB
+  buffer.
+- **Hostile-peer input.** A HELLO with out-of-range CDC parameters could
+  panic the receiver in release builds. Plan entries are now
+  bounds-checked on arrival, before any allocation is sized from them
+  (length, overflowing offsets, entry count). Sender memory during the
+  manifest exchange stays O(own chunks) whatever the peer streams.
+- **Commit metadata (§16.6/§16.9, D18).**
+  - Windows receivers marked *writable* sender modes read-only (the
+    mapping was inverted).
+  - A read-only sender mode failed the sync: the mode was applied
+    before the mtime, so the mtime write was refused. The order is now
+    mtime, then mode, and both writes are best-effort.
+  - Pre-1970 mtimes re-synced on every session.
+  - Empty files are committed through temp + rename like every other
+    file.
+- **Identity and pins.**
+  - Any read error on `identity.bin` other than "not found" (permission
+    denied, sharing violation) silently regenerated the key and broke
+    every peer's pin. It is now reported instead.
+  - On unix the key file is created `0600`; it was briefly
+    world-readable.
+  - Racing first runs agree on a single identity.
+  - `pins.conf` rewrites are durable (fsynced).
+  - `untrust` keeps comments and labels.
+- **Parallel worker connections (§16.8)** are pinned to the control
+  connection's peer. Another pinned peer can no longer inject
+  conversations into a running session.
+- **Parallel temp collision.** `a.mkv` and `a.mp4` shared one temp
+  (`a.ffsync-tmp`), so concurrent workers overwrote each other's temp.
+  The temp suffix is now appended (`a.mkv.ffsync-tmp`), like the index
+  suffix.
+- **Tree delete pass.**
+  - A directory holding orphan sidecars or excluded files failed the
+    session after a complete transfer. Such directories are now kept
+    instead.
+  - A real failure in the delete pass now reports `ERROR` instead of a
+    dangling TREE_END.
+  - The delete guard no longer protects a *file* named like an excluded
+    directory pattern.
+- **Stuck resumes.**
+  - A leftover temp no longer blocks a target that already matches.
+  - A resume after the sender's file *shrank* trims the temp before
+    VERIFY.
+  - The receiver writes all Local chunks before any Remote chunk (D10
+    locals-first), so a disconnect leaves a temp that is mostly real
+    bytes.
+- **Linux → Windows tree syncs re-checked every file.** NTFS stores
+  mtimes in 100 ns ticks, so comparisons now happen at 100 ns
+  granularity. The D15 index keeps its exact compare.
+- `*.ffsync-index-tmp` files (from a killed index writer) leaked into
+  tree manifests and aborted the next session.
+- `--dry-run` single-file receives no longer remove orphan indexes
+  (zero-mutation contract), and the dry-run report counts same-second
+  rewrites.
+- The index decoder refuses chunk lists that do not partition the file.
+- Short positional reads and writes are retried instead of trusted.
+- Non-UTF-8 names are skipped with a warning on both peers instead of
+  being renamed lossily.
+- The D22 rename census is deterministic and never offers a file that
+  has a conversation in flight.
+- The layout-reproduction (InSync) checks compare chunk hashes, and both
+  peers report the same outcome when resume or census entries were
+  streamed.
+
+### Changed
+
+- **Parallel tree sender:** it now pulls from one shared work queue
+  instead of fixed round-robin partitions, so one large file no longer
+  idles the other K−1 connections. Progress counts are session-wide and
+  forwarded live.
+- **Performance:**
+  - The rename census lookup is O(same-size files) instead of O(files)
+    per conversation.
+  - Receiver workers share the peer manifest instead of deep-copying it.
+  - Orphan-index cleanup runs once per directory instead of once per
+    file.
+  - DATA payloads reuse the frame buffer.
+  - The exclude matcher no longer allocates per pattern.
+
+### Deprecated
+
+- `ChunkEvent::Done`: it was never sent, and completion is the channel
+  disconnecting. It will be removed in 2.0.
+
 ## [1.2.0] - 2026-10-24
 
 ### Added
