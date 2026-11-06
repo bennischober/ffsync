@@ -392,12 +392,19 @@ impl ExcludePattern {
 
     /// Does this pattern match one tree entry?
     pub fn matches(&self, rel_path: &str, kind: EntryKind) -> bool {
+        let path_segs: Vec<&str> = rel_path.split('/').collect();
+        self.matches_segs(&path_segs, kind)
+    }
+
+    /// [`matches`](Self::matches) on a pre-split path: an [`ExcludeSet`]
+    /// splits once per entry and evaluates every pattern on the same
+    /// slice (one allocation per entry, not one per pattern).
+    fn matches_segs(&self, path_segs: &[&str], kind: EntryKind) -> bool {
         if self.dir_only && kind != EntryKind::Dir {
             return false;
         }
-        let path_segs: Vec<&str> = rel_path.split('/').collect();
         if self.anchored {
-            match_segs(&self.segs, &path_segs)
+            match_segs(&self.segs, path_segs)
         } else {
             // Unanchored: match the basename at any depth.
             (0..path_segs.len()).any(|start| match_segs(&self.segs, &path_segs[start..]))
@@ -500,13 +507,21 @@ fn match_segs(segs: &[PatternSeg], path: &[&str]) -> bool {
 /// Classic glob match of one sub-pattern against one path segment
 /// (characters only — `*` never crosses `/` because segments are split).
 /// Iterative with single-star backtracking (consecutive Stars collapse at
-/// parse time, so one backtrack point suffices).
+/// parse time, so one backtrack point suffices). Walks `text` by byte
+/// offset (always on a char boundary) — no per-call `Vec<char>`.
 fn match_parts(parts: &[Part], text: &str) -> bool {
-    let text: Vec<char> = text.chars().collect();
+    // Width of the char starting at byte offset `at` (callers keep `at` on
+    // a boundary and below `text.len()`).
+    let width = |at: usize| text[at..].chars().next().map_or(1, char::len_utf8);
     let (mut pi, mut ti) = (0usize, 0usize);
-    // Backtrack point: (part index OF the Star, chars it has swallowed so far).
+    // Backtrack point: (part index OF the Star, byte offset where the rest
+    // of the pattern restarts — everything before it is swallowed).
     let mut star: Option<(usize, usize)> = None;
     while ti < text.len() {
+        let c = text[ti..]
+            .chars()
+            .next()
+            .expect("ti is below len, on a boundary");
         let advanced = if pi < parts.len() {
             match &parts[pi] {
                 Part::Star => {
@@ -518,27 +533,26 @@ fn match_parts(parts: &[Part], text: &str) -> bool {
                 }
                 Part::One => {
                     pi += 1;
-                    ti += 1;
+                    ti += c.len_utf8();
                     true
                 }
-                Part::Lit(c) => {
-                    if text[ti] == *c {
+                Part::Lit(l) => {
+                    if c == *l {
                         pi += 1;
-                        ti += 1;
+                        ti += c.len_utf8();
                         true
                     } else {
                         false
                     }
                 }
                 Part::Class { negated, items } => {
-                    let c = text[ti];
                     let hit = items.iter().any(|it| match it {
                         ClassItem::Char(x) => *x == c,
                         ClassItem::Range(lo, hi) => c >= *lo && c <= *hi,
                     });
                     if hit != *negated {
                         pi += 1;
-                        ti += 1;
+                        ti += c.len_utf8();
                         true
                     } else {
                         false
@@ -554,10 +568,10 @@ fn match_parts(parts: &[Part], text: &str) -> bool {
         match star {
             // Retry: let the last seen Star swallow one more character.
             Some((sp, st)) => {
-                let st = st + 1;
-                if st > text.len() {
+                if st >= text.len() {
                     return false;
                 }
+                let st = st + width(st);
                 star = Some((sp, st));
                 pi = sp + 1;
                 ti = st;
@@ -630,8 +644,12 @@ impl ExcludeSet {
     /// included. For negation-free sets this is exactly the old any-match
     /// behavior (every pattern excludes, so the first match excludes).
     fn excluded(&self, rel_path: &str, kind: EntryKind) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let path_segs: Vec<&str> = rel_path.split('/').collect();
         for p in &self.patterns {
-            if p.matches(rel_path, kind) {
+            if p.matches_segs(&path_segs, kind) {
                 return !p.is_negated();
             }
         }
@@ -912,6 +930,21 @@ mod tests {
         assert!(m("node_modules", "node_modules", EntryKind::Dir));
         assert!(m("node_modules", "a/node_modules", EntryKind::Dir));
         assert!(!m("node_modules", "node_modules/x", EntryKind::File)); // dir itself, not contents
+    }
+
+    #[test]
+    fn exclude_patterns_match_multibyte_chars_as_one() {
+        // `?` and class items consume one CHAR, not one byte; `*` backtracks
+        // by whole chars (the matcher walks byte offsets on boundaries).
+        let f = EntryKind::File;
+        assert!(m("caf?.txt", "café.txt", f));
+        assert!(!m("caf??.txt", "café.txt", f));
+        assert!(m("*é*", "résumé", f));
+        assert!(m("[äöü]*", "über", f));
+        assert!(!m("[!äöü]*", "über", f));
+        assert!(m("*.日本", "x.日本", f));
+        assert!(m("*本", "日本", f));
+        assert!(!m("*本?", "日本", f));
     }
 
     #[test]

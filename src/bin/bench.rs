@@ -416,7 +416,7 @@ fn flip_middle_regions(path: &Path, size: u64, rng: &mut impl Rng) -> io::Result
     let file = OpenOptions::new().write(true).open(path)?;
     for pos in [size * 45 / 100, size * 55 / 100] {
         rng.fill_bytes(&mut buf);
-        file.write_at(&buf, pos)?;
+        file.write_all_at(&buf, pos)?;
     }
     Ok(())
 }
@@ -508,18 +508,13 @@ fn scan_file(
     let mut first_chunk = None;
     let mut chunks = Vec::new();
     let mut hashed_bytes = 0u64;
-    loop {
-        match rx.recv() {
-            Ok(ChunkEvent::Chunk(chunk)) => {
-                if first_chunk.is_none() {
-                    first_chunk = Some(start.elapsed());
-                }
-                hashed_bytes += chunk.length as u64;
-                chunks.push(chunk);
-            }
-            Ok(ChunkEvent::Done) => {}
-            Err(_) => break, // all senders dropped: scan finished
+    // Disconnect (all hash workers dropped their senders) ends the scan.
+    while let Ok(ChunkEvent::Chunk(chunk)) = rx.recv() {
+        if first_chunk.is_none() {
+            first_chunk = Some(start.elapsed());
         }
+        hashed_bytes += chunk.length as u64;
+        chunks.push(chunk);
     }
 
     // Canonical order: offsets are unique (chunks partition the file).
@@ -743,7 +738,7 @@ fn simulate_disconnect(
             if read != chunk.length {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
             }
-            temp.write_at(&scratch[..chunk.length], chunk.offset)?;
+            temp.write_all_at(&scratch[..chunk.length], chunk.offset)?;
         }
         // Local copies from the old file.
         let source_file = File::open(source)?;
@@ -755,7 +750,7 @@ fn simulate_disconnect(
                 if read != chunk.length {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
                 }
-                temp.write_at(&local_scratch[..chunk.length], chunk.offset)?;
+                temp.write_all_at(&local_scratch[..chunk.length], chunk.offset)?;
             }
         }
         temp.sync_all()?;

@@ -752,9 +752,14 @@ waiting. §14.4 reserved parallel streams for exactly this.
 K connections total: connection 0 is the *control* connection (the one
 TREE_BEGIN/TREE_END and the delete pass live on), connections 1..K−1 are
 *worker* connections. Each connection carries at most one conversation at
-a time; the per-file frames themselves are byte-identical to §4–§8. The
-sender partitions its conversation set round-robin over the sorted list
-(conversation *i* → connection *i* mod K — deterministic, reproducible).
+a time; the per-file frames themselves are byte-identical to §4–§8. How
+the sender assigns conversations to connections is its own business —
+the receiver checks membership, never assignment. The reference sender
+uses one shared work queue over the sorted list: each connection
+(control included) pulls the next conversation when it finishes its
+current one, so a large file never idles the other K−1 connections
+(earlier drafts used a static round-robin split, *i* → *i* mod K, which
+is still wire-legal).
 
 **Wire form.** TREE_BEGIN gains flag bit 3 `parallel`. When set, the
 payload carries `parallel u16` (K, the total connection count) right
@@ -803,13 +808,14 @@ path is in its expected conversation set and removes it — every path
 exactly once. The control connection's service loop is the receiver's
 main thread: it reads TREE_FILEs (serving each) until the sender's
 TREE_END arrives THERE — in a parallel session the control connection
-carries partition 0's conversations plus that TREE_END, so the §16.5
+carries its share of the conversations plus that TREE_END, so the §16.5
 barrier read is already satisfied when the conversations phase ends (the
 receiver then joins its worker threads, requires the membership set to
 be empty, and proceeds to deletions). At session end the set must be
 empty (a worker that died leaves it non-empty, but then the session has
-already failed with that worker's error). Within one connection,
-conversations still run in the sender's sorted partition order.
+already failed with that worker's error). Arrival order on any one
+connection is arbitrary (the reference sender's queue hands out sorted
+order globally, not per connection).
 
 **Failure semantics (fail-closed, unchanged in spirit).** A failed
 conversation aborts its connection (ERROR `Aborted`, §16.4). Workers stop
@@ -985,8 +991,7 @@ mapping, the security model, and what actually differs.
 - **Streams are cheap** (no handshake, no kernel socket): the §16.8
   cap K=2..=16 remains the wire-protocol cap, but implementations MAY
   run more conversations than they have streams in flight; this spec
-  keeps one stream per conversation partition (deterministic, matches
-  the TCP shape 1:1).
+  keeps one stream per worker connection (matches the TCP shape 1:1).
 
 ### 17.2 Security model (D16 mapping)
 

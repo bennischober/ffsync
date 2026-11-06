@@ -22,8 +22,8 @@
 //! ```
 //!
 //! A parallel session (§16.8, `--parallel K`) runs the same envelope on
-//! connection 0 (control) and distributes conversations round-robin over
-//! K−1 worker connections; each worker announces itself with TREE_WORKER
+//! connection 0 (control) and K−1 worker connections, all pulling
+//! conversations from one shared queue (work-stealing, §16.8); each worker announces itself with TREE_WORKER
 //! and names each conversation with TREE_FILE (membership, not order).
 //!
 //! Determinism contract (§16.4): both peers compute the same action list
@@ -507,27 +507,45 @@ where
                 "parallel={k} outside 2..={MAX_PARALLEL} (§16.8)"
             )));
         }
-        // Round-robin partition (deterministic, §16.8): conversation i →
-        // connection i mod K. Connection 0 (the control stream) carries
-        // partition 0 inline; partitions 1..K run on worker connections.
-        let mut partitions: Vec<Vec<String>> = vec![Vec::new(); k as usize];
-        for (i, rel) in actions.iter().enumerate() {
-            partitions[i % k as usize].push(rel.clone());
-        }
+        // Shared work queue (§16.8): every connection — control included —
+        // pulls the next conversation from one cursor over the sorted
+        // action list. The receiver validates membership, not assignment,
+        // so any distribution is wire-legal; a queue keeps all K
+        // connections busy until the list is drained (a static
+        // round-robin split idles K−1 connections behind one large file).
+        // `stop` is raised by the first failing connection: the others
+        // finish their current conversation and pull nothing new (§16.8:
+        // stop before the NEXT conversation).
+        let queue: std::sync::Arc<Vec<String>> = std::sync::Arc::new(actions.clone());
+        let cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_job = |cursor: &std::sync::atomic::AtomicUsize,
+                        stop: &std::sync::atomic::AtomicBool,
+                        len: usize|
+         -> Option<usize> {
+            use std::sync::atomic::Ordering;
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let i = cursor.fetch_add(1, Ordering::Relaxed);
+            (i < len).then_some(i)
+        };
         // Shared progress funnel: worker threads cannot call the non-Send
         // progress closure; they send (rel_path, Progress) events the
         // control thread drains after joining.
         let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(String, Progress)>();
-        // Every worker index 1..K announces itself — even with an empty
-        // partition — because the receiver expects exactly that set
-        // (§16.8); it connects, announces, and immediately closes when it
-        // has nothing to do.
+        // Every worker index 1..K announces itself — even when the queue
+        // is already drained — because the receiver expects exactly that
+        // set (§16.8); it connects, announces, and immediately closes when
+        // it has nothing to do.
         let mut handles = Vec::new();
         let mut worker_errors: Vec<Option<SyncError>> = (0..k as usize).map(|_| None).collect();
         for w in 1..k {
             let connect = std::sync::Arc::clone(&request.connect_worker);
             let root = request.root.clone();
-            let part = partitions[w as usize].clone();
+            let queue = std::sync::Arc::clone(&queue);
+            let cursor = std::sync::Arc::clone(&cursor);
+            let stop = std::sync::Arc::clone(&stop);
             let pipeline = pipeline_clone(pipeline);
             let tx = progress_tx.clone();
             let connect_index = w;
@@ -536,7 +554,10 @@ where
                 // an error (§16.8: stop before the NEXT conversation).
                 let mut worker_stream: Box<dyn ReadWrite> = match connect(connect_index) {
                     Ok(s) => s,
-                    Err(e) => return (Vec::new(), Some(SyncError::Io(e))),
+                    Err(e) => {
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return (Vec::new(), Some(SyncError::Io(e)));
+                    }
                 };
                 if let Err(e) = (|| -> Result<(), SyncError> {
                     message::TreeWorker {
@@ -554,10 +575,12 @@ where
                     }
                     Ok(())
                 })() {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     return (Vec::new(), Some(e));
                 }
                 let mut outcomes = Vec::new();
-                for rel in &part {
+                while let Some(i) = next_job(&cursor, &stop, queue.len()) {
+                    let rel = &queue[i];
                     let _ = message::TreeFile {
                         rel_path: rel.clone(),
                     }
@@ -578,6 +601,7 @@ where
                     ) {
                         Ok(o) => outcomes.push(o),
                         Err(e) => {
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = send_error_and_finish(
                                 &mut worker_stream,
                                 ErrorCode::Aborted,
@@ -591,11 +615,13 @@ where
             }));
         }
 
-        // Control connection: partition 0 inline. In parallel mode every
-        // conversation is announced with TREE_FILE — on ALL connections,
-        // control included (the receiver validates membership uniformly).
+        // Control connection: pulls from the same queue inline. In parallel
+        // mode every conversation is announced with TREE_FILE — on ALL
+        // connections, control included (the receiver validates membership
+        // uniformly).
         let mut control_error: Option<SyncError> = None;
-        for (idx, rel) in partitions[0].iter().enumerate() {
+        while let Some(idx) = next_job(&cursor, &stop, queue.len()) {
+            let rel = &queue[idx];
             progress(TreeProgress::FileStart(idx, total));
             let _ = message::TreeFile {
                 rel_path: rel.clone(),
@@ -619,6 +645,7 @@ where
             ) {
                 Ok(o) => o,
                 Err(e) => {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
                     control_error = Some(e);
                     break;
@@ -638,7 +665,7 @@ where
             let (outcomes, err) = handle
                 .join()
                 .map_err(|_| SyncError::Protocol("worker thread panicked".to_string()))?;
-            let w = w + 1; // partitions skip index 0
+            let w = w + 1; // worker indices start at 1 (0 is control)
             for o in outcomes {
                 match o {
                     SyncOutcome::InSync => in_sync += 1,
@@ -904,9 +931,10 @@ where
             checksum: bool,
             eager: bool,
             pipeline: &'a crate::chunking::PipelineConfig,
-            /// D22: OUR per-file sizes (census size filter) — the candidates
-            /// are the receiver's own same-size indexed files.
-            own_sizes: &'a std::collections::HashMap<String, u64>,
+            /// D22: OUR files grouped by size (census size filter), each
+            /// group in manifest (sorted) order — the candidates are the
+            /// receiver's own same-size indexed files.
+            by_size: &'a std::collections::HashMap<u64, Vec<String>>,
         }
         fn run_one<S: Read + Write>(
             ctx: &ConvCtx<'_>,
@@ -925,7 +953,7 @@ where
                 checksum,
                 eager,
                 pipeline,
-                own_sizes,
+                by_size,
             } = *ctx;
             progress(TreeProgress::FileStart(idx, total));
             let path = abs_path(root, rel);
@@ -952,12 +980,17 @@ where
             let extra_sources = if std::fs::metadata(&path).is_err() {
                 let want_size = peer_meta.map(|(_, s)| s).unwrap_or(0);
                 let mut sources: Vec<PathBuf> = Vec::new();
-                if want_size > 0 {
-                    for (cand_rel, cand_size) in own_sizes {
+                // O(candidates of this size), not O(files): a fresh tree
+                // has every conversation take this branch, and scanning the
+                // whole size map per conversation was quadratic.
+                if want_size > 0
+                    && let Some(candidates) = by_size.get(&want_size)
+                {
+                    for cand_rel in candidates {
                         if sources.len() >= 8 {
                             break;
                         }
-                        if cand_size != &want_size || cand_rel == rel {
+                        if cand_rel == rel {
                             continue;
                         }
                         // The candidate must exist in OUR tree (the sender's
@@ -1006,22 +1039,30 @@ where
             Ok((outcome, rel.to_string()))
         }
 
-        // D22: OUR per-file sizes (census size filter) — the candidates are
-        // the receiver's own same-size indexed files (rename evidence lives
-        // in OUR tree: the old name), one map shared by sequential and
-        // parallel conversation paths.
-        let own_sizes: std::collections::HashMap<String, u64> = manifest
+        // D22: OUR files grouped by size (census size filter) — the
+        // candidates are the receiver's own same-size indexed files (rename
+        // evidence lives in OUR tree: the old name), one map shared by
+        // sequential and parallel conversation paths. Manifest order is
+        // sorted, so each group (and thus the 8-candidate cap) is
+        // deterministic.
+        let mut by_size: std::collections::HashMap<u64, Vec<String>> =
+            std::collections::HashMap::new();
+        for e in manifest
             .entries()
-            .filter(|e| e.kind == crate::tree::EntryKind::File)
-            .map(|e| (e.rel_path.clone(), e.size))
-            .collect();
+            .filter(|e| e.kind == crate::tree::EntryKind::File && e.size > 0)
+        {
+            by_size.entry(e.size).or_default().push(e.rel_path.clone());
+        }
+        let by_size = std::sync::Arc::new(by_size);
+        // Shared with worker threads (§16.8) without a deep copy.
+        let peer_manifest = std::sync::Arc::new(peer_manifest);
         if k <= 1 {
             let ctx = ConvCtx {
                 root: &request.root,
                 checksum,
                 eager,
                 pipeline,
-                own_sizes: &own_sizes,
+                by_size: &by_size,
             };
             for (idx, rel) in conversation_paths.iter().enumerate() {
                 let peer_meta = peer_manifest
@@ -1114,11 +1155,11 @@ where
                 root: PathBuf,
                 checksum: bool,
                 eager: bool,
-                /// D22: OUR per-file sizes (census size filter).
-                own_sizes: std::collections::HashMap<String, u64>,
+                /// D22: OUR files grouped by size (census size filter).
+                by_size: std::sync::Arc<std::collections::HashMap<u64, Vec<String>>>,
                 /// The sender's manifest (mode/size lookups inside worker
-                /// closures — the outer binding is dropped before threads run).
-                peer_manifest: crate::tree::TreeManifest,
+                /// closures), shared, not copied.
+                peer_manifest: std::sync::Arc<crate::tree::TreeManifest>,
                 pipeline: crate::chunking::PipelineConfig,
             }
             impl Shared {
@@ -1138,8 +1179,8 @@ where
                 root: request.root.clone(),
                 checksum,
                 eager,
-                own_sizes: own_sizes.clone(),
-                peer_manifest: peer_manifest.clone(),
+                by_size: std::sync::Arc::clone(&by_size),
+                peer_manifest: std::sync::Arc::clone(&peer_manifest),
                 pipeline: pipeline_clone(pipeline),
             });
             let serve_connection = {
@@ -1151,8 +1192,8 @@ where
                         }
                         let frame = match framing::read_frame(&mut *s) {
                             Ok(f) => f,
-                            // The sender closed this connection: its partition is
-                            // over (success or failure decided via first_error and
+                            // The sender closed this connection: it has no more
+                            // conversations for it (success or failure decided via first_error and
                             // the remaining set after the joins).
                             Err(framing::FrameError::Eof) => return,
                             Err(e) => {
@@ -1200,7 +1241,7 @@ where
                                 checksum: shared.checksum,
                                 eager: shared.eager,
                                 pipeline: &shared.pipeline,
-                                own_sizes: &shared.own_sizes,
+                                by_size: &shared.by_size,
                             },
                             &mut s,
                             &rel,
@@ -1244,7 +1285,7 @@ where
 
             // Control connection: the same service loop inline. The loop ends
             // when the sender's TREE_END arrives here — which the sender sends
-            // only after ALL its conversations (partitions + joined workers)
+            // only after ALL its conversations (its own + joined workers)
             // succeeded, so reaching TREE_END means every conversation it knows
             // of finished; the membership set must be empty then.
             let mut idx = 0usize;
@@ -1324,7 +1365,7 @@ where
                                 checksum,
                                 eager,
                                 pipeline,
-                                own_sizes: &own_sizes,
+                                by_size: &by_size,
                             },
                             stream,
                             &rel,
@@ -1464,6 +1505,22 @@ where
                     other
                 )));
             }
+        }
+    }
+
+    // Orphan-index cleanup (D15), batched: once per directory that had a
+    // conversation (single-file `receive` does it per call; per
+    // conversation that was a read_dir per file → O(files²) per
+    // directory). Deleted files' indexes are removed by the pass below.
+    if !dry_run {
+        let mut dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        for rel in &conversation_paths {
+            if let Some(parent) = abs_path(&request.root, rel).parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+        for dir in &dirs {
+            crate::index::remove_orphan_indexes(dir);
         }
     }
 

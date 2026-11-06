@@ -254,8 +254,8 @@ pre-existing.
   happens via CI (`cargo clippy --all-targets -- -D warnings`; no
   crate-level `#![deny]`/`#![forbid]`).
 - The crate's only `unsafe` block is the mmap at
-  `src/chunking/pipeline.rs:82` — keep it that way, and add the missing
-  `SAFETY:` comment when you touch it.
+  `src/chunking/pipeline.rs` (`Mmap::map`, with its `SAFETY:` comment) —
+  keep it that way.
 - `.opencode/` is local-only agent tooling (a git-commit-message skill,
   credentials, local config); it is untracked and must stay that way.
 
@@ -339,7 +339,8 @@ pre-existing.
   "optimize" the membership check away or reintroduce order-based
   expectations — the sender's worker threads race, and arrival order is
   arbitrary on every connection. The receiver's control loop consumes the
-  sender's TREE_END itself (that is how it stops serving partition 0), so
+  sender's TREE_END itself (that is how it stops serving the control
+  connection), so
   the sequential §16.5 barrier read is gated on `sender_end_consumed` —
   removing that gate deadlocks the sender on its TREE_END reply.
 - Worker connections authenticate with the SAME pin policy as the control

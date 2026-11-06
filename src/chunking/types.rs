@@ -8,12 +8,12 @@ pub struct Chunk {
     pub hash: Hash,
 }
 
-/// Result of chunking operation
+/// Result of chunking operation. Completion is signalled by the channel
+/// disconnecting (every hash worker has dropped its sender), not by an
+/// event — the old `Done` variant was never sent.
 pub enum ChunkEvent {
     /// A chunk was processed (metadata only, no data copy)
     Chunk(Chunk),
-    /// Chunking completed
-    Done,
 }
 
 /// The root hash of a file under ffsync's chunk-tree definition:

@@ -45,10 +45,8 @@ mod tests {
 
         // Collect all chunks from V2
         let mut target_chunks = Vec::new();
-        while let Ok(event) = chunk_rx.recv() {
-            if let ChunkEvent::Chunk(c) = event {
-                target_chunks.push(c);
-            }
+        while let Ok(ChunkEvent::Chunk(c)) = chunk_rx.recv() {
+            target_chunks.push(c);
         }
 
         // Calculate the expected root hash of V2

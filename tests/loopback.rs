@@ -344,10 +344,13 @@ mod tests {
         filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(t_tgt)).unwrap();
         // Re-stamp the bogus index with the backdated source mtime so its
         // validation still passes — the poison scenario must survive.
+        // Structurally valid (one chunk covering the whole file — the
+        // decoder refuses lists that do not partition the file), wrong
+        // hash: only VERIFY can catch this one.
         let stale = ffsync::index::FileIndex::from_scan(
             vec![ffsync::chunking::Chunk {
                 offset: 0,
-                length: 512,
+                length: src_data.len(),
                 hash: blake3::hash(b"bogus"),
             }],
             src_data.len() as u64,

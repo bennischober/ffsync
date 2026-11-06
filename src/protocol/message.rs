@@ -487,12 +487,20 @@ pub fn read_data(inp: &mut impl Read) -> Result<(Hash, Vec<u8>), MessageError> {
     if frame.ftype != framing::T_DATA {
         return Err(MessageError::UnexpectedType(frame.ftype));
     }
-    if frame.payload.len() < 32 {
+    split_data_payload(frame.payload)
+}
+
+/// Splits a DATA payload (`hash[32] | compressed`) into its parts, reusing
+/// the frame's buffer for the compressed bytes (an in-place shift, no
+/// second allocation per chunk).
+pub fn split_data_payload(mut payload: Vec<u8>) -> Result<(Hash, Vec<u8>), MessageError> {
+    if payload.len() < 32 {
         return Err(MessageError::Malformed("data frame too short"));
     }
     let mut h = [0u8; 32];
-    h.copy_from_slice(&frame.payload[..32]);
-    Ok((Hash::from_bytes(h), frame.payload[32..].to_vec()))
+    h.copy_from_slice(&payload[..32]);
+    payload.drain(..32);
+    Ok((Hash::from_bytes(h), payload))
 }
 
 // ---------------------------------------------------------------------------
