@@ -43,6 +43,10 @@ delta unit — this module is wire-protocol-relevant (D2, D19).
   sender-size policy and its HELLO wire contract are the root AGENTS.md's
   CDC gotcha). Files >= 16 MiB must chunk byte-identically to the pre-D19
   defaults — existing large-file indexes depend on it.
+- Loosening `sane_cdc_params` below fastcdc's own range constants
+  (`fastcdc::v2020::{MINIMUM,AVERAGE,MAXIMUM}_{MIN,MAX}` + evenness): the
+  library only `debug_assert!`s them, so in release builds this check is the
+  sole guard against a hostile HELLO panicking the mask-table lookup.
 - Upgrading fastcdc without the bench fingerprint check: before/after
   `cargo run --release --bin bench -- --quick --seed 42` must produce
   identical chunk counts and missing-byte counts (boundaries are

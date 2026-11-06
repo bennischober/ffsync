@@ -286,8 +286,11 @@ pre-existing.
   D15 index (order: rename → set_modified → stat → write_index). Reversing
   the order leaves the index recording the wrong mtime and every subsequent
   tree sync re-checks the file.
-- Mode bits (§16.9, v4/D18) extend that ordering: rename → **apply_mode** →
-  set_modified → stat → write_index. Mode is never a triage input (a
+- Mode bits (§16.9, v4/D18) extend that ordering: rename → set_modified
+  → **apply_mode** → stat → write_index (D18 amendment, 2026-11: mode
+  first broke read-only modes — the mtime write was refused; chmod never
+  changes the mtime, so mode goes last). Both writes are best-effort
+  warnings via `apply_commit_metadata`, never a failed sync. Mode is never a triage input (a
   chmod-only change is not synced — the same trade as rsync's fast path);
   it rides conversations the size+mtime triage already starts. The
   metadata flag is sender-authoritative and mirrored by the receiver
