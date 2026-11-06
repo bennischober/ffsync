@@ -30,6 +30,7 @@
 //! from the same two manifests, so the receiver knows exactly which files
 //! will have conversations and fails loudly on any unexpected HELLO.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -783,6 +784,26 @@ where
     let mut conversation_paths: Vec<String> = Vec::new();
     let mut deletions: Vec<(String, u64)> = Vec::new();
 
+    // Case-fold indexes for the case-insensitive-receiver guards (§16.5):
+    // on NTFS/APFS a sender spelling (`Readme.md`, `Docs/`) and a
+    // receiver-only spelling (`README.md`, `docs/`) are ONE object. The
+    // folds only nominate candidates; `tree::same_file` decides, so a
+    // case-sensitive receiver keeps the exact-path semantics.
+    let mut sender_folds: HashMap<String, Vec<&str>> = HashMap::new();
+    for e in peer_manifest.entries() {
+        sender_folds
+            .entry(tree::case_fold(&e.rel_path))
+            .or_default()
+            .push(&e.rel_path);
+    }
+    let mut receiver_folds: HashMap<String, Vec<&str>> = HashMap::new();
+    for e in manifest.entries() {
+        receiver_folds
+            .entry(tree::case_fold(&e.rel_path))
+            .or_default()
+            .push(&e.rel_path);
+    }
+
     // Every path in the union of both manifests, in canonical order.
     let mut all_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for e in manifest.entries() {
@@ -815,6 +836,28 @@ where
                     continue;
                 }
                 let p = abs_path(&request.root, rel);
+                // Case-insensitive receiver: a receiver-only spelling of
+                // this dir (`docs` for the sender's `Docs`) already IS it.
+                // Rename it to the sender's spelling, or the next scan
+                // reports the old spelling and every file below it
+                // re-syncs each session. Parents sort before children, so
+                // nested variants are renamed top-down.
+                if p.is_dir()
+                    && let Some(variant) = receiver_folds
+                        .get(&tree::case_fold(rel))
+                        .into_iter()
+                        .flatten()
+                        .find(|v| {
+                            **v != rel.as_str()
+                                && peer_manifest.get(v).is_none()
+                                && tree::same_file(&abs_path(&request.root, v), &p)
+                        })
+                    && let Err(e) = std::fs::rename(abs_path(&request.root, variant), &p)
+                {
+                    announce!(SyncError::Protocol(format!(
+                        "cannot rename dir {variant} to {rel}: {e}"
+                    )));
+                }
                 if let Err(e) = std::fs::create_dir_all(&p) {
                     announce!(SyncError::Protocol(format!("cannot create dir {rel}: {e}")));
                 }
@@ -1467,6 +1510,27 @@ where
         }
     }
 
+    // Sender spellings that fold together (`a.txt` + `A.txt` from a
+    // case-sensitive sender) share ONE object on a case-insensitive
+    // receiver: the last conversation wins and the pair re-syncs every
+    // session. Unrepresentable here, so say so instead of looping silently.
+    for group in sender_folds.values().filter(|g| g.len() > 1) {
+        let first = abs_path(&request.root, group[0]);
+        let clashing: Vec<&str> = group[1..]
+            .iter()
+            .copied()
+            .filter(|s| tree::same_file(&first, &abs_path(&request.root, s)))
+            .collect();
+        if !clashing.is_empty() {
+            eprintln!(
+                "warning: sender paths differ only in case and share one file on this \
+                 case-insensitive filesystem (re-synced every session): {} vs {}",
+                group[0],
+                clashing.join(", ")
+            );
+        }
+    }
+
     // ---- Deletions (§16.5): only after every conversation succeeded ----
     // Exclude protection (§16.7): paths matching the receiver's own patterns
     // — directly or via an excluded ancestor — are never deleted, even
@@ -1483,13 +1547,25 @@ where
             if own_excludes.matches_path_or_ancestor(rel, kind) {
                 continue;
             }
+            // Case-insensitive receiver (§16.5): `README.md` is
+            // receiver-only by name, but if it is the same object as the
+            // sender's `Readme.md` (just committed under that spelling),
+            // removing it would delete the synced file. Not a deletion.
+            let p = abs_path(&request.root, rel);
+            if sender_folds
+                .get(&tree::case_fold(rel))
+                .into_iter()
+                .flatten()
+                .any(|s| tree::same_file(&p, &abs_path(&request.root, s)))
+            {
+                continue;
+            }
             if dry_run {
                 deleted_count += 1;
                 deleted_bytes += size;
                 progress(TreeProgress::Deleting(i + 1, deleted_bytes));
                 continue;
             }
-            let p = abs_path(&request.root, rel);
             let res = if p.is_dir() {
                 std::fs::remove_dir(&p)
             } else {

@@ -1440,3 +1440,50 @@ fn tree_rename_moves_content_with_zero_wire_bytes() {
     assert_eq!(s3.files, 0, "third session fast-paths everything");
     assert_eq!(r3.files, 0);
 }
+
+/// Lists a directory's entry names (on-disk spelling), sorted, without
+/// ffsync's own sidecars (D15 indexes).
+fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !ffsync::tree::is_sidecar(n))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn tree_case_only_rename_keeps_synced_content() {
+    // The receiver holds README.md / docs/a.txt, the sender Readme.md /
+    // Docs/a.txt. On a case-insensitive receiver (NTFS, APFS) each pair is
+    // ONE object: the receiver-only spelling must not be deleted after the
+    // sender's spelling was committed (it would delete the synced file),
+    // and the dir is renamed to the sender's spelling. On a case-sensitive
+    // receiver the old spellings are ordinary receiver-only deletions.
+    // Either way the receiver ends with exactly the sender's spellings and
+    // content, and a second session is a no-op.
+    let sender = TempTree::new("case_sender");
+    let receiver = TempTree::new("case_receiver");
+    sender.write("Readme.md", b"new readme content");
+    sender.write("Docs/a.txt", b"new doc");
+    receiver.write("README.md", b"old readme");
+    receiver.write("docs/a.txt", b"old doc");
+
+    let (s, r) = run_tree_session(sender.path(), receiver.path(), false, false);
+    s.expect("sender ok");
+    r.expect("receiver ok");
+    assert_eq!(names(receiver.path()), vec!["Docs", "Readme.md"]);
+    assert_eq!(names(&receiver.path().join("Docs")), vec!["a.txt"]);
+    assert_eq!(
+        receiver.read("Readme.md"),
+        Some(b"new readme content".to_vec())
+    );
+    assert_eq!(receiver.read("Docs/a.txt"), Some(b"new doc".to_vec()));
+
+    let (s2, r2) = run_tree_session(sender.path(), receiver.path(), false, false);
+    let s2 = s2.expect("sender2 ok");
+    let r2 = r2.expect("receiver2 ok");
+    assert_eq!(s2.files, 0, "spellings converged: nothing re-syncs");
+    assert_eq!(r2.deleted, 0);
+}
