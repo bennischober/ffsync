@@ -18,7 +18,7 @@ commands.
 
 </div>
 
-> **Status: v1.2.0 (stable).** Single-file and directory-tree sync between two
+> **Status: v1.3.0 (stable).** Single-file and directory-tree sync between two
 > peers over TLS, with resume, excludes, parallel conversations, QUIC,
 > warm starts, and rename detection — all measured, no daemon, no config.
 > Details and per-feature flags: [Using it](#using-it) · history: [CHANGELOG](CHANGELOG.md) · [roadmap](#roadmap).

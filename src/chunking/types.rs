@@ -10,10 +10,17 @@ pub struct Chunk {
 
 /// Result of chunking operation. Completion is signalled by the channel
 /// disconnecting (every hash worker has dropped its sender), not by an
-/// event — the old `Done` variant was never sent.
+/// event.
 pub enum ChunkEvent {
     /// A chunk was processed (metadata only, no data copy)
     Chunk(Chunk),
+    /// Never sent. Kept only so 1.x code that names it still compiles;
+    /// completion is the channel disconnecting. Removed in 2.0.
+    #[deprecated(
+        since = "1.3.0",
+        note = "never sent; completion is the channel disconnecting"
+    )]
+    Done,
 }
 
 /// The root hash of a file under ffsync's chunk-tree definition:
