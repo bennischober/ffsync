@@ -417,6 +417,18 @@ origin, D5):
 - Receiver MUST enforce: DATA total ≤ PLAN_REMOTE total; temp file never
   exceeds sender's file_size. A sender violating these is malicious or broken
   → ERROR 3.
+- Plan entries are validated as they arrive, before any buffer is sized from
+  them (2026-11 hardening): `1 ≤ length ≤ cdc_max`, `target_offset + length
+  ≤ file_size` computed without overflow, at most `2 × file_size / cdc_min
+  + 2` entries, and a PLAN_LOCAL's length equals the receiver's own manifest
+  entry for that hash (§6.1). Each is ERROR 3.
+- HELLO CDC parameters are honored only inside the chunker library's own
+  supported ranges (fastcdc 5.0: min 64 B–1 MiB, avg 256 B–4 MiB, max
+  1 KiB–16 MiB, all even, `min ≤ avg ≤ max`); anything else falls back to
+  the receiver's local policy (§4.3) — the library checks these only in
+  debug builds, and an out-of-range average panics it in release.
+- The sender keeps manifest state bounded by its own chunk count: entries
+  for hashes it does not have are not stored, whatever the receiver sends.
 
 ## 13. Open questions
 

@@ -1196,14 +1196,23 @@ mod tests {
             (CHUNK_MIN, CHUNK_AVG, CHUNK_MAX)
         );
         // Sane-parameter gate (the receiver's hostile-peer guard).
-        assert!(sane_cdc_params((16, 64, 256)));
-        assert!(sane_cdc_params((64, 256, 1024)));
+        assert!(sane_cdc_params((64, 256, 1024)), "fastcdc's own minimums");
+        assert!(sane_cdc_params((
+            SMALL_CHUNK_MIN as u32,
+            SMALL_CHUNK_AVG as u32,
+            SMALL_CHUNK_MAX as u32
+        )));
+        assert!(!sane_cdc_params((16, 64, 256)), "below fastcdc's minimums");
         assert!(!sane_cdc_params((0, 64, 256)), "zero min is degenerate");
         assert!(!sane_cdc_params((256, 64, 256)), "min > avg is nonsense");
         assert!(!sane_cdc_params((64, 256, 32)), "avg > max is nonsense");
         assert!(
+            !sane_cdc_params((64, 64 * 1024 * 1024, 64 * 1024 * 1024)),
+            "avg past fastcdc's AVERAGE_MAX would panic its mask table in release"
+        );
+        assert!(
             !sane_cdc_params((1, 1, 128 * 1024 * 1024)),
-            "max beyond the 64 MiB cap is refused"
+            "max beyond fastcdc's 16 MiB MAXIMUM_MAX is refused"
         );
     }
 
