@@ -453,3 +453,48 @@ fn quic_tree_deletes_after_success() {
     assert!(receiver.exists("keep.txt"));
     assert!(!receiver.exists("stale.txt"), "stale file must be deleted");
 }
+
+/// IPv6 peers: the client's local UDP socket must match the peer's address
+/// family (it used to bind 0.0.0.0 unconditionally, so an IPv6 receiver
+/// was unreachable). Skips quietly where the host has no IPv6 loopback.
+#[test]
+fn quic_handshake_over_ipv6_loopback() {
+    let server_id = generate_identity("v6-server");
+    let client_id = generate_identity("v6-client");
+    let server_fp = fingerprint(&server_id);
+    let client_fp = fingerprint(&client_id);
+    let bind: SocketAddr = "[::1]:0".parse().unwrap();
+    let Ok(endpoint) = ffsync::transport::quic::listen(
+        bind,
+        &server_id,
+        &ffsync::transport::PinPolicy::Pinned(vec![client_fp.clone()]),
+    ) else {
+        eprintln!("skipping: no IPv6 loopback on this host");
+        return;
+    };
+    let server_addr = endpoint.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        // quinn surfaces the control stream once the client writes on it.
+        let (session, mut stream, saw) = ffsync::transport::quic::server_session(endpoint)?;
+        let mut byte = [0u8; 1];
+        std::io::Read::read_exact(&mut stream, &mut byte)?;
+        assert_eq!(byte, [7]);
+        drop(stream);
+        drop(session);
+        Ok::<_, std::io::Error>(saw)
+    });
+    let name = rustls::pki_types::ServerName::try_from("ffsync-peer".to_string()).unwrap();
+    let (session, mut stream, saw) = ffsync::transport::quic::client_session(
+        &client_id,
+        &ffsync::transport::PinPolicy::Pinned(vec![server_fp.clone()]),
+        server_addr,
+        name,
+    )
+    .expect("IPv6 QUIC handshake");
+    assert_eq!(saw, server_fp);
+    std::io::Write::write_all(&mut stream, &[7]).unwrap();
+    std::io::Write::flush(&mut stream).unwrap();
+    assert_eq!(server.join().unwrap().unwrap(), client_fp);
+    drop(stream);
+    drop(session);
+}

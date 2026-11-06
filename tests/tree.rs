@@ -1487,3 +1487,92 @@ fn tree_case_only_rename_keeps_synced_content() {
     assert_eq!(s2.files, 0, "spellings converged: nothing re-syncs");
     assert_eq!(r2.deleted, 0);
 }
+
+#[test]
+fn tree_parallel_same_stem_files_get_distinct_temps() {
+    // D6 amendment: the temp used to be `with_extension("ffsync-tmp")`, so
+    // a.mkv / a.mp4 / a.ogg / a.wav all wrote `a.ffsync-tmp`. Sorted and
+    // partitioned round-robin over K=4, those four run CONCURRENTLY on four
+    // connections — the collision case. Each must converge to its own bytes.
+    let sender = TempTree::new("stem_s");
+    let receiver = TempTree::new("stem_r");
+    let exts = ["mkv", "mp4", "ogg", "wav"];
+    let content = |i: usize| -> Vec<u8> {
+        (0..3 * 1024 * 1024u32)
+            .map(|j| {
+                (j as u8)
+                    .wrapping_mul(17 + 2 * i as u8)
+                    .wrapping_add((j >> 12) as u8)
+            })
+            .collect()
+    };
+    for (i, ext) in exts.iter().enumerate() {
+        sender.write(&format!("a.{ext}"), &content(i));
+    }
+    let (s, r) = run_tree_session_full(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &[],
+        &[],
+        4,
+        false,
+        false,
+    );
+    s.unwrap_or_else(|e| panic!("sender failed: {e}"));
+    r.unwrap_or_else(|e| panic!("receiver failed: {e}"));
+    for (i, ext) in exts.iter().enumerate() {
+        assert_eq!(
+            receiver.read(&format!("a.{ext}")),
+            Some(content(i)),
+            "a.{ext} did not converge"
+        );
+        assert!(!receiver.exists(&format!("a.{ext}.ffsync-tmp")));
+    }
+    assert!(!receiver.exists("a.ffsync-tmp"));
+}
+
+#[test]
+fn tree_delete_pass_handles_dirs_with_unlisted_content() {
+    // A receiver-only directory may hold entries no manifest lists. Before
+    // the fix, any of these made `remove_dir` fail the whole session AFTER
+    // every transfer had committed.
+    let sender = TempTree::new("delunl_s");
+    let receiver = TempTree::new("delunl_r");
+    sender.write("keep.txt", b"same");
+    receiver.write("keep.txt", b"same");
+    // gone/: only a real file plus orphaned sidecars (new- and old-style
+    // temps) — the directory must disappear entirely.
+    receiver.write("gone/a.bin", b"aaaa");
+    receiver.write("gone/b.bin.ffsync-tmp", b"partial");
+    receiver.write("gone/c.ffsync-tmp", b"pre-amendment temp");
+    // kept/: a file the RECEIVER's patterns protect — y.bin goes, the
+    // directory stays.
+    receiver.write("kept/x.log", b"protected");
+    receiver.write("kept/y.bin", b"yyyy");
+    // cache/: a file the SENDER's patterns exclude from both scans — the
+    // manifest never lists it, so the directory stays.
+    receiver.write("cache/z.tmp", b"unlisted");
+
+    let (s, r) = run_tree_session_ex(
+        sender.path(),
+        receiver.path(),
+        false,
+        false,
+        &["*.tmp"],
+        &["*.log"],
+    );
+    let s = s.unwrap_or_else(|e| panic!("sender failed: {e}"));
+    let r = r.unwrap_or_else(|e| panic!("receiver failed: {e}"));
+    assert!(
+        !receiver.exists("gone"),
+        "orphan sidecars must not keep gone/"
+    );
+    assert!(receiver.exists("kept/x.log"));
+    assert!(!receiver.exists("kept/y.bin"));
+    assert!(receiver.exists("cache/z.tmp"));
+    // gone/a.bin + gone/ + kept/y.bin; the kept dirs are not counted.
+    assert_eq!(r.deleted, 3);
+    assert_eq!(s.deleted, 3);
+}

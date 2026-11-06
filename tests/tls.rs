@@ -296,6 +296,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn remove_pin_keeps_comments_and_labels() {
+        // `untrust` used to rewrite pins.conf from the parsed set, dropping
+        // every comment and label. Only the target line may go.
+        let dir = std::env::temp_dir().join(format!("ffsync_tls_pins_lbl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = vec![1u8; 32];
+        let b = vec![2u8; 32];
+        let fa = ffsync::transport::format_fingerprint(&a);
+        let fb = ffsync::transport::format_fingerprint(&b);
+        let original = format!("# my peers\n{fa} # laptop\n\n{fb} # nas\n");
+        std::fs::write(dir.join("pins.conf"), &original).unwrap();
+
+        ffsync::transport::remove_pin_in(&dir, &a).unwrap();
+        let after = std::fs::read_to_string(dir.join("pins.conf")).unwrap();
+        assert_eq!(after, format!("# my peers\n\n{fb} # nas\n"));
+
+        // Absent pin: the file is left byte-identical.
+        ffsync::transport::remove_pin_in(&dir, &a).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pins.conf")).unwrap(),
+            after
+        );
+        // No temp files are left behind.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("pins.conf")]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Silence unused-import warning for Command (kept for future CLI-level
     // integration test).
     #[allow(dead_code)]

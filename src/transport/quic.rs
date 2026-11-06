@@ -201,9 +201,16 @@ impl QuicSession {
 /// `block_on` (quinn's `TokioRuntime::spawn` requires a runtime context).
 /// The returned `Endpoint` is consumed by `client_session`; the driver
 /// keeps the connection alive independently of the handle afterwards.
-fn client_endpoint() -> io::Result<Endpoint> {
+/// The local socket matches the peer's address family: a v4 socket cannot
+/// send to an IPv6 peer.
+fn client_endpoint(peer: SocketAddr) -> io::Result<Endpoint> {
+    let local: SocketAddr = if peer.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
     block_on(async {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let socket = std::net::UdpSocket::bind(local)?;
         Endpoint::new(
             EndpointConfig::default(),
             None,
@@ -254,7 +261,7 @@ pub fn client_session(
     server_addr: SocketAddr,
     server_name: rustls::pki_types::ServerName<'static>,
 ) -> io::Result<(QuicSession, QuicStream, Vec<u8>)> {
-    let mut endpoint = client_endpoint()?;
+    let mut endpoint = client_endpoint(server_addr)?;
     let tls = identity.quinn_client_config(pins)?;
     let mut client_config = ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(tls)

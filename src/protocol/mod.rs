@@ -4,11 +4,16 @@
 //! - [`framing`]: the raw frame envelope (type byte + length + payload)
 //! - [`message`]: typed frames (HELLO, MANIFEST_CHUNK, PLAN_*, DATA, ...)
 //! - [`sync`]: the two-peer state machines (sender and receiver)
+//! - [`tree_sync`]: the tree-session orchestrators (§16)
+//! - [`BufStream`]: the buffered duplex adapter callers wrap connections in
 
+mod bufstream;
 pub mod framing;
 pub mod message;
 pub mod sync;
 pub mod tree_sync;
+
+pub use bufstream::BufStream;
 
 /// Protocol magic sent in the HELLO payload.
 pub const MAGIC: [u8; 4] = *b"FFSY";

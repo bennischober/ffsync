@@ -32,7 +32,10 @@ impl Role {
 
 /// HELLO flags (`concept/Protocol.md` §4).
 pub const FLAG_TRUST_TIMES: u16 = 1 << 0;
-pub const FLAG_EAGER: u16 = 1 << 1; // §9.2 (designed, unimplemented): must be 0 on the wire; rejected loudly
+/// Eager-diff offer (§9.2): set by a sender that opted in (`--eager`);
+/// the receiver mirrors it iff it also opted in. Eager is active iff both
+/// HELLOs carry it; a sender whose offer is not mirrored fails loudly.
+pub const FLAG_EAGER: u16 = 1 << 1;
 pub const FLAG_RESUMING: u16 = 1 << 2;
 /// Dry-run offer (§7.1): the sender asks for a preview session — the
 /// receiver executes nothing, writes nothing, deletes nothing, and reports

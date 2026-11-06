@@ -118,6 +118,23 @@ Error codes: 1=version, 2=role conflict, 3=bad frame, 4=hash mismatch,
 5=io, 6=aborted. Any ERROR frame is terminal: the sender of ERROR closes the
 connection after flushing; the peer must treat the transfer as failed.
 
+**Write coalescing (implementation rule, no wire effect).** Frames are a
+byte stream; how they are cut into writes is invisible to the peer. A frame
+whose payload fits in 64 KiB is encoded as ONE write (header + payload),
+and the CLI wraps every connection in a 64 KiB read/write buffer
+(`BufStream`, 2026-11-06), so manifest and plan entries (~50 B each)
+leave in buffer-sized writes rather than one syscall, TLS record and
+(with `TCP_NODELAY`) TCP segment per frame — over QUIC, one runtime round
+trip per frame. The liveness rule that makes buffering safe: **a peer
+flushes before any blocking read whose answer depends on its pending
+frames.** The state machines flush at every such step explicitly (HELLO,
+MANIFEST_DONE, PLAN_DONE, end of DATA, VERIFY, COMMIT_ACK, the tree
+frames); the buffer also flushes on its own whenever a read must wait for
+the peer, so a missed flush degrades latency, never liveness. A flush
+that fails there (the peer already closed its read side after a final
+frame, e.g. the §4 fast path's NOT_MODIFIED) does not fail the read — the
+peer's final frame stays readable; later writes report the failure.
+
 ## 4. Handshake and negotiation
 
 1. Both peers connect and immediately send HELLO.
@@ -155,9 +172,8 @@ connection after flushing; the peer must treat the transfer as failed.
    the finest granularity any supported platform stores, so this never
    loosens a comparison any filesystem could actually distinguish.
 
-Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2 — designed below;
-still must be 0 on the wire until §9.2 is implemented, and a peer MUST
-reject a HELLO that sets it), bit 2 `resuming` (informational, §10), bit 3
+Flags (HELLO): bit 0 `trust_times`, bit 1 `eager` (§9.2, implemented: the
+sender's opt-in offer, mirrored by a receiver that also opted in), bit 2 `resuming` (informational, §10), bit 3
 `dry_run` (§7.1, implemented in v0.8 work: the sender offers a preview
 session; the receiver accepts with the DRY_RUN_ACK marker before any
 manifest/plan traffic). Unknown bits are rejected at decode (strict
@@ -308,7 +324,7 @@ layout (same count, same offsets, same lengths — identical files under
 the diff map; the sender mirrors the check against the raw manifest chunk
 list). VERIFY guards every path regardless.
 
-## 9. Diff strategy (D8) — lazy now, eager reserved
+## 9. Diff strategy (D8) — lazy default, eager opt-in
 
 ### 9.1 Lazy (v0.1, default)
 
@@ -316,7 +332,7 @@ Receiver finishes its scan before the sender sends anything. Zero wasted
 bytes, one scan-length of latency before the first data byte. Right for slow
 links, where over-sending is fatal.
 
-### 9.2 Eager (designed, not yet implemented — flag bit 1)
+### 9.2 Eager (implemented, opt-in — flag bit 1)
 
 Sender diffs against the *partial* manifest set and streams DATA for hashes
 confirmed missing so far. Bytes start moving during the scan. A late manifest
@@ -351,6 +367,26 @@ as today) under a fixed 64 MiB cap (§12 spirit). Overflow is a loud ERROR
 and a lazy retry with a clean temp — never a spill file, never a silent
 degradation. (This resolves §13 question 2.)
 
+**Transmission timing: decide early, write after MANIFEST_DONE.** The
+receiver streams its whole manifest without reading (§5). A sender that
+WRITES eager DATA while it still reads the manifest blocks as soon as the
+send→recv buffers fill, stops reading, and so blocks the receiver's
+manifest writes in turn — a deadlock on any transport whose buffers hold
+less than the eager bytes plus the rest of the manifest (a large file
+over real TCP; found 2026-11-06, pinned by
+`eager_does_not_deadlock_on_small_transport_buffers`). The sender
+therefore makes every eager decision during the manifest exchange (the
+gate above) and reads + compresses the chunk right then, but HOLDS the
+DATA frames and writes them after the receiver's MANIFEST_DONE, ahead of
+the PLAN. The receiver sees the identical frame sequence (it reads
+nothing before its own MANIFEST_DONE either way), so this is no wire
+change. Held bytes are capped at the receiver's buffer cap (64 MiB of
+compressed payload): once held frames reach it, the remaining chunks go
+the lazy way (plan + §7), so a compliant sender never trips the
+receiver's overflow ERROR. What eager still buys is the overlap of the
+sender's chunk reads and zstd work with the receiver's scan and the
+manifest transfer.
+
 **Ordering and resume.** Writes happen in arrival order under eager —
 D10's locals-first ordering is a lazy-mode property (§7), and resume is
 unaffected because the temp re-scan is content-addressed (§10).
@@ -361,7 +397,10 @@ sessions over the RTT-modeled duplex; over-send was 0 bytes in every run
 (the §6.2 position gate rescues late matches exactly as designed), and
 eager cut wall time 18–33% at 0 ms RTT and 12–18% at 30 ms RTT (medians
 455→368 ms and 596→488 ms on the 128 MiB modified fixture, 3 paired runs
-each). The knob is `--eager` on both peers; a declining peer fails the
+each). Re-measured 2026-11-06 after the transmission-timing fix above
+(both ends `BufStream`-wrapped like the CLI, 3 paired runs): over-send
+0 B, medians 479→381 ms (−20%) at 0 ms RTT and 551→423 ms (−23%) at
+30 ms RTT. The knob is `--eager` on both peers; a declining peer fails the
 session loudly (the sender checks the receiver's HELLO mirror). Wire
 contract notes: eager offers are deduplicated by hash (repeated content
 chunks are offered once; the receiver's by-hash buffer is a cache that
@@ -424,14 +463,26 @@ origin, D5):
 - Receiver MUST enforce: DATA total ≤ PLAN_REMOTE total; temp file never
   exceeds sender's file_size. A sender violating these is malicious or broken
   → ERROR 3.
+- Plan entries are validated as they arrive, before any buffer is sized from
+  them (2026-11 hardening): `1 ≤ length ≤ cdc_max`, `target_offset + length
+  ≤ file_size` computed without overflow, at most `2 × file_size / cdc_min
+  + 2` entries, and a PLAN_LOCAL's length equals the receiver's own manifest
+  entry for that hash (§6.1). Each is ERROR 3.
+- HELLO CDC parameters are honored only inside the chunker library's own
+  supported ranges (fastcdc 5.0: min 64 B–1 MiB, avg 256 B–4 MiB, max
+  1 KiB–16 MiB, all even, `min ≤ avg ≤ max`); anything else falls back to
+  the receiver's local policy (§4.3) — the library checks these only in
+  debug builds, and an out-of-range average panics it in release.
+- The sender keeps manifest state bounded by its own chunk count: entries
+  for hashes it does not have are not stored, whatever the receiver sends.
 
 ## 13. Open questions
 
 1. **Index staleness policy** (§14.1): exact trust rules for cross-run
    manifests; relationship to mtime granularity problems.
 2. **Eager-mode buffer cap** (§9.2): resolved by design — fixed 64 MiB cap,
-   overflow = loud ERROR + lazy retry (§9.2). Implementation of eager mode
-   itself remains open, gated on the eager-mode bench cell.
+   overflow = loud ERROR + lazy retry (§9.2). Eager mode is implemented
+   (§9.2 Status); the sender caps its held offers at the same bound.
 3. **Resume write-journal** vs. temp re-scan: at what file sizes does the
    re-scan cost matter?
 4. **zstd batching:** per-chunk frames waste some compression ratio at ~1 MiB
@@ -449,8 +500,8 @@ origin, D5):
 1. **Persistent index:** IMPLEMENTED (D15, v0.4 — `FFSYIX02` sidecar
    files; the INDEX-frame idea was dropped in favor of the on-disk
    sidecar, same trust model: size+mtime+CDC-parameter validation).
-2. **Eager diff:** DESIGNED, not implemented (§9.2; gated on the
-   eager-mode bench cell — D8's doctrine).
+2. **Eager diff:** IMPLEMENTED (§9.2, opt-in `--eager`; the bench cell
+   measured it before it shipped — D8's doctrine; tree sessions §16.11).
 3. **TLS:** IMPLEMENTED (D16, v0.5 — rustls TLS 1.3, mutual TOFU
    fingerprint pinning; QUIC followed in v0.6, §17).
 4. **Parallel chunk streams:** IMPLEMENTED (v0.7, §16.8 — per-file
@@ -537,7 +588,10 @@ exist only to create empty directories on the receiver (a directory with
 files needs no entry; its files imply the path). Paths are relative to the
 synced root, `/`-separated regardless of platform, and must not contain
 `..` components (protocol error otherwise — path traversal is a protocol
-violation, not a filesystem concern).
+violation, not a filesystem concern). A local name that is not valid
+UTF-8 (possible on unix) has no wire spelling: the scan skips it with a
+warning on both peers (amended 2026-11 — a lossy conversion named a file
+that did not exist and failed the session, and could merge two names).
 
 Tree flags (in TREE_BEGIN, u16): bit 0 `checksum` (D11 tree-wide: no
 metadata fast path on any file), bit 1 `no_delete` (§16.5).
@@ -631,6 +685,18 @@ TREE_END doubles as the "transfers done, please finalize" barrier — the
 receiver must not delete anything before it (a sender aborting
 mid-session leaves the receiver's tree intact apart from synced files).
 
+A receiver-only directory can hold entries no manifest listed: ffsync's
+own sidecars (`*.ffsync-tmp`, `*.ffsync-index`), files the sender's
+patterns exclude (§16.7), names the scan skips (non-UTF-8, §16.2). Before
+removing such a directory the receiver deletes **orphaned** sidecars in
+it (those whose target is gone), and the delete pass removes a deleted
+file's own sidecars with it. A directory that is still not empty is
+**kept** — it is not counted, and the session does not fail (amended
+2026-11; previously `remove_dir` failed the session after every transfer
+had committed). A real delete failure (permissions, I/O) fails the
+session and is announced to the sender with ERROR (`Aborted`) in place of
+the TREE_END reply.
+
 Delete safety is bounded by the same trust decision as every write in the
 session: the receiver already pinned the sender's fingerprint (D16).
 
@@ -664,6 +730,12 @@ peers then record the same mtime in their D15 indexes, so the next tree
 sync's triage (§16.3) skips the file — the tree fast path fires without
 reading a byte. Without this, every synced file's mtime would change at
 commit and no tree sync would ever skip.
+
+A sender mtime of `(0, 0)` is applied literally, as the Unix epoch. The
+wire fields are unsigned, so a file dated before 1970 (or one whose mtime
+cannot be read) is reported as `(0, 0)`; the receiver must set exactly
+that, or its own scan reports a different mtime and the file re-syncs on
+every run (amended 2026-11; earlier builds skipped the write for `(0, 0)`).
 
 Single-file sync adopts the same behavior under protocol v3 (observable
 change: the receiver's file now carries the sender's mtime after a sync;
@@ -939,27 +1011,32 @@ identical on both peers).
   same trade rsync's default fast path makes. The metadata is best-effort
   convergence, not a change detector. (`--checksum` still forces full
   per-file conversations, which then also apply metadata.)
-- **Apply:** after a file's reconstruction succeeds and before the mtime
+- **Apply:** after a file's reconstruction succeeds and after the mtime
   preservation write (§16.6), the receiver applies the sender's mode:
-  on unix, `fchmod`-equivalent via `std::os::unix::fs::PermissionsExt`
-  (mode masked `0o7777`); on Windows, the no-write bits
-  (`0o222` for owner/group/other) map to clearing the read-only
-  attribute — write-enable always wins (an attribute cannot express
-  read-denial; documenting the lossy direction is the honest choice).
+  on unix, `chmod` via `std::os::unix::fs::PermissionsExt` (mode masked
+  `0o7777`); on Windows, a mode with **no** write bit (`mode & 0o222 ==
+  0`) sets the read-only attribute and any write bit clears it —
+  write-enable always wins (an attribute cannot express read-denial;
+  documenting the lossy direction is the honest choice). Both metadata
+  writes are best-effort: a failure is a warning, never a failed sync
+  (the content is already verified and committed).
   Directories: mode applies to created directories at creation time;
   pre-existing directories keep their mode (the receiver's directory is
   not replaced — matching the "dir with files needs no entry" rule).
-- **Order is load-bearing:** mode write → mtime write → stat → D15 index
-  write. The index must record the post-metadata mtime or every
-  metadata-synced file re-syncs (§16.6's ordering rule, extended one
-  step earlier).
+- **Order is load-bearing:** mtime write → mode write → stat → D15 index
+  write (amended 2026-11; the v4 text had mode first). The index must
+  record the sender's mtime or every metadata-synced file re-syncs
+  (§16.6's ordering rule). Neither chmod nor the Windows read-only
+  attribute changes the mtime, so mode may follow it — and must: a
+  read-only mode applied first made the mtime write fail (EACCES for a
+  non-root unix user, os error 5 on Windows).
 - **Index (D15): no change.** The index stays (chunk list, root, size,
   mtime): triage never reads mode (chmod-only changes are accepted as
   not-synced — the §16.3 invariant), the sender's manifest mode comes
   from a fresh metadata scan at session start (never from the index —
   the tree scan is metadata-only and always current), and the per-file
-  warm path serves chunks, not metadata. Applying mode before mtime
-  (above) keeps the index's recorded mtime correct without mode ever
+  warm path serves chunks, not metadata. Mode never touches the mtime,
+  so the index's recorded mtime stays correct without mode ever
   touching the index. (An earlier draft of this section bumped the index
   codec for a mode field; the implementation review dropped it — nothing
   consumes it.)
