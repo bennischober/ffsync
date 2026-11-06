@@ -510,8 +510,18 @@ where
     // arrival order, duplicates kept - identical periodic content repeats
     // hashes and the map must not collapse the layout) for the
     // layout-reproduction check below.
+    //
+    // Memory bound (§12 spirit): the receiver controls how many manifest
+    // frames arrive. Only hashes we can actually plan against (our own
+    // source chunks) are kept in the map, and the positional list stops
+    // growing once it exceeds our chunk count — past that point the layout
+    // cannot be reproduced anyway (`manifest_overflow`). Sender memory stays
+    // O(own chunks) whatever the peer sends.
+    let source_hashes: std::collections::HashSet<Hash> =
+        source_chunks.iter().map(|c| c.hash).collect();
     let mut manifest: HashMap<Hash, u64> = HashMap::new();
     let mut manifest_chunks: Vec<(Hash, u64, u32)> = Vec::new();
+    let mut manifest_overflow = false;
     // §9.2 eager state: the sender's position gate (§6.2) — a chunk is
     // offered once manifest consumption has passed chunk.offset + 2*cdc_avg
     // without a match (or the manifest is done); elsewhere a late match
@@ -543,12 +553,22 @@ where
         if covered || (!manifest_done && chunk.offset + 2 * cdc.1 as u64 > consumed_upto) {
             return Ok(0); // still rescuable, or already covered
         }
-        let file = eager_file.get_or_insert_with(|| {
-            File::open(&request.path).expect("sender file open for eager DATA")
-        });
-        let compressor = eager_compressor.get_or_insert_with(|| {
-            zstd::bulk::Compressor::new(3).expect("zstd context for eager DATA")
-        });
+        // A hash repeated in the source is offered once: the receiver
+        // buffers by hash and serves every plan occurrence from it.
+        if eager_offered.contains(&chunk.hash) {
+            return Ok(0);
+        }
+        // I/O and zstd setup failures are session errors, never panics.
+        if eager_file.is_none() {
+            eager_file = Some(File::open(&request.path)?);
+        }
+        if eager_compressor.is_none() {
+            eager_compressor = Some(zstd::bulk::Compressor::new(3)?);
+        }
+        let (Some(file), Some(compressor)) = (eager_file.as_mut(), eager_compressor.as_mut())
+        else {
+            unreachable!("eager file and compressor initialized above");
+        };
         let mut buf = Vec::with_capacity(chunk.length);
         use std::io::{Read as _, Seek as _};
         file.seek(io::SeekFrom::Start(chunk.offset))?;
@@ -568,22 +588,25 @@ where
             framing::T_MANIFEST_CHUNK => {
                 let entry = ManifestChunk::from_frame(frame)
                     .map_err(|e| SyncError::Protocol(format!("bad manifest chunk: {}", e)))?;
-                manifest.insert(entry.hash, entry.offset);
-                manifest_chunks.push((entry.hash, entry.offset, entry.length));
-                let consumed = entry.offset + entry.length as u64;
-                for chunk in source_chunks[eager_scan..]
+                if source_hashes.contains(&entry.hash) {
+                    manifest.insert(entry.hash, entry.offset);
+                }
+                if manifest_chunks.len() < source_chunks.len() {
+                    manifest_chunks.push((entry.hash, entry.offset, entry.length));
+                } else {
+                    manifest_overflow = true;
+                }
+                let consumed = entry.offset.saturating_add(entry.length as u64);
+                let ready = source_chunks[eager_scan..]
                     .iter()
                     .take_while(|c| c.offset < consumed)
-                {
+                    .count();
+                for chunk in &source_chunks[eager_scan..eager_scan + ready] {
                     let offered =
                         offer_eager_chunk(chunk, &manifest, consumed, false, eager_sent, stream)?;
                     eager_sent += offered;
                 }
-                eager_scan = eager_scan
-                    + source_chunks[eager_scan..]
-                        .iter()
-                        .take_while(|c| c.offset < consumed)
-                        .count();
+                eager_scan += ready;
             }
             framing::T_MANIFEST_DONE => {
                 for chunk in &source_chunks[eager_scan..] {
@@ -641,6 +664,7 @@ where
     // or shifted region) executes on the receiver and reports Transferred
     // with 0 wire bytes.
     let layout_reproduced = !plan.is_empty()
+        && !manifest_overflow
         && plan.len() == manifest_chunks.len()
         && plan
             .iter()
@@ -791,6 +815,46 @@ where
             other
         ))),
     }
+}
+
+/// Validates one received plan entry against §12's resource limits: a
+/// non-empty span no longer than the session's CDC max (`max_chunk`),
+/// ending inside the declared `file_size` (overflow-checked — a u64
+/// `target_offset` near `u64::MAX` must not wrap past the bound).
+fn validate_plan_entry(
+    entry: &PlanEntry,
+    file_size: u64,
+    max_chunk: usize,
+) -> Result<(), &'static str> {
+    let (target_offset, length) = match *entry {
+        PlanEntry::Local {
+            target_offset,
+            length,
+            ..
+        }
+        | PlanEntry::Remote {
+            target_offset,
+            length,
+            ..
+        } => (target_offset, length),
+    };
+    if length == 0 || length as usize > max_chunk {
+        return Err("plan chunk length outside the session's CDC bounds");
+    }
+    match target_offset.checked_add(length as u64) {
+        Some(end) if end <= file_size => Ok(()),
+        _ => Err("plan chunk extends beyond the declared file size"),
+    }
+}
+
+/// Upper bound on the plan entries an honest sender can produce for a
+/// `file_size`-byte file chunked with minimum chunk size `min_chunk`: every
+/// chunk is at least `min_chunk` long except the tail of each pipeline
+/// region (regions are far larger than `min_chunk`), so `2 * size / min + 2`
+/// can never reject a real plan while bounding a hostile one.
+fn max_plan_entries(file_size: u64, min_chunk: usize) -> usize {
+    let per_min = file_size / (min_chunk.max(1) as u64);
+    usize::try_from(per_min.saturating_mul(2).saturating_add(2)).unwrap_or(usize::MAX)
 }
 
 /// Runs the receiver side of a sync over `stream`.
@@ -1202,6 +1266,21 @@ where
             framing::T_PLAN_LOCAL | framing::T_PLAN_REMOTE => {
                 let entry = PlanEntry::from_frame(frame)
                     .map_err(|e| SyncError::Protocol(format!("bad plan entry: {}", e)))?;
+                // §12 resource limits, enforced as each entry arrives (before
+                // any allocation is sized from it): the span stays inside
+                // the declared file size (overflow-safe), no chunk exceeds
+                // the session's CDC max, and the entry count stays within
+                // what an honest chunking of `file_size` can produce.
+                if let Err(why) = validate_plan_entry(&entry, peer.file_size, cdc.2) {
+                    return Err(send_error_and_finish(stream, ErrorCode::BadFrame, why));
+                }
+                if plan.len() >= max_plan_entries(peer.file_size, cdc.0) {
+                    return Err(send_error_and_finish(
+                        stream,
+                        ErrorCode::BadFrame,
+                        "plan has more entries than the declared file size allows",
+                    ));
+                }
                 if let PlanEntry::Remote { length, .. } = entry {
                     remote_total += length as u64;
                 }
@@ -1357,17 +1436,19 @@ where
                             "plan references a chunk not in our manifest",
                         )
                     })?;
-                    let offset = match origin {
-                        LocalOrigin::Temp { offset, .. } => *offset,
-                        LocalOrigin::Foreign { offset, .. } => *offset,
+                    let (offset, origin_len) = match origin {
+                        LocalOrigin::Temp { offset, length } => (*offset, *length),
+                        LocalOrigin::Foreign { offset, length, .. } => (*offset, *length),
                     };
-                    // Spec §12 resource limits: writes stay inside the
-                    // declared file size.
-                    if target_offset + length as u64 > target_size {
+                    // §6.1: a local match is an exact (hash, length) match —
+                    // a PLAN_LOCAL whose length disagrees with our own
+                    // manifest entry is malformed (and must not size the
+                    // scratch read). Span bounds were checked on receipt.
+                    if length as usize != origin_len {
                         return Err(send_error_and_finish(
                             stream,
                             ErrorCode::BadFrame,
-                            "plan chunk extends beyond the declared file size",
+                            "plan chunk length does not match our manifest entry",
                         ));
                     }
                     match origin {
@@ -1448,10 +1529,17 @@ where
                     // chunks the sender declared via the plan but never
                     // offered (not eager-active, or offered-late) come from
                     // the wire now.
-                    let compressed = match eager_buf.get(&hash) {
-                        Some(c) => c.clone(),
+                    // (Span bounds and the CDC-max length cap were checked
+                    // when the entry arrived — before the decompressor below
+                    // sizes its output buffer from `length`.)
+                    // Borrowed, not removed: a hash repeated across Remote
+                    // entries is offered once and served from the buffer for
+                    // every occurrence (the sender skips all of them).
+                    let wire_payload;
+                    let compressed: &[u8] = match eager_buf.get(&hash) {
+                        Some(c) => c,
                         None => {
-                            let (data_hash, compressed) = message::read_data(stream)?;
+                            let (data_hash, payload) = message::read_data(stream)?;
                             if data_hash != hash {
                                 return Err(send_error_and_finish(
                                     stream,
@@ -1459,29 +1547,21 @@ where
                                     "DATA hash does not match plan",
                                 ));
                             }
-                            compressed
+                            wire_payload = payload;
+                            &wire_payload
                         }
                     };
                     // One zstd context reused across all chunks (see the
                     // sender's data phase for the reasoning).
                     let decompressed = DECOMPRESSOR.with(|d| {
                         let mut decompressor = d.borrow_mut();
-                        decompressor.decompress(&compressed, length as usize)
+                        decompressor.decompress(compressed, length as usize)
                     })?;
                     if decompressed.len() != length as usize {
                         return Err(send_error_and_finish(
                             stream,
                             ErrorCode::BadFrame,
                             "decompressed length mismatch",
-                        ));
-                    }
-                    // Spec §12 resource limits: chunk data must never
-                    // overflow the sender's declared file size.
-                    if target_offset + length as u64 > target_size {
-                        return Err(send_error_and_finish(
-                            stream,
-                            ErrorCode::BadFrame,
-                            "plan chunk extends beyond the declared file size",
                         ));
                     }
                     let task = ReconstructionTask {
@@ -1520,14 +1600,13 @@ where
         // the rename is journaled, the data pages are not; renaming
         // without fsync can leave a renamed-but-empty target after a
         // crash on some filesystems) and rename atomically. Order is
-        // load-bearing (§16.9): sync → rename → mode → mtime → stat →
+        // load-bearing (§16.9): sync → rename → mtime → mode → stat →
         // index.
         reconstructor.sync_temp()?;
         clear_readonly_best_effort(&request.path);
         std::fs::rename(&temp_path, &request.path)?;
         fsync_parent_dir_best_effort(&request.path);
-        apply_commit_mode(&request.path, request.apply_mode)?;
-        apply_commit_mtime(&request)?;
+        apply_commit_metadata(&request);
         // Persist the verified state for the next warm start (D15): the
         // verified temp scan is exactly the index content. The index
         // records the mtime AFTER it was set to the sender's (§16.6), so
@@ -1597,12 +1676,10 @@ where
             // file is empty); drop it before truncating.
             let _ = std::fs::remove_file(&temp_path);
         }
-        // Truncate the target to empty (create if absent), carry the
-        // sender's mtime, and persist the empty index (D15).
-        clear_readonly_best_effort(&request.path);
-        std::fs::File::create(&request.path)?.set_len(0)?;
-        apply_commit_mode(&request.path, request.apply_mode)?;
-        apply_commit_mtime(&request)?;
+        // Replace the target with an empty file (create if absent), carry
+        // the sender's mtime, and persist the empty index (D15).
+        commit_empty_file(&request.path, &temp_path)?;
+        apply_commit_metadata(&request);
         let _ = crate::index::write_index(
             &request.path,
             &FileIndex::from_scan(
@@ -1641,8 +1718,7 @@ where
             //   local_source, path local_source), so a repeated
             //   --from sync warm-starts the receiver's scan. Never
             //   index the target from another file's content.
-            apply_commit_mode(&request.path, request.apply_mode)?;
-            apply_commit_mtime(&request)?;
+            apply_commit_metadata(&request);
             if request.local_source == request.path {
                 let _ = crate::index::write_index(
                     &request.path,
@@ -1693,11 +1769,9 @@ where
                 if resuming {
                     std::fs::remove_file(&temp_path).ok();
                 }
-                // Truncate the target to empty (or create it).
-                clear_readonly_best_effort(&request.path);
-                std::fs::File::create(&request.path)?.set_len(0)?;
-                apply_commit_mode(&request.path, request.apply_mode)?;
-                apply_commit_mtime(&request)?;
+                // Replace the target with an empty file (or create it).
+                commit_empty_file(&request.path, &temp_path)?;
+                apply_commit_metadata(&request);
                 let _ = crate::index::write_index(
                     &request.path,
                     &FileIndex::from_scan(
@@ -1771,18 +1845,60 @@ fn fsync_parent_dir_best_effort(path: &Path) {
 #[cfg(not(unix))]
 fn fsync_parent_dir_best_effort(_path: &Path) {}
 
-/// Applies the sender's POSIX mode bits to the committed target (§16.9,
-/// tree mode only, BEFORE the mtime write — the D15 index must record the
-/// post-metadata mtime). Best-effort like mtime: a failure must not fail a
-/// verified sync, but it will cause the file's mode to diverge until the
-/// next sync of that file applies it again.
+/// Replaces `path` with an empty file through the temp path + atomic
+/// rename, like every other commit. Truncating in place needs write access
+/// to the existing target, which a read-only (e.g. `0o444`) target denies
+/// on unix even to its owner; rename replaces the directory entry and
+/// ignores the old file's mode.
+fn commit_empty_file(path: &Path, temp_path: &Path) -> io::Result<()> {
+    let f = std::fs::File::create(temp_path)?;
+    f.sync_all()?;
+    drop(f);
+    clear_readonly_best_effort(path);
+    std::fs::rename(temp_path, path)?;
+    fsync_parent_dir_best_effort(path);
+    Ok(())
+}
+
+/// Applies the sender's mtime (§16.6) and then its mode bits (§16.9) to the
+/// committed target. Best-effort, as both specs require: the content is
+/// already verified and renamed into place, so a metadata failure must not
+/// fail the sync. It is reported as a warning; the cost is that the next
+/// tree sync re-checks the file (self-healing).
 ///
-/// Unix: fchmod-equivalent with the masked `0o7777` bits (exact).
-/// Windows: the no-write bits (`0o200`/`0o020`/`0o002`) map to setting the
-/// read-only attribute; any write-enabled bit clears it. This is lossy by
-/// design — an NTFS attribute cannot express read-denial per class, and
-/// write-enable winning is the safe direction (a read-only file that should
-/// be writable would otherwise break every later sync's writes).
+/// Order: mtime BEFORE mode. Applying a read-only mode first made the mtime
+/// write fail (it needed a writable handle): EACCES for a non-root unix
+/// user, os error 5 on Windows. Neither chmod nor the Windows read-only
+/// attribute touches the mtime, so the D15 index written afterwards still
+/// records the sender's mtime.
+fn apply_commit_metadata(request: &ReceiveRequest) {
+    if let Err(e) = apply_commit_mtime(request) {
+        eprintln!(
+            "warning: could not set mtime on {}: {}",
+            request.path.display(),
+            e
+        );
+    }
+    if let Err(e) = apply_commit_mode(&request.path, request.apply_mode) {
+        eprintln!(
+            "warning: could not set mode on {}: {}",
+            request.path.display(),
+            e
+        );
+    }
+}
+
+/// Applies the sender's POSIX mode bits to the committed target (§16.9,
+/// tree mode only). Called through [`apply_commit_metadata`].
+///
+/// Unix: chmod with the masked `0o7777` bits (exact). No writable handle is
+/// needed — the owner may chmod a read-only file.
+/// Windows: a mode with NO write bit (`0o200`/`0o020`/`0o002` all clear)
+/// sets the read-only attribute; any write-enabled bit clears it. This is
+/// lossy by design — an NTFS attribute cannot express read-denial per
+/// class, and write-enable winning is the safe direction (a read-only file
+/// that should be writable would otherwise break every later sync's
+/// writes).
 fn apply_commit_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     let Some(bits) = mode.filter(|m| *m != 0) else {
         return Ok(()); // no metadata section, or sender has no mode concept
@@ -1790,16 +1906,18 @@ fn apply_commit_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let f = std::fs::OpenOptions::new().write(true).open(path)?;
-        f.set_permissions(std::fs::Permissions::from_mode(bits))?;
-        Ok(())
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits & 0o7777))
     }
     #[cfg(windows)]
     {
-        let write_denied = bits & 0o222 != 0;
+        let write_denied = windows_mode_is_read_only(bits);
         let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_readonly(write_denied);
-        std::fs::set_permissions(path, perms)?;
+        if perms.readonly() != write_denied {
+            // Both directions are intended here (§16.9 mapping).
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(write_denied);
+            std::fs::set_permissions(path, perms)?;
+        }
         Ok(())
     }
     #[cfg(not(any(unix, windows)))]
@@ -1809,22 +1927,42 @@ fn apply_commit_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     }
 }
 
+/// The §16.9 Windows mapping: read-only iff the mode grants write to no
+/// class. (`&` binds tighter than `==` in Rust, unlike C.)
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_mode_is_read_only(bits: u32) -> bool {
+    bits & 0o222 == 0
+}
+
 /// Applies the sender's mtime to the committed target file (§16.6, tree
 /// mode only): the receiver's file must carry the sender's mtime so the
 /// next tree sync's metadata triage skips it, and both peers' D15 indexes
-/// record the same mtime. Best-effort: a failure to set mtime must not
-/// fail a verified sync — but it WILL cause the next tree sync to re-check
-/// this file (its triage metadata will differ), which is self-healing.
+/// record the same mtime. Called through [`apply_commit_metadata`].
+///
+/// The handle requests the least access that can set times, so a read-only
+/// target (an unchanged file on the no-rewrite path) still works: a
+/// read-only fd on unix (futimens is an owner check, not a write check),
+/// `FILE_WRITE_ATTRIBUTES` on Windows (the read-only attribute blocks data
+/// writes, not attribute writes).
 fn apply_commit_mtime(request: &ReceiveRequest) -> io::Result<()> {
     let Some((secs, nanos)) = request.apply_mtime else {
         return Ok(());
     };
-    if secs == 0 && nanos == 0 {
-        return Ok(()); // sender had no mtime; leave ours
+    // (0, 0) is applied literally, as the epoch: the wire mtime is unsigned,
+    // so a sender file dated before 1970 (or with no readable mtime) reports
+    // (0, 0). Skipping the write here left the receiver's own mtime in place,
+    // the triage metadata never matched, and the file re-synced on every
+    // run. Writing the epoch makes the receiver's scan report (0, 0) too.
+    let mut opts = std::fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        opts.access_mode(FILE_WRITE_ATTRIBUTES);
     }
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&request.path)?;
+    #[cfg(not(windows))]
+    opts.read(true);
+    let f = opts.open(&request.path)?;
     f.set_modified(UNIX_EPOCH + std::time::Duration::new(secs, nanos))
 }
 
@@ -1880,6 +2018,90 @@ fn scan_file_plain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote(target_offset: u64, length: u32) -> PlanEntry {
+        PlanEntry::Remote {
+            target_offset,
+            length,
+            hash: blake3::hash(b"x"),
+        }
+    }
+
+    #[test]
+    fn plan_entry_bounds_are_overflow_safe() {
+        let max = 1024 * 1024;
+        assert!(validate_plan_entry(&remote(0, 4096), 4096, max).is_ok());
+        assert!(validate_plan_entry(&remote(4096, 1), 4096, max).is_err());
+        assert!(
+            validate_plan_entry(&remote(0, 0), 4096, max).is_err(),
+            "empty span"
+        );
+        // Would wrap to a tiny end offset with unchecked u64 addition.
+        assert!(validate_plan_entry(&remote(u64::MAX - 10, 4096), u64::MAX, max).is_err());
+        // A 4 GiB claimed chunk must be refused before anything sizes a
+        // buffer from it, whatever the declared file size.
+        assert!(validate_plan_entry(&remote(0, u32::MAX), u64::MAX, max).is_err());
+    }
+
+    #[test]
+    fn plan_entry_cap_admits_honest_plans() {
+        assert_eq!(max_plan_entries(0, 65536), 2);
+        // An honest chunking produces at most size/min + regions + 1.
+        let size = 10 * 1024 * 1024 * 1024u64;
+        assert!(max_plan_entries(size, 65536) as u64 > size / 65536 + size / (256 << 20));
+        assert_eq!(max_plan_entries(u64::MAX, 0), usize::MAX);
+    }
+
+    #[test]
+    fn windows_mode_mapping_is_read_only_iff_no_write_bit() {
+        assert!(!windows_mode_is_read_only(0o644), "owner-writable");
+        assert!(!windows_mode_is_read_only(0o755));
+        assert!(!windows_mode_is_read_only(0o464), "group write still wins");
+        assert!(windows_mode_is_read_only(0o444));
+        assert!(windows_mode_is_read_only(0o555));
+    }
+
+    #[test]
+    fn commit_metadata_handles_read_only_modes_both_ways() {
+        let dir = std::env::temp_dir().join(format!("ffsync-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.bin");
+        std::fs::write(&path, b"content").unwrap();
+        let mut req = ReceiveRequest {
+            path: path.clone(),
+            local_source: path.clone(),
+            force_checksum: false,
+            tree: true,
+            eager: false,
+            extra_sources: Vec::new(),
+            apply_mtime: Some((1_600_000_000, 123_400)),
+            apply_mode: Some(0o444),
+        };
+        let mtime_of = |p: &Path| crate::index::stat_mtime(p).unwrap();
+
+        // Read-only mode: the mtime must still land (it used to be written
+        // AFTER the mode, through a writable handle the mode now denies).
+        apply_commit_metadata(&req);
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(mtime_of(&path), (1_600_000_000, 123_400));
+
+        // Same read-only file, now a writable sender mode and a new mtime
+        // (the no-rewrite path applies metadata to an existing target).
+        req.apply_mtime = Some((1_700_000_000, 500));
+        req.apply_mode = Some(0o644);
+        apply_commit_metadata(&req);
+        assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(mtime_of(&path), (1_700_000_000, 500));
+
+        // A pre-1970 (or unreadable) sender mtime travels as (0, 0) and must
+        // be applied as the epoch, or the receiver's scan never agrees and
+        // the file re-syncs on every tree run.
+        req.apply_mtime = Some((0, 0));
+        apply_commit_metadata(&req);
+        assert_eq!(mtime_of(&path), (0, 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hello_accepts_eager_bit_decline_is_session_level() {

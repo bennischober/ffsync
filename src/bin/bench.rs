@@ -273,6 +273,16 @@ fn parse_cdc(value: &str) -> (usize, usize, usize) {
     if triple.0 % 2 != 0 || triple.1 % 2 != 0 || triple.2 % 2 != 0 {
         die("--cdc values must be even (fastcdc 5.0 requirement)");
     }
+    let fits_u32 = |v: usize| u32::try_from(v).ok();
+    let in_range = match (fits_u32(triple.0), fits_u32(triple.1), fits_u32(triple.2)) {
+        (Some(a), Some(b), Some(c)) => ffsync::chunking::sane_cdc_params((a, b, c)),
+        _ => false,
+    };
+    if !in_range {
+        die(
+            "--cdc values outside fastcdc 5.0's supported ranges              (min 64..=1m, avg 256..=4m, max 1k..=16m)",
+        );
+    }
     triple
 }
 

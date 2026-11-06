@@ -33,8 +33,15 @@ to the sync protocol seam.
   applies the TOFU decision (prompt or `--trust`) AFTER the handshake, before
   any sync data.
 - Pins are a set, not per-name entries; any pinned fingerprint may connect in
-  either role. Worker connections authenticate with the SAME pin policy as
-  the control connection (closures injected by the CLI).
+  either role. Worker connections (§16.8) are pinned to the control
+  connection's fingerprint only — not the whole set (closures injected by
+  the CLI, `authenticate_worker` in main.rs).
+- Identity creation: only `NotFound` may create a new `identity.bin`
+  (any other read error is returned — falling through would overwrite a
+  valid key). The key file is created `0600` at open (never chmod after),
+  fsynced, and published with a hard link so racing first runs agree on
+  one identity. pins.conf rewrites are fsynced, and `untrust` keeps
+  comments/labels.
 - `--plaintext` bypasses TLS entirely (TCP only); QUIC shares identity/pins.
 
 ## ANTI-PATTERNS (THIS PROJECT)
