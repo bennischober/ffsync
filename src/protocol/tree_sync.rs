@@ -30,6 +30,7 @@
 //! from the same two manifests, so the receiver knows exactly which files
 //! will have conversations and fails loudly on any unexpected HELLO.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -240,6 +241,89 @@ fn send_tree_begin(
     Ok(())
 }
 
+/// Removes the ffsync sidecars in `dir` whose target is gone (§16.5): a
+/// temp left by an interrupted sync of a file the sender has since deleted,
+/// the index of a file removed outside ffsync, a pre-D6-amendment temp
+/// (`a.ffsync-tmp` for `a.mkv`). A sidecar whose target still exists is
+/// left alone (that target is protected, so the directory stays anyway).
+fn remove_orphan_sidecars(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(target) = name
+            .strip_suffix(".ffsync-tmp")
+            .or_else(|| name.strip_suffix(".ffsync-index"))
+        else {
+            continue;
+        };
+        if !target.is_empty() && dir.join(target).exists() {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// D22 rename-census candidates: receiver file size → the rel paths of
+/// that size, sorted. Built once per session (one lookup per new file
+/// instead of a scan over the whole manifest).
+type CensusIndex = std::collections::HashMap<u64, Vec<String>>;
+
+/// A sender worker thread's report to the control thread (§16.8).
+enum SenderEvent {
+    Start,
+    Progress(String, Progress),
+    Done,
+}
+
+/// Session-wide conversation counters for a parallel sender, so the
+/// 0-based indices in FileStart/FileDone count every connection.
+#[derive(Default)]
+struct SessionCounts {
+    started: usize,
+    done: usize,
+}
+
+impl SessionCounts {
+    fn start(&mut self) -> usize {
+        self.started += 1;
+        self.started - 1
+    }
+
+    fn done(&mut self) -> usize {
+        self.done += 1;
+        self.done - 1
+    }
+
+    fn forward(&mut self, ev: SenderEvent, total: usize, progress: &mut dyn FnMut(TreeProgress)) {
+        match ev {
+            SenderEvent::Start => progress(TreeProgress::FileStart(self.start(), total)),
+            SenderEvent::Progress(rel_path, p) => progress(TreeProgress::FileProgress {
+                rel_path,
+                progress: p,
+            }),
+            SenderEvent::Done => progress(TreeProgress::FileDone(self.done(), total)),
+        }
+    }
+
+    fn forward_pending(
+        &mut self,
+        rx: &std::sync::mpsc::Receiver<SenderEvent>,
+        total: usize,
+        progress: &mut dyn FnMut(TreeProgress),
+    ) {
+        while let Ok(ev) = rx.try_recv() {
+            self.forward(ev, total, progress);
+        }
+    }
+}
+
 /// Builds the receiver-side filesystem path for a relative tree path.
 /// The rel path was validated at manifest decode (no `..`, no backslash),
 /// so a plain join cannot escape the root.
@@ -435,7 +519,12 @@ where
             .filter_map(|rel| {
                 manifest.get(rel).map(|e| {
                     peer_manifest.get(rel).map_or(e.size, |p| {
-                        if p.size == e.size && p.mtime_secs == e.mtime_secs {
+                        // Same predicate as the triage fast path: nanos
+                        // included (a same-second rewrite is a change).
+                        if p.size == e.size
+                            && p.mtime_secs == e.mtime_secs
+                            && p.mtime_nanos == e.mtime_nanos
+                        {
                             0
                         } else {
                             e.size
@@ -531,9 +620,12 @@ where
             (i < len).then_some(i)
         };
         // Shared progress funnel: worker threads cannot call the non-Send
-        // progress closure; they send (rel_path, Progress) events the
-        // control thread drains after joining.
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(String, Progress)>();
+        // progress closure; they send events the control thread forwards
+        // live — between and during its own conversations, and while it
+        // waits for the workers — so FileStart/FileDone carry SESSION-wide
+        // counts, not partition-local indices.
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<SenderEvent>();
+        let mut counts = SessionCounts::default();
         // Every worker index 1..K announces itself — even when the queue
         // is already drained — because the receiver expects exactly that
         // set (§16.8); it connects, announces, and immediately closes when
@@ -581,6 +673,7 @@ where
                 let mut outcomes = Vec::new();
                 while let Some(i) = next_job(&cursor, &stop, queue.len()) {
                     let rel = &queue[i];
+                    let _ = tx.send(SenderEvent::Start);
                     let _ = message::TreeFile {
                         rel_path: rel.clone(),
                     }
@@ -596,10 +689,13 @@ where
                         eager_active,
                         &pipeline,
                         &mut |p| {
-                            let _ = tx.send((rel_c.clone(), p));
+                            let _ = tx.send(SenderEvent::Progress(rel_c.clone(), p));
                         },
                     ) {
-                        Ok(o) => outcomes.push(o),
+                        Ok(o) => {
+                            outcomes.push(o);
+                            let _ = tx.send(SenderEvent::Done);
+                        }
                         Err(e) => {
                             stop.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = send_error_and_finish(
@@ -622,7 +718,8 @@ where
         let mut control_error: Option<SyncError> = None;
         while let Some(idx) = next_job(&cursor, &stop, queue.len()) {
             let rel = &queue[idx];
-            progress(TreeProgress::FileStart(idx, total));
+            counts.forward_pending(&progress_rx, total, progress);
+            progress(TreeProgress::FileStart(counts.start(), total));
             let _ = message::TreeFile {
                 rel_path: rel.clone(),
             }
@@ -640,7 +737,8 @@ where
                     progress(TreeProgress::FileProgress {
                         rel_path: rel.clone(),
                         progress: p,
-                    })
+                    });
+                    counts.forward_pending(&progress_rx, total, progress);
                 },
             ) {
                 Ok(o) => o,
@@ -656,7 +754,14 @@ where
                 SyncOutcome::Transferred { bytes, .. } => transferred_bytes += bytes,
                 SyncOutcome::WouldChange => {} // unreachable: dry-run sessions skip the conversation phase
             }
-            progress(TreeProgress::FileDone(idx, total));
+            progress(TreeProgress::FileDone(counts.done(), total));
+        }
+
+        // Keep forwarding worker events until every worker has exited (each
+        // drops its sender clone; ours goes first), THEN join.
+        drop(progress_tx);
+        for ev in progress_rx.iter() {
+            counts.forward(ev, total, progress);
         }
 
         // Join workers; aggregate outcomes. First error wins (§16.8: any
@@ -674,14 +779,6 @@ where
                 }
             }
             worker_errors[w] = err;
-        }
-        drop(progress_tx);
-        // Final drain (workers are joined; the channel is closed once empty).
-        while let Ok((rel_path, p)) = progress_rx.try_recv() {
-            progress(TreeProgress::FileProgress {
-                rel_path,
-                progress: p,
-            });
         }
         if let Some(e) = worker_errors.into_iter().flatten().next() {
             return Err(e);
@@ -739,6 +836,8 @@ where
     // No deadlock: the sender writes its TREE_BEGIN before blocking on ours.
     progress(TreeProgress::Scanning);
     let (peer_begin, peer_manifest) = read_tree_begin(stream)?;
+    // Shared with worker threads (§16.8) without a deep copy.
+    let peer_manifest = std::sync::Arc::new(peer_manifest);
     let sender_excludes = tree::ExcludeSet::from_patterns(&peer_begin.excludes)
         .map_err(|e| SyncError::Protocol(format!("peer sent bad exclude pattern: {e}")))?;
     let manifest =
@@ -810,6 +909,26 @@ where
     let mut conversation_paths: Vec<String> = Vec::new();
     let mut deletions: Vec<(String, u64)> = Vec::new();
 
+    // Case-fold indexes for the case-insensitive-receiver guards (§16.5):
+    // on NTFS/APFS a sender spelling (`Readme.md`, `Docs/`) and a
+    // receiver-only spelling (`README.md`, `docs/`) are ONE object. The
+    // folds only nominate candidates; `tree::same_file` decides, so a
+    // case-sensitive receiver keeps the exact-path semantics.
+    let mut sender_folds: HashMap<String, Vec<&str>> = HashMap::new();
+    for e in peer_manifest.entries() {
+        sender_folds
+            .entry(tree::case_fold(&e.rel_path))
+            .or_default()
+            .push(&e.rel_path);
+    }
+    let mut receiver_folds: HashMap<String, Vec<&str>> = HashMap::new();
+    for e in manifest.entries() {
+        receiver_folds
+            .entry(tree::case_fold(&e.rel_path))
+            .or_default()
+            .push(&e.rel_path);
+    }
+
     // Every path in the union of both manifests, in canonical order.
     let mut all_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for e in manifest.entries() {
@@ -842,6 +961,28 @@ where
                     continue;
                 }
                 let p = abs_path(&request.root, rel);
+                // Case-insensitive receiver: a receiver-only spelling of
+                // this dir (`docs` for the sender's `Docs`) already IS it.
+                // Rename it to the sender's spelling, or the next scan
+                // reports the old spelling and every file below it
+                // re-syncs each session. Parents sort before children, so
+                // nested variants are renamed top-down.
+                if p.is_dir()
+                    && let Some(variant) = receiver_folds
+                        .get(&tree::case_fold(rel))
+                        .into_iter()
+                        .flatten()
+                        .find(|v| {
+                            **v != rel.as_str()
+                                && peer_manifest.get(v).is_none()
+                                && tree::same_file(&abs_path(&request.root, v), &p)
+                        })
+                    && let Err(e) = std::fs::rename(abs_path(&request.root, variant), &p)
+                {
+                    announce!(SyncError::Protocol(format!(
+                        "cannot rename dir {variant} to {rel}: {e}"
+                    )));
+                }
                 if let Err(e) = std::fs::create_dir_all(&p) {
                     announce!(SyncError::Protocol(format!("cannot create dir {rel}: {e}")));
                 }
@@ -931,10 +1072,8 @@ where
             checksum: bool,
             eager: bool,
             pipeline: &'a crate::chunking::PipelineConfig,
-            /// D22: OUR files grouped by size (census size filter), each
-            /// group in manifest (sorted) order — the candidates are the
-            /// receiver's own same-size indexed files.
-            by_size: &'a std::collections::HashMap<u64, Vec<String>>,
+            /// D22: census candidates by size (see [`CensusIndex`]).
+            census: &'a CensusIndex,
         }
         fn run_one<S: Read + Write>(
             ctx: &ConvCtx<'_>,
@@ -953,7 +1092,7 @@ where
                 checksum,
                 eager,
                 pipeline,
-                by_size,
+                census,
             } = *ctx;
             progress(TreeProgress::FileStart(idx, total));
             let path = abs_path(root, rel);
@@ -980,13 +1119,8 @@ where
             let extra_sources = if std::fs::metadata(&path).is_err() {
                 let want_size = peer_meta.map(|(_, s)| s).unwrap_or(0);
                 let mut sources: Vec<PathBuf> = Vec::new();
-                // O(candidates of this size), not O(files): a fresh tree
-                // has every conversation take this branch, and scanning the
-                // whole size map per conversation was quadratic.
-                if want_size > 0
-                    && let Some(candidates) = by_size.get(&want_size)
-                {
-                    for cand_rel in candidates {
+                if want_size > 0 {
+                    for cand_rel in census.get(&want_size).into_iter().flatten() {
                         if sources.len() >= 8 {
                             break;
                         }
@@ -1039,30 +1173,37 @@ where
             Ok((outcome, rel.to_string()))
         }
 
-        // D22: OUR files grouped by size (census size filter) — the
-        // candidates are the receiver's own same-size indexed files (rename
-        // evidence lives in OUR tree: the old name), one map shared by
-        // sequential and parallel conversation paths. Manifest order is
-        // sorted, so each group (and thus the 8-candidate cap) is
-        // deterministic.
-        let mut by_size: std::collections::HashMap<u64, Vec<String>> =
-            std::collections::HashMap::new();
-        for e in manifest
-            .entries()
-            .filter(|e| e.kind == crate::tree::EntryKind::File && e.size > 0)
-        {
-            by_size.entry(e.size).or_default().push(e.rel_path.clone());
-        }
-        let by_size = std::sync::Arc::new(by_size);
-        // Shared with worker threads (§16.8) without a deep copy.
-        let peer_manifest = std::sync::Arc::new(peer_manifest);
+        // D22: census candidates — the receiver's own files (rename evidence
+        // lives in OUR tree: the old name), one index shared by sequential
+        // and parallel conversation paths. Files this session converses
+        // about are NOT candidates: in a parallel session another worker
+        // may be rewriting one while this conversation reads it (a spurious
+        // HashMismatch that failed the session and dropped the other
+        // worker's fresh index). Receiver-only files (the classic old name
+        // of a rename) and skipped files stay put until the delete pass.
+        let census = {
+            let conversing: std::collections::HashSet<&str> =
+                conversation_paths.iter().map(String::as_str).collect();
+            let mut by_size = CensusIndex::new();
+            // Manifest order is sorted, so each size bucket is sorted too:
+            // the 8-candidate cap picks the same files on every run.
+            for e in manifest.entries() {
+                if e.kind == crate::tree::EntryKind::File
+                    && e.size > 0
+                    && !conversing.contains(e.rel_path.as_str())
+                {
+                    by_size.entry(e.size).or_default().push(e.rel_path.clone());
+                }
+            }
+            std::sync::Arc::new(by_size)
+        };
         if k <= 1 {
             let ctx = ConvCtx {
                 root: &request.root,
                 checksum,
                 eager,
                 pipeline,
-                by_size: &by_size,
+                census: &census,
             };
             for (idx, rel) in conversation_paths.iter().enumerate() {
                 let peer_meta = peer_manifest
@@ -1155,8 +1296,8 @@ where
                 root: PathBuf,
                 checksum: bool,
                 eager: bool,
-                /// D22: OUR files grouped by size (census size filter).
-                by_size: std::sync::Arc<std::collections::HashMap<u64, Vec<String>>>,
+                /// D22: census candidates by size (shared, not copied).
+                census: std::sync::Arc<CensusIndex>,
                 /// The sender's manifest (mode/size lookups inside worker
                 /// closures), shared, not copied.
                 peer_manifest: std::sync::Arc<crate::tree::TreeManifest>,
@@ -1179,7 +1320,7 @@ where
                 root: request.root.clone(),
                 checksum,
                 eager,
-                by_size: std::sync::Arc::clone(&by_size),
+                census: std::sync::Arc::clone(&census),
                 peer_manifest: std::sync::Arc::clone(&peer_manifest),
                 pipeline: pipeline_clone(pipeline),
             });
@@ -1241,7 +1382,7 @@ where
                                 checksum: shared.checksum,
                                 eager: shared.eager,
                                 pipeline: &shared.pipeline,
-                                by_size: &shared.by_size,
+                                census: &shared.census,
                             },
                             &mut s,
                             &rel,
@@ -1365,7 +1506,7 @@ where
                                 checksum,
                                 eager,
                                 pipeline,
-                                by_size: &by_size,
+                                census: &shared.census,
                             },
                             stream,
                             &rel,
@@ -1524,6 +1665,27 @@ where
         }
     }
 
+    // Sender spellings that fold together (`a.txt` + `A.txt` from a
+    // case-sensitive sender) share ONE object on a case-insensitive
+    // receiver: the last conversation wins and the pair re-syncs every
+    // session. Unrepresentable here, so say so instead of looping silently.
+    for group in sender_folds.values().filter(|g| g.len() > 1) {
+        let first = abs_path(&request.root, group[0]);
+        let clashing: Vec<&str> = group[1..]
+            .iter()
+            .copied()
+            .filter(|s| tree::same_file(&first, &abs_path(&request.root, s)))
+            .collect();
+        if !clashing.is_empty() {
+            eprintln!(
+                "warning: sender paths differ only in case and share one file on this \
+                 case-insensitive filesystem (re-synced every session): {} vs {}",
+                group[0],
+                clashing.join(", ")
+            );
+        }
+    }
+
     // ---- Deletions (§16.5): only after every conversation succeeded ----
     // Exclude protection (§16.7): paths matching the receiver's own patterns
     // — directly or via an excluded ancestor — are never deleted, even
@@ -1540,14 +1702,30 @@ where
             if own_excludes.matches_path_or_ancestor(rel, kind) {
                 continue;
             }
+            // Case-insensitive receiver (§16.5): `README.md` is
+            // receiver-only by name, but if it is the same object as the
+            // sender's `Readme.md` (just committed under that spelling),
+            // removing it would delete the synced file. Not a deletion.
+            let p = abs_path(&request.root, rel);
+            if sender_folds
+                .get(&tree::case_fold(rel))
+                .into_iter()
+                .flatten()
+                .any(|s| tree::same_file(&p, &abs_path(&request.root, s)))
+            {
+                continue;
+            }
             if dry_run {
                 deleted_count += 1;
                 deleted_bytes += size;
                 progress(TreeProgress::Deleting(i + 1, deleted_bytes));
                 continue;
             }
-            let p = abs_path(&request.root, rel);
-            let res = if p.is_dir() {
+            let is_dir = p.is_dir();
+            let res = if is_dir {
+                // The manifest never lists sidecars, sender-excluded files
+                // or skipped names (§16.5), so the dir may not be empty yet.
+                remove_orphan_sidecars(&p);
                 std::fs::remove_dir(&p)
             } else {
                 std::fs::remove_file(&p)
@@ -1556,12 +1734,20 @@ where
                 Ok(()) => {
                     deleted_count += 1;
                     deleted_bytes += size;
-                    // Remove the orphaned D15 index of a deleted file. The
-                    // file is already gone at this point, so the is_file()
-                    // gate of the original code never fired for it — remove
-                    // unconditionally (remove_index is a no-op when absent).
-                    crate::index::remove_index(&p);
+                    if !is_dir {
+                        // The deleted file's own sidecars: its D15 index and
+                        // any temp left by an interrupted sync (both no-ops
+                        // when absent).
+                        crate::index::remove_index(&p);
+                        let _ = std::fs::remove_file(
+                            crate::reconstruction::Reconstructor::temp_path_for(&p),
+                        );
+                    }
                 }
+                // Still holds content this session must not touch (a
+                // receiver-protected or sender-excluded file, a skipped
+                // name): keep the directory (§16.5).
+                Err(e) if is_dir && e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
                 // Already gone — or its ancestor became a file when a kind
                 // conflict was resolved this session (the conflict removal
                 // destroyed the subtree, §16.3). On Linux that surfaces as
@@ -1571,7 +1757,11 @@ where
                     if e.kind() == io::ErrorKind::NotFound
                         || e.kind() == io::ErrorKind::NotADirectory => {}
                 Err(e) => {
-                    return Err(SyncError::Protocol(format!("cannot delete {rel}: {e}")));
+                    // The sender is blocked on our TREE_END reply: answer
+                    // with ERROR so it fails fast with the real reason.
+                    let err = SyncError::Protocol(format!("cannot delete {rel}: {e}"));
+                    let _ = send_error_and_finish(stream, ErrorCode::Aborted, &err.to_string());
+                    return Err(err);
                 }
             }
             progress(TreeProgress::Deleting(i + 1, deleted_bytes));

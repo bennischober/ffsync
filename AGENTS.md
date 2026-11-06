@@ -269,25 +269,37 @@ pre-existing.
   because it is stateless (`Send + Sync`). Preserve this split.
 - The mmap is created with `unsafe { Mmap::map }`; the underlying file must not
   be modified while the pipeline holds the mapping.
-- The reconstructor's temp path is derived with
-  `Path::with_extension("ffsync-tmp")`, which *replaces* the last extension
-  (`a.mkv` → `a.ffsync-tmp`). This differs from the `<.file.ext.ffsync-tmp>`
-  naming in the concept doc (recorded as D6 in `concept/Design Decisions.md`).
-  The index path does the OPPOSITE (appends `.ffsync-index`) because the
-  orphan cleanup must recover the target name by stripping the suffix; never
-  "fix" one to match the other.
+- Sidecar names APPEND their suffix: the temp is `a.mkv.ffsync-tmp`
+  (`Reconstructor::temp_path_for`, D6 amendment 2026-11) and the index is
+  `a.mkv.ffsync-index` (`index_path_for`). Never derive either with
+  `Path::with_extension` — substituting the extension mapped `a.mkv` and
+  `a.mp4` to one temp (a §16.8 parallel collision), and the orphan cleanup
+  recovers target names by stripping the index suffix. Both stay visible
+  (no leading-dot convention; the tree scan filters them by suffix).
 - Sub-second mtime is load-bearing in two places: the index validation and
   the §4 wire fast path (HELLO `file_mtime_nanos`, protocol v2). Whole-second
   comparisons let a same-second same-size rewrite pass as unchanged — a
-  silent wrong-content sync. Any new metadata-based fast path must compare
-  at the finest available granularity.
+  silent wrong-content sync. Peer-vs-peer comparisons (§4 fast path, tree
+  triage) go through `tree::mtimes_match`, which compares at **100 ns** —
+  NTFS's tick; an exact-ns compare made every Linux→Windows sync re-check
+  forever (D23). The index validation stays exact (same local FS). Never
+  widen beyond 100 ns, never compare whole seconds.
+- Case-insensitive receivers (D23): triage compares paths byte-exactly by
+  design (identical on both peers); the receiver's delete pass and
+  CreateDir branch guard case-only renames with `tree::case_fold`
+  (nominates) + `tree::same_file` (decides). Do not drop the identity
+  check — on a case-sensitive FS two spellings are two files and the
+  delete must run.
 - mtime preservation on commit (§16.6, v3) is what makes tree syncs skip:
   the receiver sets the target's mtime to the sender's *before* writing the
   D15 index (order: rename → set_modified → stat → write_index). Reversing
   the order leaves the index recording the wrong mtime and every subsequent
   tree sync re-checks the file.
-- Mode bits (§16.9, v4/D18) extend that ordering: rename → **apply_mode** →
-  set_modified → stat → write_index. Mode is never a triage input (a
+- Mode bits (§16.9, v4/D18) extend that ordering: rename → set_modified
+  → **apply_mode** → stat → write_index (D18 amendment, 2026-11: mode
+  first broke read-only modes — the mtime write was refused; chmod never
+  changes the mtime, so mode goes last). Both writes are best-effort
+  warnings via `apply_commit_metadata`, never a failed sync. Mode is never a triage input (a
   chmod-only change is not synced — the same trade as rsync's fast path);
   it rides conversations the size+mtime triage already starts. The
   metadata flag is sender-authoritative and mirrored by the receiver
@@ -315,7 +327,8 @@ pre-existing.
   ancestor junction on Windows needs no privilege and was a plausible
   infinite loop); file symlinks are followed, dangling ones warn+skip.
   Classification goes through symlink metadata, not the target's.
-- Tree manifests must exclude `*.ffsync-index` / `*.ffsync-tmp` — they are
+- Tree manifests must exclude `*.ffsync-index` / `*.ffsync-index-tmp` /
+  `*.ffsync-tmp` (`tree::is_sidecar`) — they are
   ffsync's own bookkeeping; syncing them would sync internal state and
   desync warm starts (an index written at commit changes mtime → re-sync
   loop). The scan filter in `src/tree.rs` is the single place this lives.
@@ -343,9 +356,13 @@ pre-existing.
   connection), so
   the sequential §16.5 barrier read is gated on `sender_end_consumed` —
   removing that gate deadlocks the sender on its TREE_END reply.
-- Worker connections authenticate with the SAME pin policy as the control
-  connection; the CLI's connect/accept closures handle that, and the
-  state machines stay transport-agnostic (the closures are injected).
+- Worker connections authenticate against the control connection's peer:
+  the CLI narrows the pin set to the ONE fingerprint the control
+  connection presented (`WorkerAuth`/`authenticate_worker` in main.rs),
+  so another pinned peer cannot inject conversations into a running
+  session; no first-use prompt, no per-worker "peer identity" line. The
+  connect/accept closures handle that, and the state machines stay
+  transport-agnostic (the closures are injected).
   Over QUIC (§17) the same closures open/accept extra streams on the one
   session connection — the membership protocol is unchanged.
 - QUIC teardown is NOT TCP teardown (§17.6): closing a QUIC connection
@@ -361,6 +378,21 @@ pre-existing.
   driver) — route them through the module's `block_on`, and give
   `client_session` its bounded handshake timeout (quinn retransmits
   Initials forever; a dead peer must fail loudly, §17.5).
+- Every CLI connection is wrapped ONCE in `protocol::BufStream` (64 KiB
+  read + write buffers, `buffered()` in `main.rs`); the bench wraps its
+  ends the same way. Liveness rests on flush-before-blocking-read: the
+  state machines flush at each request/response step, and the buffer
+  flushes itself when a read must wait. Never re-wrap a live connection
+  (read-ahead bytes belong to the next frame), never write to the inner
+  stream past the buffer, and keep per-frame flushes out of hot loops
+  (manifest/plan entries) — one flush per phase is the contract (§3).
+- Eager senders (§9.2) DECIDE and compress during the manifest exchange
+  but WRITE the DATA frames only after the receiver's MANIFEST_DONE: the
+  receiver streams its manifest without reading, so writing earlier
+  deadlocks on any transport with less buffering than the eager bytes +
+  remaining manifest. Held bytes are capped at `EAGER_BUF_CAP` (= the
+  receiver's cap). Do not "optimize" the writes back into the manifest
+  loop; `eager_does_not_deadlock_on_small_transport_buffers` pins it.
 - Windows is the primary development platform; keep platform-specific I/O
   behind `FileExt` cfg branches.
 - The identity file (`identity.bin`) holds the private key: `0600` on unix,

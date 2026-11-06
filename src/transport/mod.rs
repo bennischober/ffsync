@@ -26,7 +26,7 @@
 //! handshake signatures to verify against the presented key (rustls does
 //! that), so the pin binds to a key the peer demonstrably controls.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,34 +65,65 @@ impl Identity {
         })?;
         fs::create_dir_all(&dir)?;
         let path = dir.join(IDENTITY_FILE);
-        if let Ok(bytes) = fs::read(&path) {
-            if let Some(id) = decode_identity(&bytes) {
-                return Ok((id, false));
+        match fs::read(&path) {
+            Ok(bytes) => {
+                if let Some(id) = decode_identity(&bytes) {
+                    return Ok((id, false));
+                }
+                // Corrupt identity file: refuse to silently regenerate — a
+                // new cert would break every peer's pin silently. The user
+                // must delete the file explicitly (and re-pin peers).
+                return Err(io::Error::other(format!(
+                    "corrupt identity file: {} — delete it only if you intend to \
+                     re-pin every peer that trusts this machine",
+                    path.display()
+                )));
             }
-            // Corrupt identity file: refuse to silently regenerate — a new
-            // cert would break every peer's pin silently. The user must
-            // delete the file explicitly (and re-pin peers).
-            return Err(io::Error::other(format!(
-                "corrupt identity file: {} — delete it only if you intend to \
-                 re-pin every peer that trusts this machine",
-                path.display()
-            )));
+            // Only a missing file means "first run". Any other read error
+            // (permission denied, sharing violation, I/O error) must not
+            // fall through to generation: that would overwrite a valid
+            // identity and silently break every peer's pin.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot read identity file {}: {e}", path.display()),
+                ));
+            }
         }
         let id = Self::generate()?;
-        let tmp = path.with_extension("pem-tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&encode_identity(&id))?;
+        // The file holds the private key: it is created owner-only (0600 on
+        // unix, set at creation so the key is never briefly world-readable;
+        // Windows inherits the user-profile ACLs of %APPDATA%) and fsynced
+        // before it becomes visible.
+        let tmp = dir.join(format!("{IDENTITY_FILE}.{}.tmp", std::process::id()));
+        write_synced(&tmp, &encode_identity(&id), true)?;
+        // Publish without clobbering: two first runs racing (e.g. a send and
+        // a receive started together) must agree on ONE identity. A hard
+        // link fails with AlreadyExists if the other process won; we then
+        // adopt its identity. Filesystems without hard links fall back to
+        // rename (last writer wins).
+        match fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&tmp);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp);
+                let bytes = fs::read(&path)?;
+                return decode_identity(&bytes)
+                    .map(|id| (id, false))
+                    .ok_or_else(|| {
+                        io::Error::other(format!("corrupt identity file: {}", path.display()))
+                    });
+            }
+            Err(_) => {
+                if let Err(e) = fs::rename(&tmp, &path) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
         }
-        fs::rename(&tmp, &path)?;
-        // The identity file holds the private key: restrict to the owner on
-        // unix. Windows ACLs are inherited from the user profile, which is
-        // already owner-only for %APPDATA%.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
+        fsync_dir_best_effort(&dir);
         Ok((id, true))
     }
 
@@ -486,9 +517,7 @@ pub fn add_pin_in(dir: &Path, raw: &[u8]) -> io::Result<()> {
     }
     content.push_str(&format_fingerprint(raw));
     content.push('\n');
-    let tmp = path.with_extension("conf-tmp");
-    fs::write(&tmp, content)?;
-    fs::rename(&tmp, &path)
+    write_pins_file(dir, &path, content.as_bytes())
 }
 
 /// Removes a fingerprint from the pins file in the state dir. No-op if
@@ -501,24 +530,84 @@ pub fn remove_pin(raw: &[u8]) -> io::Result<()> {
 }
 
 /// Like [`remove_pin`], but for an explicit directory.
+///
+/// Edits the file line by line: only lines whose fingerprint equals `raw`
+/// are dropped; comments, labels (`AA:BB:… # laptop`), blank lines and
+/// even lines that do not parse are kept verbatim — `untrust` must not
+/// destroy the user's annotations.
 pub fn remove_pin_in(dir: &Path, raw: &[u8]) -> io::Result<()> {
     let path = dir.join(PINS_FILE);
-    let existing = load_pins_from(dir)?;
-    let kept: Vec<&Vec<u8>> = existing
-        .iter()
-        .filter(|p| !constant_time_eq(p, raw))
-        .collect();
-    if kept.len() == existing.len() {
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut content = String::with_capacity(text.len());
+    let mut removed = false;
+    for line in text.split_inclusive('\n') {
+        let body = line.split('#').next().unwrap_or("").trim();
+        let is_target = !body.is_empty()
+            && parse_fingerprint(body).is_some_and(|fp| constant_time_eq(&fp, raw));
+        if is_target {
+            removed = true;
+        } else {
+            content.push_str(line);
+        }
+    }
+    if !removed {
         return Ok(()); // not pinned
     }
-    let mut content = String::new();
-    for p in kept {
-        content.push_str(&format_fingerprint(p));
-        content.push('\n');
+    write_pins_file(dir, &path, content.as_bytes())
+}
+
+/// Atomically replaces `pins.conf`: temp file, fsync, rename, fsync dir.
+/// Without the fsync a crash right after `trust` could leave an empty
+/// pins file (rename persisted, data not) — every peer would then hit
+/// first use again.
+fn write_pins_file(dir: &Path, path: &Path, content: &[u8]) -> io::Result<()> {
+    let tmp = dir.join(format!("{PINS_FILE}.{}.tmp", std::process::id()));
+    write_synced(&tmp, content, false)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    let tmp = path.with_extension("conf-tmp");
-    fs::write(&tmp, content)?;
-    fs::rename(&tmp, &path)
+    fsync_dir_best_effort(dir);
+    Ok(())
+}
+
+/// Writes `content` to a fresh file at `path` and fsyncs it. A leftover
+/// file at `path` (a crashed earlier attempt) is replaced. `private`
+/// creates the file `0600` on unix (no-op elsewhere).
+fn write_synced(path: &Path, content: &[u8], private: bool) -> io::Result<()> {
+    let _ = fs::remove_file(path);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut f = opts.open(path)?;
+    let result = f.write_all(content).and_then(|()| f.sync_all());
+    if result.is_err() {
+        drop(f);
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+/// fsyncs a directory so a rename inside it is durable (unix). Windows has
+/// no directory handle for this; NTFS journals the rename itself.
+fn fsync_dir_best_effort(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 // ---------------------------------------------------------------------------

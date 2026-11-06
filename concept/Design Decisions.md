@@ -110,6 +110,19 @@ temp file is deleted and the original untouched.
 `.a.mkv.ffsync-tmp` from the concept doc. Accepted for now; revisit when the
 network layer lands (a hidden-file convention may be preferable).
 
+> **Amendment (2026-11):** the temp suffix is now *appended*:
+> `a.mkv` → `a.mkv.ffsync-tmp` (`Reconstructor::temp_path_for`), the same
+> rule as the D15 index sidecar. The substitution was a real bug once
+> §16.8 parallel sessions landed: `a.mkv` and `a.mp4` shared
+> `a.ffsync-tmp`, so two workers truncated each other's temp, and a
+> resume (D10) of one file could adopt the other's partial temp (caught
+> only by the final root check). The dotfile variant stays rejected (the
+> tree scan already filters sidecars by suffix, and hidden temps would
+> surprise users on Windows less than on unix — not worth a platform
+> split). Temps left by older builds use the old name; they no longer
+> resume (a one-time full re-transfer) and the tree delete pass removes
+> them as sidecars (§16.4).
+
 ## D13 — Transport plan: plain TCP in v0.1, QUIC as the v0.2 default
 
 > **Amendment (2026-10, v0.2 work):** QUIC is *deferred past* v0.2; the
@@ -288,6 +301,25 @@ content hashes need the offer deduped by hash and the receiver's buffer
 treated as a cache (get, not take) — otherwise duplicate DATA frames
 desync the frame stream at VERIFY. Correctness tests: eager convergence,
 loud decline on a non-opt-in receiver, in `tests/loopback.rs`.
+
+**Amendment (2026-11-06): decide early, write after MANIFEST_DONE.** The
+shipped sender WROTE eager DATA while still reading the receiver's
+manifest. The receiver streams its whole manifest without reading, so once
+the send→recv buffers filled the sender blocked, stopped reading, and the
+receiver blocked on its manifest writes: a deadlock whenever the eager
+bytes plus the remaining manifest exceed the transport's buffering (any
+large modified file over real TCP). The bench never saw it because its
+in-memory duplex buffers 1 024 messages. Fix: the gate decisions and the
+chunk reads + zstd still happen during the manifest exchange, but the
+sender holds the DATA frames and writes them after MANIFEST_DONE, before
+the plan, capped at the receiver's 64 MiB buffer cap (the rest go lazy).
+No wire change: the receiver reads nothing before its own MANIFEST_DONE,
+so it sees the identical frame sequence. Re-measured with the same cell
+(3 paired runs, both ends now `BufStream`-wrapped like the CLI): over-send
+0 B in every run, eager −20% at 0 ms RTT (median 479→381 ms) and −23% at
+30 ms (551→423 ms) — the gain survives because the expensive part (read +
+compress) still overlaps the receiver's scan. Pinned by
+`eager_does_not_deadlock_on_small_transport_buffers` (2-message duplex).
 
 **Amendment (2026-10-24, trees):** eager extends to tree sessions
 (§16.11): TREE_BEGIN flag bit 7 announced by the sender, mirrored by the
@@ -872,6 +904,17 @@ rest stays out:
   stat → D15 index write. The index must record the post-metadata mtime
   or every metadata-synced file re-syncs on the next run (the §16.6
   ordering rule extended one step earlier).
+  > **Amendment (2026-11, code review):** the order is now mtime → mode
+  > → stat → index. Mode first broke read-only modes: the mtime write
+  > opened a writable handle, which a `0o444` file refuses (EACCES for a
+  > non-root unix user; os error 5 on Windows), and the error failed an
+  > already-committed sync on every run. chmod and the Windows read-only
+  > attribute do not touch the mtime, so the index still records the
+  > sender's value. The mtime handle now requests the least access
+  > (read-only fd / `FILE_WRITE_ATTRIBUTES`), both writes are warnings
+  > rather than errors (the "best-effort" this decision always promised),
+  > and the Windows mapping's inverted test (`bits & 0o222 != 0` marked
+  > writable modes read-only) was fixed to `== 0`.
 - **Wire:** TREE_BEGIN flag bit 4 `metadata`; when set, each entry gains
   `mode u32` (st_mode low bits masked `0o7777`, 0 where the platform has
   no POSIX modes — Windows maps no-write bits to the read-only attribute,
@@ -1076,3 +1119,52 @@ built from the receiver's own disk — nothing to guard on the wire).
 documentation amendment — the manifest's meaning "I have these chunks"
 is unchanged; where the bytes live has always been the receiver's
 business, per the D10 union-manifest precedent).
+
+## D23 — mtime granularity and case-insensitive receivers (2026-11-06)
+
+**Problem.** Two cross-platform issues in the metadata fast path and the
+tree delete pass, found in the 2026-11 code review:
+
+1. **mtime precision.** NTFS stores mtimes in 100 ns ticks. A Linux
+   sender's nanosecond mtime (`…789`) is written to a Windows receiver
+   at commit (§16.6) and reads back as `…700`. The exact-nanosecond
+   compare (§4, §16.3) then never matches: every Linux→Windows tree
+   sync re-checks every synced file, forever (correct, but the fast path
+   is dead).
+2. **Case-only renames lose data.** Triage compares paths byte-exactly.
+   On a case-insensitive receiver, a sender rename `README.md` →
+   `Readme.md` triages as transfer + delete of what is the same file;
+   the delete pass runs last and removes the freshly synced file.
+   Reproduced by `tree_case_only_rename_keeps_synced_content` (the
+   receiver root ends up empty on the pre-fix code).
+
+**Decision.**
+
+1. Compare mtimes at **100 ns** (`tree::mtimes_match`, used by both the
+   single-file fast path and tree triage). 100 ns is the finest
+   granularity any supported platform stores, so nothing a filesystem
+   can distinguish is folded together. The index validation (D15) keeps
+   its exact compare — both sides of it are the same local filesystem.
+   Coarser filesystems (HFS+ 1 s, FAT 2 s) still re-check; that costs a
+   VERIFY, never correctness, and widening the window further would let
+   same-tick rewrites pass as unchanged.
+2. **Receiver-local case guard**, no wire change: the delete pass skips
+   targets that case-fold to a sender path *and* are the same
+   filesystem entry (`tree::same_file`); a sender directory whose
+   case-variant exists as the same entry is renamed to the sender's
+   spelling before use; sender trees with case-only collisions get a
+   warning. The fold (`str::to_lowercase`) only nominates candidates —
+   identity decides — so the guard is inert on case-sensitive
+   filesystems and Unicode folding differences cost at most a missed
+   optimisation, never a wrong skip.
+
+**Rejected.** Folding case in triage itself: triage must stay identical
+on both peers, and the receiver's filesystem semantics are not the
+sender's business (a Linux sender may legitimately hold both spellings).
+Probing case sensitivity per directory up front: the identity check per
+candidate is cheaper and exact.
+
+**Also.** `.ffsync-index-tmp` (the D15 index writer's temp) joined the
+sidecar filter (`tree::is_sidecar`). A writer killed mid-index left the
+temp in the *source* tree, where the next index write consumed it and
+the sender aborted with "sender file vanished".

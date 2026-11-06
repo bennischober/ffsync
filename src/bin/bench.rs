@@ -273,6 +273,16 @@ fn parse_cdc(value: &str) -> (usize, usize, usize) {
     if triple.0 % 2 != 0 || triple.1 % 2 != 0 || triple.2 % 2 != 0 {
         die("--cdc values must be even (fastcdc 5.0 requirement)");
     }
+    let fits_u32 = |v: usize| u32::try_from(v).ok();
+    let in_range = match (fits_u32(triple.0), fits_u32(triple.1), fits_u32(triple.2)) {
+        (Some(a), Some(b), Some(c)) => ffsync::chunking::sane_cdc_params((a, b, c)),
+        _ => false,
+    };
+    if !in_range {
+        die(
+            "--cdc values outside fastcdc 5.0's supported ranges              (min 64..=1m, avg 256..=4m, max 1k..=16m)",
+        );
+    }
     triple
 }
 
@@ -598,10 +608,8 @@ fn simulate_disconnect(
     cdc: (usize, usize, usize),
     kill_pct: u32,
 ) -> io::Result<DisconnectStats> {
-    // The Reconstructor derives its on-disk temp path by replacing the last
-    // extension with "ffsync-tmp"; mirror that here.
     let rec_path = variant.with_file_name("disconnect_sim.bin");
-    let temp_path = rec_path.with_extension("ffsync-tmp");
+    let temp_path = Reconstructor::temp_path_for(&rec_path);
     let _ = fs::remove_file(&temp_path);
 
     let source_hashes: HashSet<Hash> = source_chunks.iter().map(|c| c.hash).collect();
@@ -1496,7 +1504,8 @@ fn run_one_latency_session(
         // Take the control end FIRST, dropping the lock before tree_receive
         // runs (a temporary guard on an argument would live for the whole
         // call and deadlock the accept closure).
-        let mut control_end = receiver_ends.lock().unwrap().remove(0);
+        let mut control_end =
+            ffsync::protocol::BufStream::new(receiver_ends.lock().unwrap().remove(0));
         tree_receive(
             &mut control_end,
             &TreeReceiveRequest {
@@ -1507,7 +1516,9 @@ fn run_one_latency_session(
                 accept_worker: {
                     let ends = std::sync::Arc::clone(&receiver_ends);
                     std::sync::Arc::new(move || {
-                        Ok(Box::new(ends.lock().unwrap().remove(0)) as Box<dyn ReadWrite>)
+                        Ok(Box::new(ffsync::protocol::BufStream::new(
+                            ends.lock().unwrap().remove(0),
+                        )) as Box<dyn ReadWrite>)
                     })
                 },
                 dry_run: false,
@@ -1520,7 +1531,7 @@ fn run_one_latency_session(
 
     let t = Instant::now();
     let send_res = tree_send(
-        &mut sender_ends.remove(0),
+        &mut ffsync::protocol::BufStream::new(sender_ends.remove(0)),
         &TreeSendRequest {
             root: send_root,
             force_checksum: false,
@@ -1532,7 +1543,9 @@ fn run_one_latency_session(
             connect_worker: {
                 let ends = std::sync::Mutex::new(sender_ends);
                 std::sync::Arc::new(move |_| {
-                    Ok(Box::new(ends.lock().unwrap().remove(0)) as Box<dyn ReadWrite>)
+                    Ok(Box::new(ffsync::protocol::BufStream::new(
+                        ends.lock().unwrap().remove(0),
+                    )) as Box<dyn ReadWrite>)
                 })
             },
         },
@@ -1672,7 +1685,11 @@ fn run_one_eager_session(
     let _ = fs::remove_file(&target);
     fs::copy(source, &target)?;
 
-    let (mut s_end, mut r_end) = latency_pair(Duration::from_millis(rtt_ms) / 2);
+    // Buffered like the CLI's connections (`BufStream`), so the session
+    // runs the shipped write pattern.
+    let (s_end, r_end) = latency_pair(Duration::from_millis(rtt_ms) / 2);
+    let mut s_end = ffsync::protocol::BufStream::new(s_end);
+    let mut r_end = ffsync::protocol::BufStream::new(r_end);
 
     let variant_p = variant.to_path_buf();
     let target_r = target.clone();

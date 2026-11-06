@@ -144,9 +144,10 @@ impl TreeManifest {
 
     /// [`TreeManifest::scan`] with exclude patterns (§16.7): an excluded
     /// file is skipped; an excluded directory is pruned with its whole
-    /// subtree (contents cannot re-include — there is no negation syntax).
-    /// The sidecar filter (`*.ffsync-index` / `*.ffsync-tmp`) applies in
-    /// addition and is not user-visible.
+    /// subtree (a `!` negation cannot re-include anything below a pruned
+    /// directory — the scan never descends into it).
+    /// The sidecar filter ([`is_sidecar`]) applies in addition and is not
+    /// user-visible.
     pub fn scan_with_excludes(root: &Path, excludes: &ExcludeSet) -> io::Result<TreeManifest> {
         let mut manifest = TreeManifest::new();
         let root_meta = std::fs::metadata(root)?;
@@ -180,13 +181,21 @@ impl TreeManifest {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            // `entry.metadata()` on a symlink already returns link metadata
-            // (std does not follow), but be explicit: re-read through
-            // symlink_metadata so the is_symlink flag is authoritative.
-            let is_symlink = std::fs::symlink_metadata(entry.path())
-                .map(|m| m.is_symlink())
-                .unwrap_or(false);
-            let name = entry.file_name().to_string_lossy().into_owned();
+            // `DirEntry::metadata` never traverses a symlink (lstat on unix,
+            // the directory record on Windows), so its flag is authoritative
+            // without a second stat per entry.
+            let is_symlink = meta.is_symlink();
+            // Wire paths are UTF-8 (§16.2). A lossy conversion would map the
+            // name to one that does not exist (the sender's open then fails
+            // the whole session) and could merge two distinct names into
+            // one. Skip it, recorded not silent (D17).
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                eprintln!(
+                    "warning: skipping non-UTF-8 file name: {}",
+                    entry.path().display()
+                );
+                continue;
+            };
             let rel = if prefix.is_empty() {
                 name
             } else {
@@ -216,7 +225,7 @@ impl TreeManifest {
                     Err(e) => return Err(e),
                 };
                 if target_meta.is_file() {
-                    if rel.ends_with(".ffsync-index") || rel.ends_with(".ffsync-tmp") {
+                    if is_sidecar(&rel) {
                         continue;
                     }
                     if excludes.matches(&rel, EntryKind::File) {
@@ -239,13 +248,13 @@ impl TreeManifest {
             } else if meta.is_file() {
                 // D15/D17: the sidecar index and the temp file are ffsync's
                 // own bookkeeping, never tree content. The index filename is
-                // `<target>.ffsync-index` (suffix APPENDED — see index.rs);
-                // the temp is `<target-with-ext>.ffsync-tmp`. Both are
+                // `<target>.ffsync-index` and the temp `<target>.ffsync-tmp`
+                // (suffixes APPENDED — index.rs, D6 amendment). Both are
                 // excluded from tree manifests: syncing them would (a) sync
                 // our bookkeeping to the peer and (b) desync on every run
                 // (an index written at commit changes mtime → re-transfer
-                // loop).
-                if rel.ends_with(".ffsync-index") || rel.ends_with(".ffsync-tmp") {
+                // loop). See `is_sidecar` for the index temp.
+                if is_sidecar(&rel) {
                     continue;
                 }
                 if excludes.matches(&rel, EntryKind::File) {
@@ -347,7 +356,7 @@ impl ExcludePattern {
             (false, raw)
         };
         if rest.is_empty() {
-            return Err("exclude pattern is only a negation: {raw:?}".to_string());
+            return Err(format!("exclude pattern is only a negation: {raw:?}"));
         }
         if rest.contains('\\') {
             return Err(format!(
@@ -669,17 +678,12 @@ impl ExcludeSet {
         if self.excluded(rel_path, kind) {
             return true;
         }
-        let mut prefix = String::new();
-        for seg in rel_path.split('/') {
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(seg);
-            if self.excluded(&prefix, EntryKind::Dir) {
-                return true;
-            }
-        }
-        false
+        // Proper ancestors only: the path itself was judged above with its
+        // REAL kind. Re-judging the final segment as a Dir made a dir-only
+        // pattern (`build/`) protect a *file* named `build`.
+        rel_path
+            .match_indices('/')
+            .any(|(i, _)| self.excluded(&rel_path[..i], EntryKind::Dir))
     }
 }
 
@@ -750,8 +754,10 @@ pub fn triage(
                 (EntryKind::File, EntryKind::File) => {
                     if !checksum
                         && s.size == r.size
-                        && s.mtime_secs == r.mtime_secs
-                        && s.mtime_nanos == r.mtime_nanos
+                        && mtimes_match(
+                            (s.mtime_secs, s.mtime_nanos),
+                            (r.mtime_secs, r.mtime_nanos),
+                        )
                     {
                         Triage::Skip
                     } else {
@@ -764,6 +770,76 @@ pub fn triage(
                     remove_receiver_entry: true,
                 },
             }
+        }
+    }
+}
+
+/// Whether a tree-relative path is ffsync's own bookkeeping, never tree
+/// content (D15/D17): the D15 index `<target>.ffsync-index`, its write
+/// temp `<target>.ffsync-index-tmp` (left behind when a writer is killed
+/// mid-index — the sender writes its own warm-start indexes too, so the
+/// remnant sits in the SOURCE tree; scanned as content it vanishes on the
+/// next index write and aborts the session "sender file vanished"), and
+/// the reconstruction temp `<target-with-ext>.ffsync-tmp`. The single
+/// place this filter lives.
+pub fn is_sidecar(rel_path: &str) -> bool {
+    rel_path.ends_with(".ffsync-index")
+        || rel_path.ends_with(".ffsync-index-tmp")
+        || rel_path.ends_with(".ffsync-tmp")
+}
+
+/// The mtime granularity of the metadata fast path, in nanoseconds: 100 ns,
+/// NTFS's resolution (the coarsest timestamp of the supported targets that
+/// still separates real rewrites).
+pub const MTIME_GRANULARITY_NANOS: u32 = 100;
+
+/// Whether two `(secs, nanos)` mtimes match for the metadata fast path
+/// (tree triage §16.4, single-file HELLO compare §4).
+///
+/// Compared at [`MTIME_GRANULARITY_NANOS`]: a Linux sender's nanosecond
+/// mtime set on a Windows receiver at commit (§16.6) is stored truncated to
+/// 100 ns, so an exact compare would re-check that file on every session.
+/// Never coarser: whole-second compares let a same-second same-size rewrite
+/// pass as unchanged (the v0.2 lesson), while 100 ns is below any real
+/// rewrite window (kernel file timestamps themselves tick far coarser).
+/// Targets coarser than 100 ns (HFS+ 1 s, FAT 2 s) still re-check every
+/// session — correct, just not fast.
+pub fn mtimes_match(a: (u64, u32), b: (u64, u32)) -> bool {
+    a.0 == b.0 && a.1 / MTIME_GRANULARITY_NANOS == b.1 / MTIME_GRANULARITY_NANOS
+}
+
+/// The case-fold key used to find paths that a case-insensitive filesystem
+/// (NTFS, APFS default) maps to the same object. A candidate filter only:
+/// every decision made on it is confirmed with [`same_file`], so an
+/// imperfect fold can miss a pair but never conflate two distinct files.
+pub fn case_fold(rel_path: &str) -> String {
+    rel_path.to_lowercase()
+}
+
+/// Whether two existing paths name the same filesystem object (false if
+/// either is missing). Directory entries are compared, not symlink targets.
+///
+/// This is the case-insensitive-receiver guard (§16.5): on NTFS/APFS
+/// `README.md` and `Readme.md` are one file, so deleting the receiver-only
+/// spelling after the sender's spelling was committed would destroy the
+/// file just synced.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // std exposes no stable file id on Windows; the canonical path
+        // (GetFinalPathNameByHandleW) carries the on-disk spelling, so two
+        // spellings of one file canonicalize identically.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
         }
     }
 }
@@ -819,12 +895,69 @@ mod tests {
         // Size differs.
         let r1 = entry("a.bin", EntryKind::File, 101, 1600000000, 500);
         assert_eq!(triage("a.bin", Some(&s), Some(&r1), false), Triage::Sync);
-        // Only sub-second mtime differs (the v0.2 lesson, now in triage).
-        let r2 = entry("a.bin", EntryKind::File, 100, 1600000000, 501);
+        // Only sub-second mtime differs (the v0.2 lesson, now in triage) —
+        // by one full 100 ns tick, the fast path's granularity.
+        let r2 = entry("a.bin", EntryKind::File, 100, 1600000000, 600);
         assert_eq!(triage("a.bin", Some(&s), Some(&r2), false), Triage::Sync);
         // Whole-second equal, nanos equal, but secs differ.
         let r3 = entry("a.bin", EntryKind::File, 100, 1600000001, 500);
         assert_eq!(triage("a.bin", Some(&s), Some(&r3), false), Triage::Sync);
+    }
+
+    #[test]
+    fn triage_mtime_compares_at_100ns() {
+        // A Linux sender's ns mtime, stored truncated to 100 ns by an NTFS
+        // receiver at commit (§16.6), must still match next session…
+        let s = entry("a.bin", EntryKind::File, 100, 1600000000, 123_456_789);
+        let ntfs = entry("a.bin", EntryKind::File, 100, 1600000000, 123_456_700);
+        assert_eq!(triage("a.bin", Some(&s), Some(&ntfs), false), Triage::Skip);
+        assert_eq!(triage("a.bin", Some(&ntfs), Some(&s), false), Triage::Skip);
+        // …but anything a full 100 ns tick apart is a different mtime.
+        let other = entry("a.bin", EntryKind::File, 100, 1600000000, 123_456_699);
+        assert_eq!(triage("a.bin", Some(&s), Some(&other), false), Triage::Sync);
+        assert!(mtimes_match((5, 0), (5, 99)));
+        assert!(!mtimes_match((5, 99), (5, 100)));
+        assert!(!mtimes_match((5, 0), (6, 0)));
+    }
+
+    #[test]
+    fn sidecars_are_filtered_from_scans() {
+        assert!(is_sidecar("a.bin.ffsync-index"));
+        assert!(is_sidecar("d/a.bin.ffsync-index-tmp"));
+        assert!(is_sidecar("d/a.ffsync-tmp"));
+        assert!(!is_sidecar("a.bin"));
+        assert!(!is_sidecar("ffsync-index.txt"));
+        let dir = std::env::temp_dir().join(format!("ffsync_sidecar_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "a.bin",
+            "a.bin.ffsync-index",
+            "a.bin.ffsync-index-tmp",
+            "a.ffsync-tmp",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let m = TreeManifest::scan(&dir).unwrap();
+        let paths: Vec<&str> = m.entries().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["a.bin"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_file_distinguishes_entries() {
+        let dir = std::env::temp_dir().join(format!("ffsync_same_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        assert!(same_file(&dir.join("a.txt"), &dir.join("a.txt")));
+        assert!(!same_file(&dir.join("a.txt"), &dir.join("b.txt")));
+        assert!(!same_file(&dir.join("a.txt"), &dir.join("missing.txt")));
+        // A case variant is the same file exactly when the fs folds case.
+        let folds = dir.join("A.TXT").exists();
+        assert_eq!(same_file(&dir.join("a.txt"), &dir.join("A.TXT")), folds);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1118,6 +1251,18 @@ mod tests {
         assert!(set.matches("]x", EntryKind::File));
         assert!(!set.matches("x", EntryKind::File));
         assert!(ExcludeSet::from_patterns(["!"]).is_err());
+    }
+
+    #[test]
+    fn delete_guard_judges_the_path_itself_by_its_real_kind() {
+        let set = ExcludeSet::from_patterns(["build/"]).unwrap();
+        // A FILE named build is not matched by a dir-only pattern.
+        assert!(!set.matches_path_or_ancestor("build", EntryKind::File));
+        assert!(!set.matches_path_or_ancestor("src/build", EntryKind::File));
+        // The directory and everything below it are protected.
+        assert!(set.matches_path_or_ancestor("build", EntryKind::Dir));
+        assert!(set.matches_path_or_ancestor("build/out.o", EntryKind::File));
+        assert!(set.matches_path_or_ancestor("src/build/out.o", EntryKind::File));
     }
 
     #[test]

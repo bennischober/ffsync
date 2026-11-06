@@ -214,8 +214,8 @@ impl FileIndex {
 /// *appended*, not substituted for the last extension: `a.mkv` becomes
 /// `a.mkv.ffsync-index`, so the target name is recoverable from the index
 /// name by stripping the suffix — required by the orphan cleanup, and the
-/// convention the concept doc originally described (D6's deviation note
-/// applies only to the temp file, which needs no reverse mapping).
+/// convention the concept doc originally described. Since the D6
+/// amendment (2026-11) the temp file appends its suffix the same way.
 pub fn index_path_for(target_path: &Path) -> PathBuf {
     let mut name = target_path
         .file_name()
@@ -227,7 +227,8 @@ pub fn index_path_for(target_path: &Path) -> PathBuf {
 
 /// Writes the index atomically: temp file + rename (same pattern as the
 /// reconstruction commit, D6). A crash mid-write leaves the old index (or a
-/// `<path>.ffsync-index-tmp` remnant, harmless).
+/// `<path>.ffsync-index-tmp` remnant, which the next write replaces; the
+/// tree scan filters it as a sidecar — `tree::is_sidecar`).
 pub fn write_index(path: &Path, index: &FileIndex) -> io::Result<()> {
     let idx_path = index_path_for(path);
     let tmp_path = {

@@ -31,7 +31,7 @@ impl Reconstructor {
     /// Creates a new reconstructor.
     /// Opens the temporary file and pre-allocates it (Sparse file).
     pub fn new(target_path: &Path, local_source_path: &Path, final_size: u64) -> io::Result<Self> {
-        let temp_path = target_path.with_extension("ffsync-tmp");
+        let temp_path = Self::temp_path_for(target_path);
 
         let file = OpenOptions::new()
             .read(true) // Needed for final verification
@@ -64,7 +64,7 @@ impl Reconstructor {
         local_source_path: &Path,
         final_size: u64,
     ) -> io::Result<Self> {
-        let temp_path = target_path.with_extension("ffsync-tmp");
+        let temp_path = Self::temp_path_for(target_path);
         let file = OpenOptions::new().read(true).write(true).open(&temp_path)?;
         if file.metadata()?.len() < final_size {
             file.set_len(final_size)?;
@@ -88,9 +88,15 @@ impl Reconstructor {
     }
 
     /// The temp file path for a given target path (single source of truth
-    /// for the naming convention).
+    /// for the naming convention). The suffix is *appended* (D6 amendment,
+    /// 2026-11): `a.mkv` → `a.mkv.ffsync-tmp`. Substituting the extension
+    /// mapped `a.mkv` and `a.mp4` to the same `a.ffsync-tmp`, which collided
+    /// when §16.8 parallel workers synced both at once, and let a resume of
+    /// one adopt the other's partial temp.
     pub fn temp_path_for(target_path: &Path) -> PathBuf {
-        target_path.with_extension("ffsync-tmp")
+        let mut name = target_path.as_os_str().to_owned();
+        name.push(".ffsync-tmp");
+        PathBuf::from(name)
     }
 
     /// Durability (§8.3): flush the temp file's data before the atomic
@@ -157,7 +163,7 @@ impl Reconstructor {
         if final_hash != expected_hash {
             // Explicitly delete the corrupted temp file
             // (Use metadata to get the path, or reconstruct it)
-            let _ = std::fs::remove_file(final_path.with_extension("ffsync-tmp"));
+            let _ = std::fs::remove_file(Self::temp_path_for(final_path));
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Reconstructed hash mismatch",
@@ -168,7 +174,7 @@ impl Reconstructor {
         self.temp_file.sync_all()?;
         drop(self.temp_file);
 
-        std::fs::rename(final_path.with_extension("ffsync-tmp"), final_path)?;
+        std::fs::rename(Self::temp_path_for(final_path), final_path)?;
 
         Ok(())
     }
