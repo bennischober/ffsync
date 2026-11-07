@@ -412,11 +412,12 @@ impl ExcludePattern {
         if self.dir_only && kind != EntryKind::Dir {
             return false;
         }
+        let from = match_segs_from(&self.segs, path_segs);
         if self.anchored {
-            match_segs(&self.segs, path_segs)
+            from[0]
         } else {
             // Unanchored: match the basename at any depth.
-            (0..path_segs.len()).any(|start| match_segs(&self.segs, &path_segs[start..]))
+            from[..path_segs.len()].iter().any(|&m| m)
         }
     }
 }
@@ -495,22 +496,37 @@ fn parse_class(chars: &[char], start: usize) -> Option<(Part, usize)> {
     None // unterminated
 }
 
-/// Matches pattern segments against path segments (no `**` backtracking
-/// beyond its own: it tries every consumption width).
-fn match_segs(segs: &[PatternSeg], path: &[&str]) -> bool {
-    match segs.split_first() {
-        None => path.is_empty(),
-        Some((PatternSeg::DoubleStar, rest)) => {
-            // Zero segments, then every possible consumption.
-            (0..=path.len()).any(|skip| match_segs(rest, &path[skip..]))
+/// Matches pattern segments against every suffix of `path` at once:
+/// `result[j]` says whether `segs` matches `path[j..]` (`j` in `0..=len`).
+/// Dynamic programming over (segment, path position), one row per pattern
+/// segment, in O(segments × depth) time — the recursive form tried every
+/// consumption width for every `**`, which a hostile sender's pattern
+/// (`**/**/…/x` — excludes come from the PEER, §16.7) turned exponential.
+fn match_segs_from(segs: &[PatternSeg], path: &[&str]) -> Vec<bool> {
+    let n = path.len();
+    // Row for the empty pattern: matches only the empty suffix.
+    let mut next = vec![false; n + 1];
+    next[n] = true;
+    for seg in segs.iter().rev() {
+        let mut cur = vec![false; n + 1];
+        match seg {
+            PatternSeg::DoubleStar => {
+                // Zero or more segments: any later position the rest matches.
+                let mut any_later = false;
+                for j in (0..=n).rev() {
+                    any_later |= next[j];
+                    cur[j] = any_later;
+                }
+            }
+            PatternSeg::Parts(parts) => {
+                for j in 0..n {
+                    cur[j] = next[j + 1] && match_parts(parts, path[j]);
+                }
+            }
         }
-        Some((PatternSeg::Parts(parts), rest)) => {
-            let Some((head, tail)) = path.split_first() else {
-                return false;
-            };
-            match_parts(parts, head) && match_segs(rest, tail)
-        }
+        next = cur;
     }
+    next
 }
 
 /// Classic glob match of one sub-pattern against one path segment
@@ -1218,6 +1234,30 @@ mod tests {
         // '**' inside a segment collapses to '*': one segment, no '/'.
         assert!(m("a**b", "axxb", EntryKind::File));
         assert!(!m("a**b", "a/b", EntryKind::File));
+    }
+
+    #[test]
+    fn exclude_double_star_matching_is_polynomial() {
+        // Excludes come from the PEER (§16.7): a pattern of 24 `**`
+        // segments against a 24-deep path used to explore ~C(48,24)
+        // splits per entry (minutes; a hostile sender's denial of
+        // service). The DP matcher is O(segments × depth).
+        let pattern = format!("{}x", "**/".repeat(24));
+        let path = vec!["d"; 24].join("/");
+        let t = std::time::Instant::now();
+        assert!(!m(&pattern, &path, EntryKind::File));
+        assert!(m(&pattern, &format!("{path}/x"), EntryKind::File));
+        // Unanchored form too (every start depth shares one table).
+        assert!(!m(
+            "**/a/**/a/**/a/**/b",
+            &vec!["a"; 24].join("/"),
+            EntryKind::File
+        ));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

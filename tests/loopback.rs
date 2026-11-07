@@ -1190,11 +1190,11 @@ mod tests {
         let _ = old_peer.join().expect("old peer thread panicked");
 
         // The receiver must fail — and with the version error specifically.
+        // It is OUR rejection (the ERROR(Version) went to the old peer), so
+        // it is a protocol error here, never mislabelled `Peer`.
         match r {
-            Err(SyncError::Peer(code, msg)) => {
-                assert_eq!(code, ErrorCode::Version, "message: {msg}");
-            }
-            other => panic!("receiver must fail with Peer(Version, _), got {other:?}"),
+            Err(SyncError::Protocol(msg)) if msg.contains("unsupported protocol version") => {}
+            other => panic!("receiver must fail with its version rejection, got {other:?}"),
         }
     }
 
@@ -2266,8 +2266,238 @@ mod tests {
         };
         let (s_out, r_out) = run_sync(s, r);
         match (&s_out, &r_out) {
-            (Err(SyncError::Peer(ErrorCode::Version, _)), _) => {}
+            // The sender rejects (its own error); the receiver is TOLD why.
+            (Err(SyncError::Protocol(msg)), Err(SyncError::Peer(ErrorCode::Version, _)))
+                if msg.contains("eager") => {}
             (s, r) => panic!("expected loud decline, got sender={s:?} receiver={r:?}"),
+        }
+    }
+
+    // ---- Scripted peers: hand-driven frames put the real state machines
+    // into states an honest peer rarely produces (§3: ERROR may arrive at
+    // any read point and is terminal; every terminal failure is announced).
+
+    fn tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (b, _) = l.accept().unwrap();
+        for s in [&a, &b] {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+        }
+        (a, b)
+    }
+
+    fn scripted_hello(role: ffsync::protocol::message::Role, file_size: u64) -> Vec<u8> {
+        use ffsync::protocol::message::{FLAG_TRUST_TIMES, Hello, Message as _};
+        let mut buf = Vec::new();
+        Hello {
+            version: ffsync::protocol::VERSION,
+            flags: FLAG_TRUST_TIMES,
+            role,
+            cdc_min: 16 * 1024,
+            cdc_avg: 64 * 1024,
+            cdc_max: 256 * 1024,
+            file_size,
+            file_mtime: 1_700_000_000,
+            file_mtime_nanos: 0,
+            path: "x.bin".into(),
+        }
+        .into_frame()
+        .unwrap()
+        .encode(&mut buf)
+        .unwrap();
+        buf
+    }
+
+    /// Reads frames until an ERROR (returns its code) or the stream ends.
+    fn first_error(peer: &mut std::net::TcpStream) -> Option<ErrorCode> {
+        use ffsync::protocol::{framing, message};
+        while let Ok(f) = framing::read_frame(peer) {
+            if f.ftype == framing::T_ERROR {
+                return message::read_error_payload(&f).ok().map(|(c, _)| c);
+            }
+        }
+        None
+    }
+
+    /// Runs the real receiver against a scripted sender: HELLO for a
+    /// 100 000-byte file, the receiver's manifest is drained up to
+    /// MANIFEST_DONE, then `script` plays the rest. Returns the receiver's
+    /// result and what the script returned.
+    fn scripted_sender<R: Send + 'static>(
+        name: &str,
+        script: impl FnOnce(&mut std::net::TcpStream) -> R + Send + 'static,
+    ) -> (Result<SyncOutcome, SyncError>, R) {
+        use ffsync::protocol::framing;
+        let fx = Fixture::new(name);
+        let target = fx.path("t.bin");
+        let (mut r_sock, mut peer) = tcp_pair();
+        let fake = std::thread::spawn(move || {
+            peer.write_all(&scripted_hello(
+                ffsync::protocol::message::Role::Sender,
+                100_000,
+            ))
+            .unwrap();
+            loop {
+                let f = framing::read_frame(&mut peer).unwrap();
+                if f.ftype == framing::T_MANIFEST_DONE {
+                    break;
+                }
+            }
+            let out = script(&mut peer);
+            let _ = peer.flush();
+            let mut sink = Vec::new();
+            let _ = peer.read_to_end(&mut sink);
+            out
+        });
+        let req = ReceiveRequest {
+            path: target.clone(),
+            local_source: target,
+            force_checksum: false,
+            tree: false,
+            apply_mtime: None,
+            apply_mode: None,
+            eager: false,
+            extra_sources: Vec::new(),
+        };
+        let r = receive(
+            &mut r_sock,
+            &req,
+            &PipelineConfig::default(),
+            &mut |_p: Progress| {},
+        );
+        drop(r_sock);
+        (r, fake.join().unwrap())
+    }
+
+    /// Writes a one-entry Remote plan (100 000 bytes of 1s) + PLAN_DONE.
+    fn write_one_remote_plan(peer: &mut std::net::TcpStream) {
+        use ffsync::protocol::message::{Message as _, PlanEntry};
+        use ffsync::protocol::{framing, message};
+        let mut buf = Vec::new();
+        PlanEntry::Remote {
+            target_offset: 0,
+            length: 100_000,
+            hash: blake3::hash(&[1u8; 100_000]),
+        }
+        .into_frame()
+        .unwrap()
+        .encode(&mut buf)
+        .unwrap();
+        message::encode_empty(framing::T_PLAN_DONE)
+            .unwrap()
+            .encode(&mut buf)
+            .unwrap();
+        peer.write_all(&buf).unwrap();
+    }
+
+    fn write_error(peer: &mut std::net::TcpStream, code: ErrorCode, msg: &str) {
+        let mut buf = Vec::new();
+        ffsync::protocol::message::encode_error(code, msg)
+            .unwrap()
+            .encode(&mut buf)
+            .unwrap();
+        peer.write_all(&buf).unwrap();
+    }
+
+    #[test]
+    fn sender_surfaces_receiver_error_during_manifest_phase() {
+        // A receiver that aborts mid-manifest (scan failure, disk error)
+        // announces it with ERROR: the sender must report THAT reason, not
+        // its own "expected manifest frame, got 0x0B".
+        let fx = Fixture::new("scripted_mf_err");
+        create_file(fx.source(), &vec![3u8; 200_000]);
+        let (mut s_sock, mut peer) = tcp_pair();
+        let fake = std::thread::spawn(move || {
+            peer.write_all(&scripted_hello(
+                ffsync::protocol::message::Role::Receiver,
+                0,
+            ))
+            .unwrap();
+            write_error(&mut peer, ErrorCode::Io, "disk on fire");
+            let mut sink = Vec::new();
+            let _ = peer.read_to_end(&mut sink);
+        });
+        let req = SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "src.bin".into(),
+            mtime: None,
+            force_checksum: true,
+            eager: false,
+            dry_run: false,
+            tree: false,
+        };
+        let r = send(
+            &mut s_sock,
+            &req,
+            &PipelineConfig::default(),
+            &mut |_p: Progress| {},
+        );
+        drop(s_sock);
+        fake.join().unwrap();
+        match r {
+            Err(SyncError::Peer(ErrorCode::Io, msg)) if msg.contains("disk on fire") => {}
+            other => panic!("sender must report the receiver's reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receiver_surfaces_sender_error_instead_of_data() {
+        // A sender whose source read fails mid-transfer aborts with ERROR
+        // where the receiver expects DATA.
+        let (r, ()) = scripted_sender("scripted_data_err", |peer| {
+            write_one_remote_plan(peer);
+            write_error(peer, ErrorCode::Io, "source file shrank");
+        });
+        match r {
+            Err(SyncError::Peer(ErrorCode::Io, msg)) if msg.contains("source file shrank") => {}
+            other => panic!("receiver must report the sender's reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receiver_surfaces_sender_error_instead_of_verify() {
+        let (r, ()) = scripted_sender("scripted_verify_err", |peer| {
+            write_one_remote_plan(peer);
+            let data = [1u8; 100_000];
+            let mut buf = Vec::new();
+            ffsync::protocol::message::encode_data(
+                blake3::hash(&data),
+                &zstd::bulk::compress(&data, 3).unwrap(),
+            )
+            .unwrap()
+            .encode(&mut buf)
+            .unwrap();
+            peer.write_all(&buf).unwrap();
+            write_error(peer, ErrorCode::Aborted, "sender gave up");
+        });
+        match r {
+            Err(SyncError::Peer(ErrorCode::Aborted, msg)) if msg.contains("sender gave up") => {}
+            other => panic!("receiver must report the sender's reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receiver_answers_malformed_plan_entry_with_error() {
+        // A plan entry that does not decode is a terminal protocol error
+        // the sender must be TOLD about (it used to see a bare close), and
+        // it is OUR rejection — never labelled a peer error.
+        let (r, reply) = scripted_sender("scripted_bad_plan", |peer| {
+            let mut buf = Vec::new();
+            ffsync::protocol::framing::Frame::new(
+                ffsync::protocol::framing::T_PLAN_REMOTE,
+                vec![1, 2, 3],
+            )
+            .encode(&mut buf)
+            .unwrap();
+            peer.write_all(&buf).unwrap();
+            first_error(peer)
+        });
+        assert_eq!(reply, Some(ErrorCode::BadFrame));
+        match r {
+            Err(SyncError::Protocol(msg)) if msg.contains("bad plan entry") => {}
+            other => panic!("expected the receiver's own rejection, got {other:?}"),
         }
     }
 }

@@ -224,15 +224,54 @@ pub(crate) fn send_error_and_finish(
     code: ErrorCode,
     msg: &str,
 ) -> SyncError {
-    let frame = message::encode_error(code, msg);
-    let _ = frame.and_then(|f| f.encode(out));
-    let _ = out.flush();
+    write_error(out, code, msg);
     // Give the peer a moment to read the ERROR frame before the stream
     // drops (drain_for_close only reads; the peer's ERROR read happens
     // after we flushed). Returning immediately is fine here because ERROR
     // paths are terminal failures anyway; the receiver-side read of ERROR
     // happens before its own writes in every flow.
-    SyncError::Peer(code, msg.to_string())
+    local_rejection(code, msg)
+}
+
+/// Writes one ERROR frame and flushes, best effort (the peer may be gone).
+fn write_error(out: &mut (impl Write + ?Sized), code: ErrorCode, msg: &str) {
+    let frame = message::encode_error(code, msg);
+    let _ = frame.and_then(|f| f.encode(out));
+    let _ = out.flush();
+}
+
+/// Passes `r` through; on a LOCAL failure (scan, source read — anything
+/// but the peer's own ERROR) tells the peer first with ERROR(Io), so it
+/// fails with our reason instead of a bare "connection closed" (§3: every
+/// terminal failure after the handshake is announced). The original error
+/// is returned unchanged.
+fn announce_local<T>(
+    out: &mut (impl Write + ?Sized),
+    r: Result<T, SyncError>,
+) -> Result<T, SyncError> {
+    r.inspect_err(|e| {
+        if !matches!(e, SyncError::Peer(..)) {
+            write_error(out, ErrorCode::Io, &e.to_string());
+        }
+    })
+}
+
+/// Classifies a failure WE detected and reported to the peer.
+/// `SyncError::Peer` is reserved for errors the peer sent us: labelling our
+/// own rejection "peer error …" pointed users at the wrong machine, and
+/// made the tree layer echo the rejection back as if it were the peer's.
+/// Wire-shape problems become `Protocol`, everything else `Io` (the code's
+/// meaning survives in the kind, the message in the payload).
+fn local_rejection(code: ErrorCode, msg: &str) -> SyncError {
+    match code {
+        ErrorCode::BadFrame | ErrorCode::RoleConflict | ErrorCode::Version => {
+            SyncError::Protocol(msg.to_string())
+        }
+        ErrorCode::HashMismatch => {
+            SyncError::Io(io::Error::new(io::ErrorKind::InvalidData, msg.to_string()))
+        }
+        ErrorCode::Io | ErrorCode::Aborted => SyncError::Io(io::Error::other(msg.to_string())),
+    }
 }
 
 /// Drains the stream until the peer closes, with a byte bound as a safety
@@ -259,16 +298,16 @@ fn drain_for_close(stream: &mut impl Read) -> io::Result<()> {
 }
 
 /// Validates the received HELLO against ours (§4). Returns the peer's HELLO
-/// or a terminal error. On rejection the caller must send ERROR before
-/// closing; `validate_hello` only classifies, it does not write (it has no
-/// access to the stream).
-fn validate_hello(peer: &Hello, ours_role: Role) -> Result<Hello, SyncError> {
+/// or the ERROR code + message to reject it with. On rejection the caller
+/// must send ERROR before closing; `validate_hello` only classifies, it does
+/// not write (it has no access to the stream).
+fn validate_hello(peer: &Hello, ours_role: Role) -> Result<Hello, (ErrorCode, String)> {
     if peer.version != super::VERSION {
-        // Classified as Peer(Version) so callers send ERROR(Version) on the
-        // wire — the old peer must learn WHY it was rejected, not just see a
-        // hangup (found by the version-mismatch loopback test: the v0.1
-        // code wrote the ERROR frame into a throwaway buffer).
-        return Err(SyncError::Peer(
+        // ERROR(Version) on the wire — the old peer must learn WHY it was
+        // rejected, not just see a hangup (found by the version-mismatch
+        // loopback test: the v0.1 code wrote the ERROR frame into a
+        // throwaway buffer).
+        return Err((
             ErrorCode::Version,
             format!(
                 "unsupported protocol version {} (this peer speaks {})",
@@ -278,10 +317,10 @@ fn validate_hello(peer: &Hello, ours_role: Role) -> Result<Hello, SyncError> {
         ));
     }
     if peer.role == ours_role {
-        return Err(SyncError::Protocol(format!(
-            "role conflict: both peers are {:?}",
-            ours_role
-        )));
+        return Err((
+            ErrorCode::RoleConflict,
+            format!("role conflict: both peers are {:?}", ours_role),
+        ));
     }
     // §9.2: the eager bit is now KNOWN (D8 implemented this build); whether
     // the session runs eager is decided per-side after validation — the
@@ -410,14 +449,8 @@ where
     let peer = message::read_typed::<Hello>(stream)?;
     let peer = match validate_hello(&peer, Role::Sender) {
         Ok(h) => h,
-        Err(SyncError::Protocol(msg)) => {
-            return Err(send_error_and_finish(stream, ErrorCode::RoleConflict, &msg));
-        }
-        Err(SyncError::Peer(code, msg)) => {
-            // Version rejection: the old peer must get an explicit ERROR.
-            return Err(send_error_and_finish(stream, code, &msg));
-        }
-        Err(other) => return Err(other),
+        // Version/role rejection: the peer must get an explicit ERROR.
+        Err((code, msg)) => return Err(send_error_and_finish(stream, code, &msg)),
     };
 
     // ---- Fast path (§4): size+mtime equal and trust_times agreed ----
@@ -443,10 +476,11 @@ where
                 return Err(SyncError::Peer(code, msg));
             }
             other => {
-                return Err(SyncError::Protocol(format!(
-                    "expected DRY_RUN_ACK or manifest, got 0x{:02X}",
-                    other
-                )));
+                return Err(send_error_and_finish(
+                    stream,
+                    ErrorCode::BadFrame,
+                    &format!("expected DRY_RUN_ACK or manifest, got 0x{other:02X}"),
+                ));
             }
         }
     }
@@ -463,8 +497,7 @@ where
             ErrorCode::Version,
             "peer did not accept eager diff (its HELLO lacks flag bit 1)",
         );
-        return Err(SyncError::Peer(
-            ErrorCode::Version,
+        return Err(SyncError::Protocol(
             "peer did not accept eager diff (its HELLO lacks flag bit 1); upgrade the peer or drop --eager".into(),
         ));
     }
@@ -601,11 +634,21 @@ where
         Ok(())
     };
     loop {
-        let frame = framing::read_frame(stream)?;
+        // The receiver may abort mid-manifest (scan failure, disk error):
+        // surface ITS reason, not our "expected manifest frame".
+        let frame = message::read_frame_or_error(stream)?;
         match frame.ftype {
             framing::T_MANIFEST_CHUNK => {
-                let entry = ManifestChunk::from_frame(frame)
-                    .map_err(|e| SyncError::Protocol(format!("bad manifest chunk: {}", e)))?;
+                let entry = match ManifestChunk::from_frame(frame) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        return Err(send_error_and_finish(
+                            stream,
+                            ErrorCode::BadFrame,
+                            &format!("bad manifest chunk: {e}"),
+                        ));
+                    }
+                };
                 if source_hashes.contains(&entry.hash) {
                     manifest.insert(entry.hash, entry.offset);
                 }
@@ -619,13 +662,13 @@ where
                     if chunk.offset >= consumed {
                         break;
                     }
-                    offer_eager_chunk(chunk, &manifest, consumed, false)?;
+                    announce_local(stream, offer_eager_chunk(chunk, &manifest, consumed, false))?;
                     eager_scan += 1;
                 }
             }
             framing::T_MANIFEST_DONE => {
                 for chunk in &source_chunks[eager_scan..] {
-                    offer_eager_chunk(chunk, &manifest, 0, true)?;
+                    announce_local(stream, offer_eager_chunk(chunk, &manifest, 0, true))?;
                 }
                 break;
             }
@@ -766,9 +809,14 @@ where
             chunk_buf.clear();
             chunk_buf.resize(length, 0);
             use std::io::{Read as _, Seek as _};
-            file.seek(io::SeekFrom::Start(target_offset))?;
-            file.read_exact(&mut chunk_buf)?;
-            let compressed = compressor.compress(&chunk_buf)?;
+            // A source read failure (file shrank, disk error) mid-data is
+            // announced: the receiver is blocked reading our next DATA.
+            let read = (|| -> Result<Vec<u8>, SyncError> {
+                file.seek(io::SeekFrom::Start(target_offset))?;
+                file.read_exact(&mut chunk_buf)?;
+                Ok(compressor.compress(&chunk_buf)?)
+            })();
+            let compressed = announce_local(stream, read)?;
             message::encode_data(hash, &compressed)?.encode(stream)?;
             sent += length as u64;
             sent_chunks += 1;
@@ -835,12 +883,16 @@ where
         framing::T_NOT_MODIFIED => {
             // §7.1: the receiver accepted the dry-run offer and reports a
             // would-change; the DRY_RUN_ACK frame is the formal accept.
-            let ack = framing::read_frame(stream)?;
+            let ack = message::read_frame_or_error(stream)?;
             if ack.ftype != framing::T_DRY_RUN_ACK {
-                return Err(SyncError::Protocol(format!(
-                    "expected DRY_RUN_ACK after NOT_MODIFIED, got 0x{:02X}",
-                    ack.ftype
-                )));
+                return Err(send_error_and_finish(
+                    stream,
+                    ErrorCode::BadFrame,
+                    &format!(
+                        "expected DRY_RUN_ACK after NOT_MODIFIED, got 0x{:02X}",
+                        ack.ftype
+                    ),
+                ));
             }
             if request.dry_run {
                 progress(Progress::WouldChange);
@@ -864,10 +916,11 @@ where
             }
             Err(SyncError::Peer(code, msg))
         }
-        other => Err(SyncError::Protocol(format!(
-            "expected COMMIT_ACK, got 0x{:02X}",
-            other
-        ))),
+        other => Err(send_error_and_finish(
+            stream,
+            ErrorCode::BadFrame,
+            &format!("expected COMMIT_ACK, got 0x{other:02X}"),
+        )),
     }
 }
 
@@ -996,14 +1049,8 @@ where
     let peer = message::read_typed::<Hello>(stream)?;
     let peer = match validate_hello(&peer, Role::Receiver) {
         Ok(h) => h,
-        Err(SyncError::Protocol(msg)) => {
-            return Err(send_error_and_finish(stream, ErrorCode::RoleConflict, &msg));
-        }
-        Err(SyncError::Peer(code, msg)) => {
-            // Version rejection: the old peer must get an explicit ERROR.
-            return Err(send_error_and_finish(stream, code, &msg));
-        }
-        Err(other) => return Err(other),
+        // Version/role rejection: the peer must get an explicit ERROR.
+        Err((code, msg)) => return Err(send_error_and_finish(stream, code, &msg)),
     };
     // §7.1: accept the dry-run offer with a marker frame, before manifest
     // or plan traffic. An old peer (bit ignored on decode) never reads it
@@ -1074,10 +1121,12 @@ where
         _ => {
             if local_size > 0 {
                 progress(Progress::Scanning(0, local_size));
-                let (_stats, chunks) =
-                    scan_with_progress(&request.local_source, pipeline, cdc, |hashed| {
-                        progress(Progress::Scanning(hashed, local_size))
-                    })?;
+                // After the handshake the sender waits for our manifest:
+                // a scan failure must reach it as ERROR, not as EOF.
+                let scanned = scan_with_progress(&request.local_source, pipeline, cdc, |hashed| {
+                    progress(Progress::Scanning(hashed, local_size))
+                });
+                let (_stats, chunks) = announce_local(stream, scanned)?;
                 let root = chunk_root(&chunks);
                 (chunks, Some(root))
             } else {
@@ -1091,11 +1140,13 @@ where
     // from the interrupted session), so it scans with the sender's
     // parameters (D19). ----
     let temp_chunks: Vec<Chunk> = if resuming {
-        let tsize = std::fs::metadata(&temp_path)?.len();
+        let tsize =
+            announce_local(stream, std::fs::metadata(&temp_path).map_err(SyncError::Io))?.len();
         progress(Progress::Scanning(0, tsize));
-        let (_stats, chunks) = scan_with_progress(&temp_path, pipeline, cdc, |hashed| {
+        let scanned = scan_with_progress(&temp_path, pipeline, cdc, |hashed| {
             progress(Progress::Scanning(hashed, tsize))
-        })?;
+        });
+        let (_stats, chunks) = announce_local(stream, scanned)?;
         chunks
     } else {
         Vec::new()
@@ -1324,8 +1375,16 @@ where
                 eager_buf.insert(hash, compressed);
             }
             framing::T_PLAN_LOCAL | framing::T_PLAN_REMOTE => {
-                let entry = PlanEntry::from_frame(frame)
-                    .map_err(|e| SyncError::Protocol(format!("bad plan entry: {}", e)))?;
+                let entry = match PlanEntry::from_frame(frame) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        return Err(send_error_and_finish(
+                            stream,
+                            ErrorCode::BadFrame,
+                            &format!("bad plan entry: {e}"),
+                        ));
+                    }
+                };
                 // §12 resource limits, enforced as each entry arrives (before
                 // any allocation is sized from it): the span stays inside
                 // the declared file size (overflow-safe), no chunk exceeds

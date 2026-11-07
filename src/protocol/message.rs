@@ -394,7 +394,7 @@ pub fn encode_empty(ftype: u8) -> io::Result<Frame> {
 
 /// Reads and validates an empty-payload frame of the given type.
 pub fn read_empty(inp: &mut impl Read, ftype: u8) -> Result<(), MessageError> {
-    let frame = framing::read_frame(inp)?;
+    let frame = read_frame_or_error(inp)?;
     if frame.ftype != ftype {
         return Err(MessageError::UnexpectedType(frame.ftype));
     }
@@ -450,7 +450,7 @@ pub fn encode_verify(root: Hash) -> io::Result<Frame> {
 }
 
 pub fn read_verify(inp: &mut impl Read) -> Result<Hash, MessageError> {
-    let frame = framing::read_frame(inp)?;
+    let frame = read_frame_or_error(inp)?;
     if frame.ftype != framing::T_VERIFY {
         return Err(MessageError::UnexpectedType(frame.ftype));
     }
@@ -479,19 +479,7 @@ pub fn encode_error(code: ErrorCode, message: &str) -> io::Result<Frame> {
 }
 
 pub fn read_error(inp: &mut impl Read) -> Result<(ErrorCode, String), MessageError> {
-    let frame = framing::read_frame(inp)?;
-    if frame.ftype != framing::T_ERROR {
-        return Err(MessageError::UnexpectedType(frame.ftype));
-    }
-    let p = &frame.payload;
-    let mut pos = 0usize;
-    let code = read_u16_le(p, &mut pos)?;
-    let code = ErrorCode::from_u16(code).ok_or(MessageError::Malformed("unknown error code"))?;
-    let msg_len = read_u16_le(p, &mut pos)? as usize;
-    let msg = read_bytes(p, &mut pos, msg_len)?;
-    let msg = String::from_utf8(msg.to_vec())
-        .map_err(|_| MessageError::Malformed("error message is not UTF-8"))?;
-    Ok((code, msg))
+    read_error_payload(&framing::read_frame(inp)?)
 }
 
 /// Reads an ERROR frame payload from an already-received frame.
@@ -507,6 +495,12 @@ pub fn read_error_payload(frame: &Frame) -> Result<(ErrorCode, String), MessageE
     let msg = read_bytes(p, &mut pos, msg_len)?;
     let msg = String::from_utf8(msg.to_vec())
         .map_err(|_| MessageError::Malformed("error message is not UTF-8"))?;
+    if pos != p.len() {
+        // Strict like every other codec (§3): trailing bytes are malformed.
+        return Err(MessageError::Malformed(
+            "trailing bytes after error message",
+        ));
+    }
     Ok((code, msg))
 }
 
@@ -520,7 +514,7 @@ pub fn encode_data(hash: Hash, compressed: &[u8]) -> io::Result<Frame> {
 
 /// Reads a DATA frame, returning (hash, compressed bytes).
 pub fn read_data(inp: &mut impl Read) -> Result<(Hash, Vec<u8>), MessageError> {
-    let frame = framing::read_frame(inp)?;
+    let frame = read_frame_or_error(inp)?;
     if frame.ftype != framing::T_DATA {
         return Err(MessageError::UnexpectedType(frame.ftype));
     }
@@ -918,6 +912,16 @@ mod tests {
         let (code, msg) = read_error(&mut cursor).unwrap();
         assert_eq!(code, ErrorCode::HashMismatch);
         assert_eq!(msg, "root hash differs");
+    }
+
+    #[test]
+    fn error_payload_rejects_trailing_bytes() {
+        // Strict codec (§3): ERROR was the one decoder that ignored bytes
+        // after its message.
+        let mut f = encode_error(ErrorCode::Io, "x").unwrap();
+        assert!(read_error_payload(&f).is_ok());
+        f.payload.extend_from_slice(b"junk");
+        assert!(read_error_payload(&f).is_err());
     }
 
     #[test]

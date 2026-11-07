@@ -118,6 +118,20 @@ Error codes: 1=version, 2=role conflict, 3=bad frame, 4=hash mismatch,
 5=io, 6=aborted. Any ERROR frame is terminal: the sender of ERROR closes the
 connection after flushing; the peer must treat the transfer as failed.
 
+**ERROR discipline (amended 2026-11).** The ERROR payload is exactly code
++ message: trailing bytes are a malformed frame, as in every other codec.
+ERROR may arrive at ANY read point, single-file sessions included (the
+v3 rule of §16.4): a peer reading manifest, plan, DATA, VERIFY or a
+marker frame reports an incoming ERROR as the peer's reason, never as an
+unexpected frame type. Conversely, a peer that fails AFTER the HELLO
+exchange — a frame it rejects, a local scan or source-read failure —
+sends ERROR before closing, so the other side learns why instead of
+seeing the connection drop. A peer never answers an ERROR with one of its
+own: the frame it received is the session's reason. (A second ERROR from
+the same peer — e.g. a tree conversation's own rejection followed by the
+tree layer's `Aborted` — is harmless, since the first one already ended
+the session for the reader.)
+
 **Write coalescing (implementation rule, no wire effect).** Frames are a
 byte stream; how they are cut into writes is invisible to the peer. A frame
 whose payload fits in 64 KiB is encoded as ONE write (header + payload),
@@ -503,7 +517,14 @@ origin, D5):
 - Any ERROR frame: terminal, both sides close. Documented codes in §3.
 - Truncated connections: both sides treat as failure; receiver keeps temp +
   manifest (that is the resume point); sender keeps nothing.
-- Frames larger than 64 MiB payload: protocol error.
+- Frames larger than 64 MiB payload: protocol error. A reader never
+  allocates the claimed length up front (2026-11): the payload buffer
+  starts at most 2 MiB and grows only as bytes actually arrive, so a bare
+  header cannot pin 64 MiB per connection.
+- Exclude patterns arrive from the sender (§16.7) and are matched in
+  O(pattern segments × path depth) per entry — never by backtracking
+  over every split of the path, which `**/**/…` patterns made
+  exponential (2026-11).
 - Receiver MUST enforce: DATA total ≤ PLAN_REMOTE total; temp file never
   exceeds sender's file_size. A sender violating these is malicious or broken
   → ERROR 3.
