@@ -3,10 +3,13 @@
 Specification for the ffsync wire protocol. (Named `Protocol v0.1.md`
 until 2026-10-24 — the filename carried the first release's version; the
 file itself tracks the protocol across versions and now lives under its
-version-neutral name.) Written for v0.1 (protocol
-version 1: **one file pair, two peers, one TCP connection**); it tracks the
-protocol across versions — changes ship with a `VERSION` bump and are
-recorded in the relevant sections. Current version: **4** (v0.2: HELLO
+version-neutral name.) First written for v0.1 (protocol version 1: **one
+file pair, two peers, one TCP connection**) and amended in place since:
+wire changes ship with a `VERSION` bump or behind a flag bit and are
+recorded in the relevant sections, dated where they amend shipped
+behavior. Sections that still say "v0.1" describe the baseline they were
+written for; the amendments say what changed. Current version: **4**
+(unchanged through ffsync 1.x) (v0.2: HELLO
 gained `file_mtime_nanos`, see §3/§4; v0.3 adds the tree envelope, see
 §16; v0.4/v0.5 work extends TREE_BEGIN additively under flag bits —
 §16.7 excludes, §16.8 parallel sessions — without a VERSION bump, since
@@ -25,9 +28,10 @@ the same wire bytes, no VERSION bump.
 - Roles: the peer with the desired ("source") content is the **sender**, the
   peer wanting to converge is the **receiver**. Roles are assigned by the CLI,
   not negotiated.
-- Transport: one ordered, reliable byte stream (TCP). Plaintext for v0.1 —
-  intended for LAN use or inside an SSH tunnel. TLS (rustls) is planned; see
-  D13 and §14.
+- Transport: one ordered, reliable byte stream. v0.1 was plaintext TCP;
+  since v0.2 the stream is TLS 1.3 with mutual fingerprint pinning by
+  default (D16, `--plaintext` opts out), and since v0.6 it may be a QUIC
+  stream (§17). Everything below the framing layer is carrier-agnostic.
 - Compression: zstd on chunk-data frames only.
 - Resume after disconnect (receiver-authoritative, D10).
 - Progress/observability derived from protocol flow (§11).
@@ -109,7 +113,7 @@ not by tolerating unknown frames).
 | 0x0A  | NOT_MODIFIED   | both    | empty |
 | 0x0B  | ERROR          | both    | code u16 + message (u16 len + UTF-8) |
 | 0x0C  | TREE_BEGIN     | send→recv | flags u16 (§16.2), [parallel u16 when bit 3], [pattern section when bit 2], entry_count u64, then entry_count × tree entry (§16.2; per-entry `mode u32` when bit 4) |
-| 0x0D  | TREE_END       | both    | deleted_count u32 + deleted_bytes u64 (recv→send, after deletes; send→recv variant is empty); v0.3 |
+| 0x0D  | TREE_END       | both    | deleted_count u32 + deleted_bytes u64, always 12 bytes (recv→send: the delete report, after deletes; send→recv: both fields 0); v0.3 |
 | 0x0E  | FILE_SYNC      | send→recv | empty; tree sessions only: "this file needs a conversation" (§16.4) — its absence is NOT_MODIFIED |
 | 0x0F  | TREE_WORKER    | both    | sender→recv: worker_index u16 (1..K-1); recv→sender: ACK (empty) (§16.8) |
 | 0x10  | TREE_FILE      | send→recv | rel path (u16 len + UTF-8) (§16.8) |
@@ -562,14 +566,14 @@ origin, D5):
 
 ## 14. Extension points — status
 
-1. **Persistent index:** IMPLEMENTED (D15, v0.4 — `FFSYIX02` sidecar
+1. **Persistent index:** IMPLEMENTED (D15, v0.2; `FFSYIX02` since D19 — sidecar
    files; the INDEX-frame idea was dropped in favor of the on-disk
    sidecar, same trust model: size+mtime+CDC-parameter validation).
 2. **Eager diff:** IMPLEMENTED (§9.2, opt-in `--eager`; the bench cell
    measured it before it shipped — D8's doctrine; tree sessions §16.11).
-3. **TLS:** IMPLEMENTED (D16, v0.5 — rustls TLS 1.3, mutual TOFU
+3. **TLS:** IMPLEMENTED (D16, v0.2 — rustls TLS 1.3, mutual TOFU
    fingerprint pinning; QUIC followed in v0.6, §17).
-4. **Parallel chunk streams:** IMPLEMENTED (v0.7, §16.8 — per-file
+4. **Parallel chunk streams:** IMPLEMENTED (v0.5, §16.8 — per-file
    conversations over K TCP connections; on QUIC they ride streams,
    §17).
 5. **Hash truncation:** reserved, not implemented. BLAKE3 supports
@@ -622,7 +626,7 @@ R→S: TREE_BEGIN   (receiver's tree manifest, same framing)
         S→R: per-file HELLO (path = relative path, §4)
         ... per-file protocol §5–§8 unchanged ...
       (deletions, §16.5)
-S→R: TREE_END     (empty payload)
+S→R: TREE_END     (12 zero bytes)
 R→S: TREE_END     (deleted_count, deleted_bytes)
 ```
 
@@ -694,8 +698,19 @@ place of the receiver's TREE_BEGIN and reports it. The operator's way out
 is to exclude the paths on the sender (§16.7), which removes them from
 both scans.
 
-Tree flags (in TREE_BEGIN, u16): bit 0 `checksum` (D11 tree-wide: no
-metadata fast path on any file), bit 1 `no_delete` (§16.5).
+Tree flags (in TREE_BEGIN, u16). Unknown bits are a protocol error
+(strict codec), which is what lets later bits ship without a VERSION bump:
+
+| Bit | Name        | Meaning                                              | Section |
+|-----|-------------|------------------------------------------------------|---------|
+| 0   | `checksum`  | D11 tree-wide: no metadata fast path on any file     | §16.3   |
+| 1   | `no_delete` | receiver keeps receiver-only files                   | §16.5   |
+| 2   | `excludes`  | a pattern section follows                            | §16.7   |
+| 3   | `parallel`  | a `parallel u16` (K) follows                         | §16.8   |
+| 4   | `metadata`  | entries carry `mode u32`                             | §16.9   |
+| 5   | `negation`  | the pattern section may contain `!` patterns         | §16.7   |
+| 6   | `dry_run`   | triage-only preview, no conversations                | §16.10  |
+| 7   | `eager`     | per-file conversations may run eager (§9.2)          | §16.11  |
 
 ### 16.3 Triage (local, no wire traffic)
 
@@ -776,7 +791,9 @@ pass.
 
 ### 16.5 Deletions
 
-After the last per-file COMMIT_ACK, the sender sends TREE_END (empty).
+After the last per-file COMMIT_ACK, the sender sends TREE_END (both
+fields 0 — the payload is always 12 bytes; the decoder rejects any other
+length).
 The receiver deletes every file in its `delete` set (skipped when
 `no_delete` is set), then removes now-empty directories bottom-up
 (within the synced subtree only), then replies TREE_END with
@@ -1048,50 +1065,6 @@ no async runtime enters the tree (the D13 amendment's constraint). QUIC
 `Read + Write`, so worker connections map onto streams without touching
 this layer again. That substitution is specified in §17.
 
-### 16.10 Dry-run preview (v0.8 work)
-
-`--dry-run` in tree mode is a TREE_BEGIN flag bit (bit 6,
-`TREE_FLAG_DRY_RUN`), mirrored by the receiver like every session flag:
-the sender announces it, the receiver mirrors it, and both run the normal
-TREE_BEGIN exchange and triage. Then:
-
-- The sender skips the per-file conversations entirely and goes straight
-  to its TREE_END barrier; the receiver skips its conversation loop and
-  its TREE_END barrier read consumes the sender's frame as usual (§16.8
-  membership discipline is untouched).
-- The receiver's delete pass runs in count-only mode: excluded and
-  protected paths are skipped exactly as in a real session, everything
-  else is counted (deepest-first order preserved), and the TREE_END
-  delete report carries the WOULD-delete numbers. Nothing is removed,
-  no directories are created, no kind-conflict cleanup happens.
-- The sender's preview outcome reports the conversation count from its
-  own triage (files that WOULD transfer), a sender-side byte estimate,
-  and the receiver's would-delete report.
-
-Old peers reject the unknown bit loudly at TREE_BEGIN decode (§16.2
-strict flag policy) — the same failure shape as every other flag-gated
-feature.
-
-### 16.11 Eager diff in tree sessions (v1.0.x work, D8 extended)
-
-`--eager` in tree mode is a TREE_BEGIN flag bit (bit 7,
-`TREE_FLAG_EAGER`), announced by the sender. The receiver mirrors the bit
-in its own TREE_BEGIN **iff it also opted in with its own `--eager`** —
-unlike the mirrored metadata/negation/dry-run bits, eager is an opt-in,
-not a session property: a receiver must never accept pre-plan DATA it
-did not agree to buffer. Eager is active for the whole session iff both
-peers set the bit; every per-file conversation (sequential §16.4 and
-parallel §16.8 workers alike) then runs the single-file §9.2 machinery
-inside the normal conversation frame order — the position gate, the
-hash-keyed pre-plan DATA buffer with its 64 MiB cap, and the
-offer-dedup contract (§9.2) are reused unchanged; no new frame types.
-
-A declining receiver converges lazily (silent fallback, same as the
-single-file offer), so mixed-version pairs and opt-out pairs stay
-compatible. The flag joins `TREE_FLAG_KNOWN`; old peers reject it loudly
-at decode — correct, since a peer that cannot parse bit 7 must not be
-asked to interpret conversations that ride it.
-
 ### 16.9 File metadata: POSIX mode bits (v4, D9 amendment)
 
 **Scope decision (D9 amendment, 2026-10-23).** Tree sync gains one metadata
@@ -1185,6 +1158,50 @@ per-entry layout, so it takes the bump; the earlier additive extensions
 they changed no existing layout. Unknown flag bits were already
 rejected, making the migration path the loud-failure one the protocol
 prefers).
+
+### 16.10 Dry-run preview (v0.8 work)
+
+`--dry-run` in tree mode is a TREE_BEGIN flag bit (bit 6,
+`TREE_FLAG_DRY_RUN`), mirrored by the receiver like every session flag:
+the sender announces it, the receiver mirrors it, and both run the normal
+TREE_BEGIN exchange and triage. Then:
+
+- The sender skips the per-file conversations entirely and goes straight
+  to its TREE_END barrier; the receiver skips its conversation loop and
+  its TREE_END barrier read consumes the sender's frame as usual (§16.8
+  membership discipline is untouched).
+- The receiver's delete pass runs in count-only mode: excluded and
+  protected paths are skipped exactly as in a real session, everything
+  else is counted (deepest-first order preserved), and the TREE_END
+  delete report carries the WOULD-delete numbers. Nothing is removed,
+  no directories are created, no kind-conflict cleanup happens.
+- The sender's preview outcome reports the conversation count from its
+  own triage (files that WOULD transfer), a sender-side byte estimate,
+  and the receiver's would-delete report.
+
+Old peers reject the unknown bit loudly at TREE_BEGIN decode (§16.2
+strict flag policy) — the same failure shape as every other flag-gated
+feature.
+
+### 16.11 Eager diff in tree sessions (v1.0.x work, D8 extended)
+
+`--eager` in tree mode is a TREE_BEGIN flag bit (bit 7,
+`TREE_FLAG_EAGER`), announced by the sender. The receiver mirrors the bit
+in its own TREE_BEGIN **iff it also opted in with its own `--eager`** —
+unlike the mirrored metadata/negation/dry-run bits, eager is an opt-in,
+not a session property: a receiver must never accept pre-plan DATA it
+did not agree to buffer. Eager is active for the whole session iff both
+peers set the bit; every per-file conversation (sequential §16.4 and
+parallel §16.8 workers alike) then runs the single-file §9.2 machinery
+inside the normal conversation frame order — the position gate, the
+hash-keyed pre-plan DATA buffer with its 64 MiB cap, and the
+offer-dedup contract (§9.2) are reused unchanged; no new frame types.
+
+A declining receiver converges lazily (silent fallback, same as the
+single-file offer), so mixed-version pairs and opt-out pairs stay
+compatible. The flag joins `TREE_FLAG_KNOWN`; old peers reject it loudly
+at decode — correct, since a peer that cannot parse bit 7 must not be
+asked to interpret conversations that ride it.
 
 ## 17. QUIC transport (D13 step 2, v0.6 work)
 

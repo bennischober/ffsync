@@ -29,7 +29,8 @@ pub struct Reconstructor {
 
 impl Reconstructor {
     /// Creates a new reconstructor.
-    /// Opens the temporary file and pre-allocates it (Sparse file).
+    /// Opens the temporary file and sizes it to `final_size` (sparse where
+    /// the filesystem supports it).
     pub fn new(target_path: &Path, local_source_path: &Path, final_size: u64) -> io::Result<Self> {
         let temp_path = Self::temp_path_for(target_path);
 
@@ -40,8 +41,10 @@ impl Reconstructor {
             .truncate(true) // Overwrite if partial exists (for now)
             .open(&temp_path)?;
 
-        // Pre-allocate file size. This is crucial for performance and ensuring
-        // we don't run out of disk space halfway through.
+        // Size the file up front so every positional write lands inside it.
+        // This does NOT reserve disk space: `set_len` extends sparsely on
+        // NTFS and most unix filesystems, so a full disk still surfaces as
+        // a write error mid-transfer (loud, never a silent short file).
         file.set_len(final_size)?;
 
         Ok(Self {
@@ -77,7 +80,7 @@ impl Reconstructor {
     }
 
     /// Trims (or extends) the temp file to exactly `len` bytes. Called
-    /// after every plan write and before verification: a resumed temp
+    /// after the last plan write and before verification: a resumed temp
     /// that is longer than the new target would otherwise keep a stale
     /// tail, fail the VERIFY re-scan, and waste the whole attempt.
     pub fn set_final_len(&self, len: u64) -> io::Result<()> {
