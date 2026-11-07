@@ -373,6 +373,10 @@ pre-existing.
   transport-agnostic (the closures are injected).
   Over QUIC (§17) the same closures open/accept extra streams on the one
   session connection — the membership protocol is unchanged.
+  The TCP accept (`accept_worker_connection`) SKIPS connections that fail
+  worker authentication (warning, never fatal — the port is public while
+  the session runs), with a per-attempt handshake budget and an overall
+  deadline. Do not turn a rejected stray back into a session error.
 - QUIC teardown is NOT TCP teardown (§17.6): closing a QUIC connection
   discards unACKed *stream* data (RFC 9000 §10.2.2), while TCP `close()`
   flushes. A final frame that is ANSWERED (TREE_END report, COMMIT_ACK)
