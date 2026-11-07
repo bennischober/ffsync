@@ -428,11 +428,23 @@ where
         Err(e) => {
             // Announce the abort (best effort — the peer may be the one
             // that caused it and is already gone).
-            let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
+            announce_abort(stream, &e);
             return Err(e);
         }
     };
     Ok(outcome)
+}
+
+/// Tells the peer a per-file conversation failed (ERROR(Aborted)), unless
+/// the failure IS the peer's ERROR: echoing it back only shows up on the
+/// peer as a second, confusing "aborted: peer error …". A conversation
+/// that rejected the peer itself has already sent its own ERROR; this
+/// second one is harmless (ERROR is terminal, §3 — the peer stops reading
+/// after the first).
+fn announce_abort(stream: &mut (impl Write + ?Sized), e: &SyncError) {
+    if !matches!(e, SyncError::Peer(..)) {
+        let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
+    }
 }
 
 /// Runs the sender side of a tree session over `stream`.
@@ -567,10 +579,15 @@ where
                 manifest.get(rel).map(|e| {
                     peer_manifest.get(rel).map_or(e.size, |p| {
                         // Same predicate as the triage fast path: nanos
-                        // included (a same-second rewrite is a change).
+                        // included (a same-second rewrite is a change), at
+                        // the 100 ns peer granularity (D23) — an exact-ns
+                        // compare counted every Linux→NTFS file as bytes
+                        // to move.
                         if p.size == e.size
-                            && p.mtime_secs == e.mtime_secs
-                            && p.mtime_nanos == e.mtime_nanos
+                            && crate::tree::mtimes_match(
+                                (p.mtime_secs, p.mtime_nanos),
+                                (e.mtime_secs, e.mtime_nanos),
+                            )
                         {
                             0
                         } else {
@@ -791,7 +808,7 @@ where
                 Ok(o) => o,
                 Err(e) => {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
+                    announce_abort(stream, &e);
                     control_error = Some(e);
                     break;
                 }
@@ -881,20 +898,40 @@ where
     // sides' scans (§16.7) — our manifest must be filtered with them before
     // it goes on the wire, or the two triages diverge (§16.4 contract).
     // No deadlock: the sender writes its TREE_BEGIN before blocking on ours.
+    //
+    // Every failure from here to our TREE_BEGIN is announced with ERROR:
+    // the sender is blocked reading our envelope and would otherwise only
+    // see the connection drop (§3).
     progress(TreeProgress::Scanning);
-    let (peer_begin, peer_manifest) = read_tree_begin(stream)?;
+    let (peer_begin, peer_manifest) = match read_tree_begin(stream) {
+        Ok(v) => v,
+        // The sender's own ERROR, or it is gone: nothing to tell it.
+        Err(e @ (SyncError::Peer(..) | SyncError::Eof)) => return Err(e),
+        Err(e) => {
+            let _ = send_error_and_finish(stream, ErrorCode::BadFrame, &e.to_string());
+            return Err(e);
+        }
+    };
     // Shared with worker threads (§16.8) without a deep copy.
     let peer_manifest = std::sync::Arc::new(peer_manifest);
-    let sender_excludes = tree::ExcludeSet::from_patterns(&peer_begin.excludes)
-        .map_err(|e| SyncError::Protocol(format!("peer sent bad exclude pattern: {e}")))?;
-    let manifest =
-        TreeManifest::scan_with_excludes(&request.root, &sender_excludes).map_err(|e| {
-            SyncError::Protocol(format!(
-                "cannot scan tree {}: {}",
-                request.root.display(),
-                e
-            ))
-        })?;
+    let sender_excludes = match tree::ExcludeSet::from_patterns(&peer_begin.excludes) {
+        Ok(set) => set,
+        Err(e) => {
+            return Err(send_error_and_finish(
+                stream,
+                ErrorCode::BadFrame,
+                &format!("peer sent bad exclude pattern: {e}"),
+            ));
+        }
+    };
+    let manifest = match TreeManifest::scan_with_excludes(&request.root, &sender_excludes) {
+        Ok(m) => m,
+        Err(e) => {
+            let why = format!("cannot scan tree {}: {}", request.root.display(), e);
+            let _ = send_error_and_finish(stream, ErrorCode::Aborted, &why);
+            return Err(SyncError::Protocol(why));
+        }
+    };
 
     // §16.8: mirror the sender's K in our TREE_BEGIN (the flag bit carries
     // the field; the value is sender-authoritative). K=1 keeps the exact
@@ -947,8 +984,14 @@ where
     };
     // The receiver's own patterns never touch manifests (§16.7); they only
     // guard the delete pass below. They are NOT advertised on the wire.
-    let own_excludes = tree::ExcludeSet::from_patterns(&request.excludes)
-        .map_err(|e| SyncError::Protocol(format!("bad exclude pattern: {e}")))?;
+    let own_excludes = match tree::ExcludeSet::from_patterns(&request.excludes) {
+        Ok(set) => set,
+        Err(e) => {
+            let why = format!("bad exclude pattern: {e}");
+            let _ = send_error_and_finish(stream, ErrorCode::Aborted, &why);
+            return Err(SyncError::Protocol(why));
+        }
+    };
 
     // §16.2 receiver-side path safety, checked BEFORE our TREE_BEGIN (no
     // triage has run, nothing is written yet): every sender path must name
@@ -1225,7 +1268,7 @@ where
                     // Announce the abort (best effort): the sender may still be
                     // reading its next conversation's reply and must fail fast
                     // instead of timing out.
-                    let _ = send_error_and_finish(stream, ErrorCode::Aborted, &e.to_string());
+                    announce_abort(stream, &e);
                     return Err(e);
                 }
             };

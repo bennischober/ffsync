@@ -148,6 +148,11 @@ impl From<io::Error> for FrameError {
     }
 }
 
+/// Payload bytes [`read_frame`] reserves up front; larger frames grow as
+/// their bytes arrive (2 MiB covers the largest chunk plus compression
+/// overhead, so DATA frames never reallocate).
+const PREALLOC_LIMIT: usize = 2 * 1024 * 1024;
+
 /// Reads one frame. Clean EOF before any byte of a frame is reported as
 /// `Err(FrameError::Eof)` (callers match on it explicitly); a header or
 /// payload that ends mid-frame is `FrameError::Truncated`.
@@ -174,9 +179,17 @@ pub fn read_frame(inp: &mut (impl Read + ?Sized)) -> Result<Frame, FrameError> {
             format!("frame payload of {} bytes exceeds {}", len, MAX_PAYLOAD),
         )));
     }
-    let mut payload = vec![0u8; len as usize];
-    if let Err(e) = inp.read_exact(&mut payload) {
+    // Grow with the bytes that actually arrive instead of trusting the
+    // header: a peer claiming MAX_PAYLOAD and then going quiet must not
+    // pin 64 MiB per connection (pre-auth with --plaintext, or per worker
+    // with --parallel). Any honest DATA frame (≤ 1 MiB chunk, compressed)
+    // still fits the first allocation.
+    let mut payload = Vec::with_capacity((len as usize).min(PREALLOC_LIMIT));
+    if let Err(e) = (&mut *inp).take(len as u64).read_to_end(&mut payload) {
         return Err(FrameError::from(e));
+    }
+    if payload.len() != len as usize {
+        return Err(FrameError::Truncated);
     }
     Ok(Frame { ftype, payload })
 }
