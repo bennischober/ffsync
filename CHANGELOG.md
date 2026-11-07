@@ -2,6 +2,14 @@
 
 All notable changes to ffsync are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Tree receivers refuse sender paths they cannot store safely.** A tree receiver now checks every sender path before it writes anything, and fails the session with a clear error if a path would resolve to the wrong place. Before, a Windows receiver let `C:x` escape the sync root, wrote `a:b` into an alternate data stream, and stored `a.` as `a`, which the next session's delete pass then removed. Device names such as `nul` are refused too. On every platform, the receiver no longer writes through a directory symlink or junction in its tree, which used to land files outside the root. To sync the rest of the tree, exclude the reported paths on the sender (`--exclude`). Unix receivers still accept `a:b` and trailing dots.
+- The receiver rejects a tree manifest that lists a path twice or names an ffsync sidecar file (`*.ffsync-tmp`, `*.ffsync-index`). Only a broken or hostile sender sends one.
+- A tree sender whose receiver aborts during the opening exchange now reports the receiver's reason instead of "unexpected frame type 0x0B".
+
 ## [1.4.0] - 2026-11-06
 
 The rest of the code-review fixes, including a data bug: `receive --from` could leave the target unwritten. The protocol stays at v4 and 1.3.x peers interoperate. COMMIT_ACK gains an outcome byte (D24) that released peers ignore. Upgrade the receiver to get the `--from` fix; peers' InSync/Transferred labels agree in all cases once both run 1.4.0.

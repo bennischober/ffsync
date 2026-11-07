@@ -333,6 +333,13 @@ pre-existing.
   ffsync's own bookkeeping; syncing them would sync internal state and
   desync warm starts (an index written at commit changes mtime → re-sync
   loop). The scan filter in `src/tree.rs` is the single place this lives.
+- Receiver path safety (§16.2, 2026-11): `check_receiver_paths` in
+  `tree_sync.rs` runs `tree::check_local_name` (Windows representability:
+  drive prefix/ADS colon, trailing dot/space, device names) and
+  `tree::link_ancestor` (no writes through a dir link the scan skipped)
+  on every sender path BEFORE the receiver's TREE_BEGIN, and refuses the
+  whole session on any hit. Never "soften" it into skipping entries —
+  one-sided skips desync triage; the sender's `--exclude` is the way out.
 - Tree triage must be deterministic and identical on both peers (same two
   manifests, same flags — the receiver derives its flags from the sender's
   TREE_BEGIN). Any nondeterminism desyncs the per-file conversation

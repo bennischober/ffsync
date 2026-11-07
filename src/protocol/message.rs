@@ -141,7 +141,7 @@ pub enum MessageError {
 /// Reads one frame; on ERROR frames returns [`MessageError::PeerError`],
 /// otherwise hands the frame to the caller (used by `read_typed` so an
 /// aborting peer's ERROR is classified instead of swallowed).
-fn read_frame_or_error(inp: &mut impl Read) -> Result<Frame, MessageError> {
+pub(crate) fn read_frame_or_error(inp: &mut impl Read) -> Result<Frame, MessageError> {
     let frame = framing::read_frame(inp)?;
     if frame.ftype == framing::T_ERROR {
         let (code, msg) = read_error_payload(&frame)?;

@@ -637,6 +637,42 @@ UTF-8 (possible on unix) has no wire spelling: the scan skips it with a
 warning on both peers (amended 2026-11 — a lossy conversion named a file
 that did not exist and failed the session, and could merge two names).
 
+The decoder also refuses (protocol error, amended 2026-11): a path named
+twice (one path, one entry — a later entry used to replace an earlier one
+silently), and an ffsync sidecar name (`*.ffsync-tmp`, `*.ffsync-index`,
+`*.ffsync-index-tmp`): the scan never lists them (§16.7 note on
+`tree::is_sidecar`), so on the wire they can only come from a hostile or
+buggy sender, and they would let it overwrite the receiver's own temp or
+index files.
+
+**Receiver-side path safety (amended 2026-11).** A syntactically valid
+path can still name the wrong object on the receiver's filesystem. Before
+it sends its own TREE_BEGIN (no triage has run, nothing is written), the
+receiver checks every sender path and refuses the session with
+ERROR(`Aborted`) naming the offending paths if any one of them:
+
+- is not representable as exactly one file on this platform. On a Windows
+  receiver that is a component containing `:` (a drive prefix such as
+  `C:x` makes the join discard the sync root; any other colon opens an
+  NTFS alternate data stream), `<>"|?*` or a control character; one
+  ending in a dot or space (Win32 strips them: `a.` *is* `a`, and the next
+  session's delete pass would remove the file it just wrote); or a
+  reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`,
+  `COM0`–`COM9`, `LPT0`–`LPT9` and their superscript-digit forms,
+  case-insensitive, extension ignored). Unix receivers store every valid
+  name verbatim, so this check is a no-op there (`a:b` stays legal
+  between unix peers);
+- lies under a directory symlink or junction in the receiver's tree. The
+  scan never recurses into one (D18), so writing through it would land
+  outside the root, and because the next scan cannot see those bytes
+  they would re-transfer every session.
+
+Refusing the whole session is deliberate: dropping an entry on one side
+only would desync the two triages (§16.4). The sender sees the ERROR in
+place of the receiver's TREE_BEGIN and reports it. The operator's way out
+is to exclude the paths on the sender (§16.7), which removes them from
+both scans.
+
 Tree flags (in TREE_BEGIN, u16): bit 0 `checksum` (D11 tree-wide: no
 metadata fast path on any file), bit 1 `no_delete` (§16.5).
 

@@ -175,12 +175,28 @@ fn manifest_to_wire(m: &TreeManifest) -> Vec<TreeEntryWire> {
 }
 
 /// Decodes the wire form into a [`TreeManifest`], validating every path
-/// (§16.2: no traversal, wire separators, kind byte).
+/// (§16.2: no traversal, wire separators, kind byte, no sidecar names, no
+/// duplicates).
 pub fn manifest_from_wire(wire: &[TreeEntryWire]) -> Result<TreeManifest, SyncError> {
     let mut m = TreeManifest::new();
     for e in wire {
         tree::validate_rel_path(&e.rel_path)
             .map_err(|why| SyncError::Protocol(format!("bad tree path: {why}")))?;
+        // A scan never lists ffsync's own bookkeeping (`tree::is_sidecar`),
+        // so a sidecar name can only come from a hostile or buggy peer —
+        // and would let it overwrite our index/temp files (§16.2).
+        if tree::is_sidecar(&e.rel_path) {
+            return Err(SyncError::Protocol(format!(
+                "bad tree path: ffsync sidecar name {:?}",
+                e.rel_path
+            )));
+        }
+        if m.get(&e.rel_path).is_some() {
+            return Err(SyncError::Protocol(format!(
+                "bad tree manifest: duplicate path {:?}",
+                e.rel_path
+            )));
+        }
         let kind = EntryKind::from_u8(e.kind)
             .ok_or_else(|| SyncError::Protocol(format!("bad tree entry kind {}", e.kind)))?;
         if kind == EntryKind::Dir && e.size != 0 {
@@ -201,8 +217,49 @@ pub fn manifest_from_wire(wire: &[TreeEntryWire]) -> Result<TreeManifest, SyncEr
     Ok(m)
 }
 
+/// The receiver's §16.2 representability + link-ancestor checks over the
+/// sender's manifest. Reports up to a few offending paths at once so a
+/// user can exclude them in one go.
+fn check_receiver_paths(root: &Path, peer: &TreeManifest) -> Result<(), String> {
+    const SHOWN: usize = 5;
+    let mut problems: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    let mut checked = HashMap::new();
+    for e in peer.entries() {
+        let problem = tree::check_local_name(&e.rel_path).err().or_else(|| {
+            tree::link_ancestor(root, &e.rel_path, &mut checked).map(|link| {
+                format!(
+                    "{:?} lies under {link:?}, a directory symlink/junction on this receiver",
+                    e.rel_path
+                )
+            })
+        });
+        if let Some(p) = problem {
+            total += 1;
+            if problems.len() < SHOWN {
+                problems.push(p);
+            }
+        }
+    }
+    if total == 0 {
+        return Ok(());
+    }
+    let more = if total > SHOWN {
+        format!(" (and {} more)", total - SHOWN)
+    } else {
+        String::new()
+    };
+    Err(format!(
+        "receiver cannot store {total} sender path(s) safely: {}{more}; exclude them on the sender (--exclude) to proceed",
+        problems.join("; ")
+    ))
+}
+
 fn read_tree_begin(stream: &mut impl Read) -> Result<(TreeBegin, TreeManifest), SyncError> {
-    let frame = framing::read_frame(stream)?;
+    // An ERROR in place of the envelope (e.g. the receiver's §16.2
+    // path-safety refusal) is classified as the peer's error, so the
+    // sender reports the reason instead of "unexpected frame type".
+    let frame = message::read_frame_or_error(stream)?;
     let begin = TreeBegin::from_frame(frame)?;
     let manifest = manifest_from_wire(&begin.entries)?;
     Ok((begin, manifest))
@@ -892,6 +949,19 @@ where
     // guard the delete pass below. They are NOT advertised on the wire.
     let own_excludes = tree::ExcludeSet::from_patterns(&request.excludes)
         .map_err(|e| SyncError::Protocol(format!("bad exclude pattern: {e}")))?;
+
+    // §16.2 receiver-side path safety, checked BEFORE our TREE_BEGIN (no
+    // triage has run, nothing is written yet): every sender path must name
+    // exactly one object on this filesystem, and none may lie under a
+    // directory link/junction in our tree (the scan never recurses into
+    // one, D18 — writing through it would land outside the root). Refusing
+    // the session is the only consistent answer: skipping an entry on one
+    // side would desync the two triages (§16.4). The sender can exclude
+    // the offending paths (§16.7) to proceed.
+    if let Err(why) = check_receiver_paths(&request.root, &peer_manifest) {
+        let _ = send_error_and_finish(stream, ErrorCode::Aborted, &why);
+        return Err(SyncError::Protocol(why));
+    }
 
     send_tree_begin(stream, flags, parallel, &[], &manifest)?;
     let checksum = request.force_checksum || (peer_begin.flags & TREE_FLAG_CHECKSUM) != 0;
