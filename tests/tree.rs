@@ -1583,3 +1583,225 @@ fn tree_delete_pass_handles_dirs_with_unlisted_content() {
     assert_eq!(r.deleted, 3);
     assert_eq!(s.deleted, 3);
 }
+
+/// One wire entry for the hostile-sender tests (a 1-byte file).
+fn wire_file(rel: &str) -> ffsync::protocol::message::TreeEntryWire {
+    ffsync::protocol::message::TreeEntryWire {
+        rel_path: rel.to_string(),
+        kind: 0,
+        size: 1,
+        mtime_secs: 1,
+        mtime_nanos: 0,
+        mode: 0,
+    }
+}
+
+#[test]
+fn tree_wire_manifest_refuses_sidecar_names() {
+    // §16.2: the scan never lists sidecars, so a sidecar name on the wire
+    // comes from a hostile or buggy sender — and would let it clobber the
+    // receiver's own temp/index files (e.g. `x.ffsync-tmp` while a §16.8
+    // worker writes it).
+    use ffsync::protocol::tree_sync::manifest_from_wire;
+    for rel in ["x.ffsync-tmp", "d/x.bin.ffsync-index", "x.ffsync-index-tmp"] {
+        assert!(
+            manifest_from_wire(&[wire_file(rel)]).is_err(),
+            "{rel} accepted"
+        );
+    }
+}
+
+#[test]
+fn tree_wire_manifest_refuses_duplicate_paths() {
+    // Strict decoder: one path, one entry (the second used to replace the
+    // first silently).
+    use ffsync::protocol::tree_sync::manifest_from_wire;
+    let mut dir = wire_file("a");
+    dir.kind = 1;
+    dir.size = 0;
+    assert!(manifest_from_wire(&[wire_file("a"), dir]).is_err());
+    assert!(manifest_from_wire(&[wire_file("a"), wire_file("a")]).is_err());
+}
+
+/// Plays a hostile sender: writes one raw TREE_BEGIN naming `rel`, runs
+/// the real receiver against it, and returns the receiver's result plus
+/// the first frame type the "sender" got back (None if the connection
+/// closed without a frame).
+#[cfg(windows)]
+fn hostile_tree_begin(
+    receiver_root: &Path,
+    rel: &str,
+) -> (
+    Result<TreeOutcome, ffsync::protocol::sync::SyncError>,
+    Option<u8>,
+) {
+    use ffsync::protocol::message::TreeBegin;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let root = receiver_root.to_path_buf();
+    let server = std::thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+        tree_receive(
+            &mut &tcp,
+            &TreeReceiveRequest {
+                root,
+                force_checksum: false,
+                no_delete: false,
+                excludes: Vec::new(),
+                accept_worker: std::sync::Arc::new(|| Err(std::io::Error::other("no workers"))),
+                dry_run: false,
+                eager: false,
+            },
+            &PipelineConfig::default(),
+            &mut |_p| {},
+        )
+    });
+    let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    let mut buf = Vec::new();
+    TreeBegin {
+        flags: 0,
+        parallel: 1,
+        excludes: Vec::new(),
+        entries: vec![wire_file(rel)],
+    }
+    .into_frame()
+    .unwrap()
+    .encode(&mut buf)
+    .unwrap();
+    std::io::Write::write_all(&mut tcp, &buf).unwrap();
+    let reply = ffsync::protocol::framing::read_frame(&mut tcp)
+        .ok()
+        .map(|f| f.ftype);
+    (server.join().unwrap(), reply)
+}
+
+#[cfg(windows)]
+#[test]
+fn tree_receiver_refuses_paths_it_cannot_store() {
+    // §16.2 receiver-side path safety: names this filesystem would alias,
+    // reinterpret, or resolve outside the root fail the session before any
+    // write, and the sender is told why (ERROR, not a bare close).
+    let cases = [
+        "C:escape/payload.bin", // drive-relative: join() replaces the root
+        "d/a:b",                // NTFS alternate data stream
+        "a.",                   // Win32 strips the dot: aliases `a`
+        "b ",                   // ... and trailing spaces
+        "nul",                  // device
+        "d/con.txt",            // device, extension ignored
+        "COM1",                 // case-insensitive device
+        "x?y",                  // not representable
+    ];
+    let listing = |p: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<_> = fs::read_dir(p)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    };
+    for rel in cases {
+        let tree = TempTree::new("hostile_name");
+        let cwd_before = listing(Path::new("."));
+        let (r, reply) = hostile_tree_begin(tree.path(), rel);
+        let err = r.expect_err(&format!("{rel:?} accepted"));
+        assert!(
+            err.to_string().contains("cannot store"),
+            "{rel:?}: unexpected error {err}"
+        );
+        assert_eq!(
+            reply,
+            Some(ffsync::protocol::framing::T_ERROR),
+            "{rel:?}: sender was not told"
+        );
+        assert!(
+            listing(tree.path()).is_empty(),
+            "{rel:?}: receiver wrote something"
+        );
+        assert_eq!(
+            cwd_before,
+            listing(Path::new(".")),
+            "{rel:?}: wrote into the cwd"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn tree_trailing_dot_sender_name_fails_without_touching_receiver() {
+    // A Linux sender may hold `a.`; on a Windows receiver it aliases `a`.
+    // Before §16.2's receiver check, the conversation for `a.` wrote `a`,
+    // the next session listed `a` as receiver-only and the delete pass
+    // removed it — every other session lost the file. Now the session
+    // fails loudly, and the receiver's own `a` is never touched.
+    let base = TempTree::new("trailing_dot");
+    fs::create_dir_all(base.path().join("s")).unwrap();
+    // A verbatim (\\?\) root turns Win32 normalization off, so this
+    // Windows sender can hold the literal name `a.`.
+    let s_root = fs::canonicalize(base.path().join("s")).unwrap();
+    fs::write(s_root.join("a."), b"from the sender").unwrap();
+    fs::write(s_root.join("ok.txt"), b"fine").unwrap();
+    let r_root = base.path().join("r");
+    fs::create_dir_all(&r_root).unwrap();
+    fs::write(r_root.join("a"), b"receiver copy").unwrap();
+
+    for _ in 0..2 {
+        let (s, r) = run_tree_session(&s_root, &r_root, false, false);
+        let r = r.expect_err("receiver must refuse");
+        assert!(r.to_string().contains("trailing dots"), "{r}");
+        let s = s.expect_err("sender must fail too");
+        assert!(s.to_string().contains("cannot store"), "sender saw {s}");
+        assert_eq!(fs::read(r_root.join("a")).unwrap(), b"receiver copy");
+        assert!(!r_root.join("ok.txt").exists(), "nothing is written");
+    }
+    // The advertised way out: exclude the name on the sender.
+    let (s, r) = run_tree_session_ex(&s_root, &r_root, false, false, &["a."], &[]);
+    s.unwrap();
+    r.unwrap();
+    assert_eq!(fs::read(r_root.join("ok.txt")).unwrap(), b"fine");
+    // Remove `a.` through the verbatim root (a Win32 path cannot name it).
+    let _ = fs::remove_dir_all(&s_root);
+}
+
+#[test]
+fn tree_receiver_refuses_to_write_through_dir_links() {
+    // D18: the receiver's scan never recurses into a directory
+    // symlink/junction — so its writes must not follow one either. A
+    // sender dir with the link's name would land files OUTSIDE the
+    // receiver root (and, unseen by the scan, re-transfer every session).
+    let base = TempTree::new("write_through_link");
+    let (s_root, r_root, outside) = (
+        base.path().join("s"),
+        base.path().join("r"),
+        base.path().join("outside"),
+    );
+    for d in [&s_root, &r_root, &outside] {
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::create_dir_all(s_root.join("link/deeper")).unwrap();
+    fs::write(s_root.join("link/deeper/f.txt"), b"from the sender").unwrap();
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(r_root.join("link"))
+            .arg(&outside)
+            .output()
+            .expect("mklink /J");
+        assert!(out.status.success(), "mklink /J failed: {:?}", out.stderr);
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, r_root.join("link")).unwrap();
+
+    let (s, r) = run_tree_session(&s_root, &r_root, false, false);
+    let r = r.expect_err("receiver must refuse");
+    assert!(r.to_string().contains("link"), "{r}");
+    assert!(s.is_err(), "sender must fail too");
+    assert_eq!(
+        fs::read_dir(&outside).unwrap().count(),
+        0,
+        "receiver wrote through the link"
+    );
+}

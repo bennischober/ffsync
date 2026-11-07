@@ -77,3 +77,75 @@ fn decoders_survive_adversarial_payloads() {
         let _ = decode_commit_ack(g); // D24 outcome byte
     }
 }
+
+// ---- Frame-header allocation bomb (§12) ----
+//
+// A header claiming the 64 MiB maximum must not make the reader allocate
+// 64 MiB before a single payload byte arrived: that is a pre-auth
+// (`--plaintext`) or per-worker (`--parallel 16`) memory lever costing the
+// attacker five bytes. A thread-local switch keeps the other test in this
+// binary out of the measurement.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct PeakTracking;
+
+thread_local! {
+    static TRACK: Cell<bool> = const { Cell::new(false) };
+}
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: forwards every call to `System` unchanged; only counts sizes.
+unsafe impl GlobalAlloc for PeakTracking {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() && TRACK.with(|t| t.get()) {
+            let now = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK.fetch_max(now, Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if TRACK.with(|t| t.get()) {
+            // Saturating: a tracked dealloc may free an untracked block.
+            // (Hand-rolled CAS: `fetch_update` is deprecated on current
+            // stable and its replacement is newer than the MSRV.)
+            let mut cur = LIVE.load(Ordering::Relaxed);
+            while let Err(seen) = LIVE.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(layout.size()),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                cur = seen;
+            }
+        }
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: PeakTracking = PeakTracking;
+
+#[test]
+fn frame_header_does_not_preallocate_claimed_length() {
+    use ffsync::protocol::framing::{FrameError, MAX_PAYLOAD, T_DATA, read_frame};
+    let mut wire = vec![T_DATA];
+    wire.extend_from_slice(&MAX_PAYLOAD.to_le_bytes());
+    wire.extend_from_slice(&[0u8; 16]); // then the peer stops sending
+    let mut cursor = std::io::Cursor::new(wire);
+    LIVE.store(0, Ordering::Relaxed);
+    PEAK.store(0, Ordering::Relaxed);
+    TRACK.with(|t| t.set(true));
+    let r = read_frame(&mut cursor);
+    TRACK.with(|t| t.set(false));
+    assert!(matches!(r, Err(FrameError::Truncated)), "{r:?}");
+    let peak = PEAK.load(Ordering::Relaxed);
+    assert!(
+        peak < 4 * 1024 * 1024,
+        "reading 16 payload bytes peaked at {peak} bytes of heap"
+    );
+}

@@ -333,6 +333,13 @@ pre-existing.
   ffsync's own bookkeeping; syncing them would sync internal state and
   desync warm starts (an index written at commit changes mtime → re-sync
   loop). The scan filter in `src/tree.rs` is the single place this lives.
+- Receiver path safety (§16.2, 2026-11): `check_receiver_paths` in
+  `tree_sync.rs` runs `tree::check_local_name` (Windows representability:
+  drive prefix/ADS colon, trailing dot/space, device names) and
+  `tree::link_ancestor` (no writes through a dir link the scan skipped)
+  on every sender path BEFORE the receiver's TREE_BEGIN, and refuses the
+  whole session on any hit. Never "soften" it into skipping entries —
+  one-sided skips desync triage; the sender's `--exclude` is the way out.
 - Tree triage must be deterministic and identical on both peers (same two
   manifests, same flags — the receiver derives its flags from the sender's
   TREE_BEGIN). Any nondeterminism desyncs the per-file conversation
@@ -366,6 +373,10 @@ pre-existing.
   transport-agnostic (the closures are injected).
   Over QUIC (§17) the same closures open/accept extra streams on the one
   session connection — the membership protocol is unchanged.
+  The TCP accept (`accept_worker_connection`) SKIPS connections that fail
+  worker authentication (warning, never fatal — the port is public while
+  the session runs), with a per-attempt handshake budget and an overall
+  deadline. Do not turn a rejected stray back into a session error.
 - QUIC teardown is NOT TCP teardown (§17.6): closing a QUIC connection
   discards unACKed *stream* data (RFC 9000 §10.2.2), while TCP `close()`
   flushes. A final frame that is ANSWERED (TREE_END report, COMMIT_ACK)

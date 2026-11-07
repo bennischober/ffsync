@@ -710,7 +710,7 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
             })?;
             tcp.set_nodelay(true).ok();
             set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-            authenticate_worker(tcp, &host, true, worker_auth.as_ref()).map(buffered)
+            authenticate_worker(tcp, &host, true, worker_auth.as_ref(), None).map(buffered)
         };
         let connect_worker: Box<dyn Fn(u16) -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
             Box::new(connect_worker);
@@ -808,13 +808,13 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
             // not be able to inject conversations into this session.
             let accept_worker: Box<dyn Fn() -> std::io::Result<Box<dyn ReadWrite>> + Send + Sync> =
                 Box::new(move || -> std::io::Result<Box<dyn ReadWrite>> {
-                    let (tcp, wpeer) = listener
-                        .accept()
-                        .map_err(|e| std::io::Error::other(format!("cannot accept worker: {e}")))?;
-                    tcp.set_nodelay(true).ok();
-                    set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
-                    authenticate_worker(tcp, &wpeer.to_string(), false, worker_auth.as_ref())
-                        .map(buffered)
+                    accept_worker_connection(
+                        &listener,
+                        worker_auth.as_ref(),
+                        Duration::from_secs(WORKER_HANDSHAKE_SECS),
+                        Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+                    )
+                    .map(buffered)
                 });
             (
                 stream,
@@ -916,20 +916,103 @@ struct WorkerAuth {
     peer_fp: Vec<u8>,
 }
 
+/// TLS handshake budget for ONE incoming worker connection. Generous for a
+/// real sender on a slow link (a handshake is two round trips), short
+/// enough that a silent stray connection cannot stall the session.
+const WORKER_HANDSHAKE_SECS: u64 = 10;
+
+/// Accepts the next §16.8 worker connection on the session's listener.
+///
+/// The listener's port is public for the whole session, so not every
+/// connection on it is the sender's: a port scanner, a health check or
+/// another (even pinned) peer can connect between the sender's workers.
+/// Such a connection fails `authenticate_worker` — it is logged and
+/// SKIPPED, never fatal to the session (before, one stray connection
+/// aborted the running sync). Each attempt gets `handshake` to complete
+/// TLS; the whole wait is bounded by `deadline`, so a sender that died
+/// before connecting its workers fails the session instead of hanging
+/// the receiver forever. Under `--plaintext` there is nothing to
+/// authenticate: the first connection is the worker, and the protocol's
+/// TREE_WORKER check is the only guard (plaintext is unauthenticated by
+/// design, D16).
+fn accept_worker_connection(
+    listener: &TcpListener,
+    auth: Option<&WorkerAuth>,
+    handshake: Duration,
+    deadline: Duration,
+) -> std::io::Result<Box<dyn ReadWrite>> {
+    use std::io::ErrorKind;
+    let give_up = std::time::Instant::now() + deadline;
+    listener.set_nonblocking(true)?;
+    loop {
+        // Checked every round, so a stream of rejected connections cannot
+        // extend the wait either.
+        if std::time::Instant::now() >= give_up {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "cannot accept worker: no authenticated worker connection within {:?}",
+                    deadline
+                ),
+            ));
+        }
+        let (tcp, wpeer) = match listener.accept() {
+            Ok(v) => v,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            // A connection that was reset while queued: not ours to fail on.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(std::io::Error::other(format!("cannot accept worker: {e}"))),
+        };
+        // Accepted sockets inherit the listener's non-blocking mode on
+        // some platforms (Windows): the session needs blocking I/O.
+        tcp.set_nonblocking(false)?;
+        tcp.set_nodelay(true).ok();
+        set_stream_timeouts(&tcp, DEFAULT_TIMEOUT_SECS);
+        match authenticate_worker(tcp, &wpeer.to_string(), false, auth, Some(handshake)) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                eprintln!("warning: ignoring connection from {wpeer} on the session port: {e}");
+            }
+        }
+    }
+}
+
 /// Authenticates one worker connection against the control connection's
 /// peer (D16 + §16.8). The pin set is narrowed to that ONE fingerprint, so
 /// the TLS verifier itself rejects any other peer — even one that is in
 /// pins.conf. No first-use prompt and no "peer identity" line: the user
 /// already decided on the control connection.
+///
+/// `handshake` (server role) bounds the TLS handshake alone: the socket's
+/// timeouts are lowered for it and restored to the session's I/O timeout
+/// once it completed. (Set on the stream itself — a timeout set through a
+/// `try_clone` handle does not reach this handle on Windows.)
 fn authenticate_worker(
     tcp: TcpStream,
     peer_label: &str,
     client_role: bool,
     auth: Option<&WorkerAuth>,
+    handshake: Option<Duration>,
 ) -> std::io::Result<Box<dyn ReadWrite>> {
     let Some(auth) = auth else {
         return Ok(Box::new(tcp));
     };
+    if let Some(t) = handshake {
+        let _ = tcp.set_read_timeout(Some(t));
+        let _ = tcp.set_write_timeout(Some(t));
+    }
     let policy = ffsync::transport::PinPolicy::Pinned(vec![auth.peer_fp.clone()]);
     let (tls, presented) = if client_role {
         let (tls, presented) = ffsync::transport::client_session(
@@ -941,6 +1024,9 @@ fn authenticate_worker(
         (Box::new(tls) as Box<dyn ReadWrite>, presented)
     } else {
         let (tls, presented) = ffsync::transport::server_session(tcp, &auth.identity, &policy)?;
+        if handshake.is_some() {
+            set_stream_timeouts(&tls.sock, DEFAULT_TIMEOUT_SECS);
+        }
         (Box::new(tls) as Box<dyn ReadWrite>, presented)
     };
     // Belt and braces: the verifier already enforced this.
@@ -1474,7 +1560,7 @@ mod tests {
         };
         let server = std::thread::spawn(move || {
             let (tcp, peer) = listener.accept().unwrap();
-            authenticate_worker(tcp, &peer.to_string(), false, Some(&auth)).is_ok()
+            authenticate_worker(tcp, &peer.to_string(), false, Some(&auth), None).is_ok()
         });
         // The client trusts the receiver (both peers are in each other's
         // pins in this scenario); only the receiver's narrowing decides.
@@ -1499,6 +1585,66 @@ mod tests {
         let control_fp = ffsync::transport::sha256(&control.cert_der);
         assert!(worker_accepted(&receiver, &control, control_fp.clone()));
         assert!(!worker_accepted(&receiver, &other_pinned, control_fp));
+    }
+
+    #[test]
+    fn stray_connections_do_not_abort_the_worker_accept() {
+        // The listener stays open for the whole session: a stray client
+        // (garbage bytes, a silent socket, another identity) may arrive
+        // before the real worker. Each is skipped; the worker is accepted.
+        let receiver = identity("receiver");
+        let control = identity("control");
+        let other = identity("other");
+        let control_fp = ffsync::transport::sha256(&control.cert_der);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let auth = WorkerAuth {
+            identity: std::sync::Arc::new(receiver.clone()),
+            peer_fp: control_fp,
+        };
+        let receiver_fp = ffsync::transport::sha256(&receiver.cert_der);
+        let clients = std::thread::spawn(move || {
+            let policy = ffsync::transport::PinPolicy::Pinned(vec![receiver_fp]);
+            let name = || rustls_pki_types_server_name("127.0.0.1").unwrap();
+            // Queued in this order ahead of the real worker.
+            let mut garbage = TcpStream::connect(addr).unwrap();
+            std::io::Write::write_all(&mut garbage, b"GET / HTTP/1.0\r\n\r\n").unwrap();
+            let silent = TcpStream::connect(addr).unwrap();
+            let wrong = TcpStream::connect(addr).unwrap();
+            let _ = ffsync::transport::client_session(wrong, &other, &policy, name());
+            let real = TcpStream::connect(addr).unwrap();
+            let ok = ffsync::transport::client_session(real, &control, &policy, name()).is_ok();
+            drop((garbage, silent));
+            ok
+        });
+        let accepted = accept_worker_connection(
+            &listener,
+            Some(&auth),
+            Duration::from_millis(500),
+            Duration::from_secs(20),
+        );
+        assert!(accepted.is_ok(), "{:?}", accepted.err());
+        assert!(
+            clients.join().unwrap(),
+            "the real worker's handshake failed"
+        );
+    }
+
+    #[test]
+    fn worker_accept_gives_up_at_the_deadline() {
+        // A sender that died before connecting its workers must fail the
+        // session, not park the receiver in accept() forever.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = std::time::Instant::now();
+        let r = accept_worker_connection(
+            &listener,
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+        let e = r.err().expect("must time out");
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

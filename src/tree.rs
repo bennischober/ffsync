@@ -412,11 +412,12 @@ impl ExcludePattern {
         if self.dir_only && kind != EntryKind::Dir {
             return false;
         }
+        let from = match_segs_from(&self.segs, path_segs);
         if self.anchored {
-            match_segs(&self.segs, path_segs)
+            from[0]
         } else {
             // Unanchored: match the basename at any depth.
-            (0..path_segs.len()).any(|start| match_segs(&self.segs, &path_segs[start..]))
+            from[..path_segs.len()].iter().any(|&m| m)
         }
     }
 }
@@ -495,22 +496,37 @@ fn parse_class(chars: &[char], start: usize) -> Option<(Part, usize)> {
     None // unterminated
 }
 
-/// Matches pattern segments against path segments (no `**` backtracking
-/// beyond its own: it tries every consumption width).
-fn match_segs(segs: &[PatternSeg], path: &[&str]) -> bool {
-    match segs.split_first() {
-        None => path.is_empty(),
-        Some((PatternSeg::DoubleStar, rest)) => {
-            // Zero segments, then every possible consumption.
-            (0..=path.len()).any(|skip| match_segs(rest, &path[skip..]))
+/// Matches pattern segments against every suffix of `path` at once:
+/// `result[j]` says whether `segs` matches `path[j..]` (`j` in `0..=len`).
+/// Dynamic programming over (segment, path position), one row per pattern
+/// segment, in O(segments × depth) time — the recursive form tried every
+/// consumption width for every `**`, which a hostile sender's pattern
+/// (`**/**/…/x` — excludes come from the PEER, §16.7) turned exponential.
+fn match_segs_from(segs: &[PatternSeg], path: &[&str]) -> Vec<bool> {
+    let n = path.len();
+    // Row for the empty pattern: matches only the empty suffix.
+    let mut next = vec![false; n + 1];
+    next[n] = true;
+    for seg in segs.iter().rev() {
+        let mut cur = vec![false; n + 1];
+        match seg {
+            PatternSeg::DoubleStar => {
+                // Zero or more segments: any later position the rest matches.
+                let mut any_later = false;
+                for j in (0..=n).rev() {
+                    any_later |= next[j];
+                    cur[j] = any_later;
+                }
+            }
+            PatternSeg::Parts(parts) => {
+                for j in 0..n {
+                    cur[j] = next[j + 1] && match_parts(parts, path[j]);
+                }
+            }
         }
-        Some((PatternSeg::Parts(parts), rest)) => {
-            let Some((head, tail)) = path.split_first() else {
-                return false;
-            };
-            match_parts(parts, head) && match_segs(rest, tail)
-        }
+        next = cur;
     }
+    next
 }
 
 /// Classic glob match of one sub-pattern against one path segment
@@ -865,6 +881,93 @@ pub fn validate_rel_path(p: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Checks that a (validated, §16.2) wire path names exactly one object
+/// under the root on THIS platform's filesystem — the receiver-side
+/// representability check of §16.2.
+///
+/// On Windows a name the sender's filesystem stores verbatim can resolve
+/// elsewhere: a drive prefix (`C:x`) makes `Path::join` discard the root
+/// (writes escape the sync root), any other `:` opens an NTFS alternate
+/// data stream, trailing dots/spaces are stripped (`a.` IS `a` — the next
+/// session's delete pass then removes the file it just wrote), reserved
+/// device names (`nul`, `COM1.txt`) are not files at all, and `<>"|?*` and
+/// control characters are invalid. Unix receivers store every validated
+/// name verbatim, so the check is a no-op there (`a:b` stays legal between
+/// unix peers).
+pub fn check_local_name(p: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    for c in p.split('/') {
+        if let Some(bad) = c
+            .chars()
+            .find(|&ch| ch < ' ' || matches!(ch, ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+        {
+            return Err(format!(
+                "{p:?}: character {bad:?} is not representable on a Windows receiver"
+            ));
+        }
+        if c.ends_with('.') || c.ends_with(' ') {
+            return Err(format!(
+                "{p:?}: Windows strips trailing dots and spaces from {c:?}"
+            ));
+        }
+        let stem = c.split('.').next().unwrap_or(c).trim_end_matches(' ');
+        if is_reserved_device_name(stem) {
+            return Err(format!("{p:?}: {c:?} is a reserved device name on Windows"));
+        }
+    }
+    let _ = p;
+    Ok(())
+}
+
+/// Windows reserved device names (matched case-insensitively against the
+/// part of a component before its first dot; older Windows versions treat
+/// `nul.txt` as the device too, so the extension does not save it).
+#[cfg(windows)]
+fn is_reserved_device_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => {
+            // `get`, not `split_at`: a multi-byte name must not panic.
+            let (Some(head), Some(tail)) = (upper.get(..3), upper.get(3..)) else {
+                return false;
+            };
+            matches!(head, "COM" | "LPT")
+                && matches!(
+                    tail,
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+        }
+    }
+}
+
+/// Returns the first proper ancestor of `rel` (as a wire path) that is a
+/// symlink or junction under `root`, if any. The scan never recurses into
+/// directory links (D18), so the receiver must not WRITE through one
+/// either: the bytes would land outside the sync root, and because the
+/// next scan cannot see them they would re-transfer every session.
+/// `checked` caches per-prefix results (one lstat per distinct directory).
+pub fn link_ancestor(
+    root: &Path,
+    rel: &str,
+    checked: &mut std::collections::HashMap<String, bool>,
+) -> Option<String> {
+    let mut end = 0;
+    while let Some(i) = rel[end..].find('/') {
+        end += i;
+        let prefix = &rel[..end];
+        let is_link = *checked.entry(prefix.to_string()).or_insert_with(|| {
+            std::fs::symlink_metadata(root.join(prefix.replace('/', std::path::MAIN_SEPARATOR_STR)))
+                .is_ok_and(|m| m.is_symlink())
+        });
+        if is_link {
+            return Some(prefix.to_string());
+        }
+        end += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1237,30 @@ mod tests {
     }
 
     #[test]
+    fn exclude_double_star_matching_is_polynomial() {
+        // Excludes come from the PEER (§16.7): a pattern of 24 `**`
+        // segments against a 24-deep path used to explore ~C(48,24)
+        // splits per entry (minutes; a hostile sender's denial of
+        // service). The DP matcher is O(segments × depth).
+        let pattern = format!("{}x", "**/".repeat(24));
+        let path = vec!["d"; 24].join("/");
+        let t = std::time::Instant::now();
+        assert!(!m(&pattern, &path, EntryKind::File));
+        assert!(m(&pattern, &format!("{path}/x"), EntryKind::File));
+        // Unanchored form too (every start depth shares one table).
+        assert!(!m(
+            "**/a/**/a/**/a/**/b",
+            &vec!["a"; 24].join("/"),
+            EntryKind::File
+        ));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
     fn exclude_dir_only_trailing_slash() {
         assert!(m("build/", "build", EntryKind::Dir));
         assert!(!m("build/", "build", EntryKind::File));
@@ -1335,6 +1462,101 @@ mod tests {
             !paths.contains(&"target/y.txt"),
             "the sibling file stays excluded: {paths:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_local_name_accepts_ordinary_names() {
+        for p in [
+            "a",
+            "a.txt",
+            "dir/sub/file.tar.gz",
+            ".hidden",
+            "consul",
+            "com10",
+            "lpt",
+            "日本語/ファイル",
+            "a b",
+        ] {
+            assert_eq!(check_local_name(p), Ok(()), "{p}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn check_local_name_refuses_names_windows_would_alias() {
+        for p in [
+            "C:x",
+            "d/a:b",
+            "a.",
+            "d./x",
+            "b ",
+            "nul",
+            "NUL.txt",
+            "d/con.tar.gz",
+            "aux ",
+            "COM1",
+            "lpt9.log",
+            "COM\u{b9}",
+            "conin$",
+            "x?y",
+            "a*b",
+            "a<b",
+            "a>b",
+            "a|b",
+            "a\"b",
+            "tab\there",
+        ] {
+            assert!(check_local_name(p).is_err(), "{p:?} accepted");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn check_local_name_is_a_no_op_on_unix() {
+        for p in ["a:b", "a.", "nul", "x?y"] {
+            assert_eq!(check_local_name(p), Ok(()), "{p}");
+        }
+    }
+
+    #[test]
+    fn check_local_name_does_not_panic_on_multibyte_names() {
+        for p in [
+            "\u{e9}t\u{e9}",
+            "CO\u{e9}",
+            "\u{1F600}\u{1F600}",
+            "LP\u{b2}",
+        ] {
+            let _ = check_local_name(p);
+        }
+    }
+
+    #[test]
+    fn link_ancestor_finds_dir_links_but_not_the_entry_itself() {
+        let dir = std::env::temp_dir().join(format!("ffsync_link_anc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real/sub")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(dir.join("real").join("link"))
+                .arg(dir.join("target"))
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("target"), dir.join("real/link")).unwrap();
+        let mut cache = std::collections::HashMap::new();
+        assert_eq!(link_ancestor(&dir, "real/sub/f", &mut cache), None);
+        assert_eq!(link_ancestor(&dir, "real/link", &mut cache), None);
+        assert_eq!(
+            link_ancestor(&dir, "real/link/x/y", &mut cache).as_deref(),
+            Some("real/link")
+        );
+        assert_eq!(link_ancestor(&dir, "missing/a/b", &mut cache), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
