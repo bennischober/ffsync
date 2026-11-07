@@ -5,6 +5,12 @@ private bytes = heap the process actually owns (working set is dominated by
 mmap file pages — file-backed, evictable, shared with the OS page cache, so
 not a heap cost). Sampling every 200 ms over live CLI-to-CLI syncs.
 
+> **Not re-measured since v0.3.0.** Later releases add fixed per-connection
+> costs (64 KiB read + write `BufStream` buffers since 1.3, one pair per
+> `--parallel` connection) and, since D19, smaller chunks (so more manifest
+> entries) for files under 16 MiB. The O(chunks) shape below still holds;
+> re-run the measurement before quoting absolute numbers for a current build.
+
 ## Peak private memory (heap) per sync role
 
 | Scenario | Sender | Receiver |

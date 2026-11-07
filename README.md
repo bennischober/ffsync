@@ -11,7 +11,7 @@ and a hand-rolled, dependency-light wire protocol. No daemon, no config, two
 commands.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
-[![Rust](https://img.shields.io/badge/rust-1.99%2B-dea584)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/MSRV-1.88-dea584)](https://www.rust-lang.org)
 [![Crates.io](https://img.shields.io/crates/v/ffsync)](https://crates.io/crates/ffsync)
 [![docs.rs](https://img.shields.io/docsrs/ffsync)](https://docs.rs/ffsync)
 [![CI](https://github.com/bennischober/ffsync/actions/workflows/ci.yml/badge.svg)](https://github.com/bennischober/ffsync/actions/workflows/ci.yml)
@@ -127,10 +127,11 @@ length-prefixed, no protobuf.
 | [crossbeam](https://github.com/crossbeam-rs/crossbeam) | Bounded channels | Backpressure between chunkers and hash workers on native threads; no async runtime in the data plane |
 | [rustls](https://github.com/rustls/rustls) + [ring](https://github.com/briansmith/ring) | Transport security (D16) | TLS 1.3 as a thin `Read + Write` wrapper around TCP; the audited, mainstream Rust choice — no hand-rolled channel crypto |
 | [rcgen](https://github.com/rustls/rcgen) | Identity certs | Generates the self-signed peer certificate on first run |
+| [quinn](https://github.com/quinn-rs/quinn) | QUIC transport (`--quic`, §17) | Mainstream Rust QUIC on the same rustls identity; its small tokio runtime stays inside the transport edge, and the sync engine sees plain blocking `Read + Write` streams |
 | rsync (comparison only) | Baseline | The tool this project is measured against, and its delta algorithm is respected, not wrapped |
 
 Design decisions and their alternatives are recorded in
-[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1–D22).
+[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1–D24).
 
 ## Using it
 
@@ -289,12 +290,20 @@ the next run of an unchanged file shows
 Deleting the index file (or the file itself, whose orphaned index is cleaned
 up automatically) always falls back to a full cold scan.
 
-Two known limitations: a file that is **open for writing on the receiver**
-(antivirus scan, media player) blocks the final rename with a sharing
-violation — the error is loud, nothing is corrupted, and a retry after the
-file closes succeeds; and `ffsync` syncs **file content, size, mtime, and
-POSIX mode bits** — other metadata (xattrs, alternate data streams,
-hardlink identity) is out of scope by design (D9).
+Known limitations:
+
+- A file that is **open for writing on the receiver** (antivirus scan,
+  media player) blocks the final rename with a sharing violation. The error
+  is loud, nothing is corrupted, and a retry after the file closes succeeds.
+- `ffsync` syncs **file content, size, mtime, and POSIX mode bits**. Other
+  metadata (xattrs, alternate data streams, hardlink identity) is out of
+  scope by design (D9).
+- A **Windows receiver refuses a tree** containing names Windows cannot
+  store as written (`CON`, `nul.txt`, a trailing dot or space, a reserved
+  character such as `:` or `?`),
+  before anything is written. Exclude those paths on the sender
+  (`--exclude`) to sync the rest. Case-only renames (`README.md` →
+  `Readme.md`) are handled on case-insensitive receivers (D23).
 
 Progress is single-line: `hashing → diffing → sending/receiving → verifying`,
 with bytes, throughput, and elapsed time per phase. A scan-bound sync says so
@@ -364,8 +373,9 @@ needed); Linux builds are musl and fully static — one binary per
 architecture runs on any distro. (Asset names are friendly platform
 labels; the Rust target triples are a build detail of the workflow.)
 
-Requires a stable Rust toolchain (developed on 1.99, edition 2024). Windows is
-the primary development platform; the I/O layer is `#[cfg]`-split for Unix.
+Requires Rust 1.88 or newer (the MSRV, checked in CI; developed on current
+stable, edition 2024). Windows is the primary development platform; the I/O
+layer is `#[cfg]`-split for Unix, and CI runs every gate on Windows and Linux.
 
 ## Project layout
 
@@ -376,8 +386,8 @@ src/
   protocol/       wire protocol: framing, messages, state machines, tree sessions
   tree.rs         tree scan, path validation, triage (D17)
   index.rs        persistent chunk index (warm starts): codec, validate, atomic write
-  transport/       TLS + fingerprint pinning (D16), QUIC carrier (D13 step 2)
-                 (transport/quic.rs: quinn streams as sync Read + Write)
+  transport/      TLS + fingerprint pinning (D16), QUIC carrier (D13 step 2)
+                  (transport/quic.rs: quinn streams as sync Read + Write)
   main.rs         the CLI
   bin/bench.rs    the benchmark harness
 fuzz/             cargo-fuzz targets over the wire decoders (hostile input)
@@ -391,7 +401,7 @@ The reasoning is the product; it is all recorded:
 
 - [`concept/Positioning.md`](concept/Positioning.md) — why this exists, the
   niche, why "build around rsync" does not work
-- [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D22 with
+- [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D24 with
   alternatives and rejected options
 - [`concept/Protocol.md`](concept/Protocol.md) — the wire protocol
   (tracks all versions; currently v4), frame by frame
@@ -424,6 +434,8 @@ Shipped, one line each (full notes in the
 - **1.0** The 1.0-prep hardening (commit durability, strict HELLO flags, long paths).
 - **1.1** Eager diff, single-file and tree: 18–33% faster at 0 ms RTT (D8, §9.2/§16.11); warm-started `--from` syncs (D21).
 - **1.2** Rename detection: renamed files move with zero wire bytes (D22).
+- **1.3** Code-review hardening: case-only renames on NTFS/APFS (D23), the `--eager` deadlock fix, `receive --bind`, buffered connections.
+- **1.4** `receive --from` and resume correctness, COMMIT_ACK outcome byte (D24), size-aware scan threads.
 
 **Deliberately not planned** (positioning, D9): daemon/continuous sync
 (Syncthing's job), cloud remotes (rclone's job), xattrs/hardlinks,

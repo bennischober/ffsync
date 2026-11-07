@@ -2,13 +2,13 @@
 
 Guidance for AI coding agents (and humans) working in this repository.
 
-**Generated:** 2026-10-23 · **Commit:** 953666a · **Branch:** main
+**Last refreshed:** 2026-11-07 (ffsync 1.4.0, protocol v4) · **Commit:** 308dedb · **Branch:** main
 
 ## What this project is
 
 `ffsync` is a file synchronization tool written in Rust that syncs data at the
 chunk level to minimize transfer and I/O, similar in spirit to rsync. As of
-v0.8.0, single-file sync **and directory-tree sync** between two peers over
+v0.8.0 (the feature baseline; current release 1.4.0), single-file sync **and directory-tree sync** between two peers over
 TCP or QUIC work end-to-end: parallel chunking/hashing pipeline, file
 reconstruction, manifest/plan exchange, zstd-compressed transfer,
 chunk-root verification, mtime/size fast path (sub-second mtimes),
@@ -28,7 +28,11 @@ the size+mtime fast path, is sender-authoritative, and Windows senders send
 no section). The metadata remainder is closed by decision (D9 amendment,
 2026-10-23): symlink-as-entry, hardlinks, and xattrs stay out of scope with
 recorded reasoning — see `concept/Design Decisions.md` D9 and
-`evaluation/ship-readiness.md`.
+`evaluation/ship-readiness.md`. 1.0 added dry-run (D20); the 1.x
+releases added eager diff (D8), rename detection (D22), case-insensitive
+receivers (D23), the COMMIT_ACK outcome byte (D24), and hostile-peer
+hardening;
+`CHANGELOG.md` is the per-release record.
 
 Per-directory knowledge bases: `src/chunking/AGENTS.md`,
 `src/protocol/AGENTS.md`, and `src/transport/AGENTS.md` hold

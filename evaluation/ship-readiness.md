@@ -1,5 +1,11 @@
 # Ship-readiness assessment (2026-10-23, updated after the 1.0-prep work)
 
+> **Historical snapshot.** This is the record of the 1.0 release
+> decision (last updated 2026-10-24, v1.0.x) and is not maintained.
+> Line references and "remaining" items reflect that point in time;
+> the current state lives in `CHANGELOG.md`, the README roadmap, and
+> `concept/Design Decisions.md`.
+
 Scope: a feature-gap and readiness pass over the code as of protocol v4 /
 v0.8.0, done alongside the D8 design pass and the D9 closure. Every claim
 below was checked against the code in this pass; line references are
