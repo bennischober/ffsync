@@ -1001,6 +1001,21 @@ its TREE_WORKER, places it by the ANNOUNCED index, and verifies the set
 is exactly {1..K−1} with no duplicates. Each worker is ACKed before the
 conversation phase starts.
 
+**Stray connections (transport note, 2026-11).** The receiver's port
+stays open while it accepts workers, so a connection that is not the
+sender's (a port scanner, a health check, another pinned peer) can
+arrive between them. Over TLS, a connection that fails worker
+authentication (it must present the control connection's fingerprint,
+D16) is logged and SKIPPED; it never fails the session. Each attempt gets
+a short handshake budget (reference: 10 s), so a silent socket cannot
+stall the accept, and the whole wait for a worker is bounded (reference:
+the session I/O timeout, 300 s), so a sender that died before connecting
+its workers fails the session instead of hanging the receiver. Under
+`--plaintext` nothing can be authenticated: the first connection is
+taken as the worker, and a stray one fails the TREE_WORKER check
+(unauthenticated by design). QUIC worker streams ride the authenticated
+session connection (§17) and cannot be stray.
+
 **Membership, not order (§16.4 amendment for parallel sessions).** In a
 parallel session the receiver does NOT expect conversations in manifest
 order. Every conversation — on worker connections AND the control
