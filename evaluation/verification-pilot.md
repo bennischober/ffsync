@@ -22,7 +22,9 @@ bug hunts missed, and which TLA+ model would be worth building next.
   second real bug: the receiver did not check that a file conversation was
   for the path it expected, so a lying manifest got one file's bytes
   committed under another name. Fixed, with a regression test.
-- Three spec and API observations are recorded below; none of them is fixed.
+- Three spec and API observations are recorded below. Observation 3 (a
+  manifest listing a file `a` and an entry `a/b`) is now fixed; the other
+  two need no change.
 - The Kani harnesses type-check but have **not been run**. Kani is not
   installed here, and installing it was out of scope.
 
@@ -325,20 +327,35 @@ needed.
   round-trip generator therefore produces non-empty patterns only. This is
   recorded here so the restriction is not mistaken for a weakened property.
 
-### Observation 3: `manifest_from_wire` does not check prefix consistency
+### Observation 3 (fixed): `manifest_from_wire` did not check prefix consistency
 
-`src/protocol/tree_sync.rs:180` accepts a manifest that lists both a file
-`a` and an entry `a/b`. A scan can never produce this, so only a broken or
-hostile sender would send it.
+`manifest_from_wire` (`src/protocol/tree_sync.rs:180`) accepted a manifest
+that lists both a file `a` and an entry `a/b`. A scan can never produce
+this, so only a broken or hostile sender would send it.
 
-On such a manifest the receiver writes `a`, then fails loudly when it
-reaches `a/b`, because the parent is a file. Nothing escapes the root and
-nothing is silently lost, but files are written before the session fails.
+On such a manifest the receiver wrote `a`, then failed loudly when it
+reached `a/b`, because the parent is a file. Nothing escaped the root and
+nothing was silently lost, but files were written before the session
+failed.
 
-Refusing the manifest up front, as the duplicate-path check already does,
-would be cleaner. It is not fixed here because the current behavior is
-fail-closed and changing it is a design choice. Candidate: one
-ancestor-is-a-file check per entry over the `BTreeMap`.
+- **Fix:** the decoder now refuses the manifest up front, like the
+  duplicate-path check: after collecting the entries it looks up every
+  proper ancestor of every path and fails if one is a file entry. Wire
+  order is not trusted, so the check runs after the loop. A path under a
+  listed directory, or under no listed entry, is still fine. Protocol.md
+  §16.2 is amended to match.
+- **Tests:** `tree_wire_manifest_refuses_entries_under_a_file` (decoder,
+  both orders, any depth, plus the allowed look-alikes `ab/c` and `a-b`)
+  and `tree_receiver_refuses_a_manifest_with_an_entry_under_a_file` (a
+  scripted sender: the receiver answers ERROR and writes nothing).
+- **The property had no teeth here at first.**
+  `manifest_from_wire_admits_only_safe_entries` gained the
+  ancestor rule in its reference, but with the check disabled it still
+  passed 4096 cases: its paths were drawn only from
+  `hostile_path_strategy`, so a manifest whose entries were all valid
+  *and* contained a file/child pair almost never occurred. Its paths now
+  also come from `wire_path_strategy`. With the check disabled it then
+  fails with a shrunk counterexample; with the check in place it passes.
 
 ## Next: is a TLA+ model worth it?
 

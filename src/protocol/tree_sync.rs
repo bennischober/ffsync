@@ -214,6 +214,21 @@ pub fn manifest_from_wire(wire: &[TreeEntryWire]) -> Result<TreeManifest, SyncEr
             mode: e.mode,
         });
     }
+    // §16.2: no entry may lie under a FILE entry (`a` plus `a/b`). No
+    // filesystem holds both, so only a broken or hostile peer sends it;
+    // accepting it let the receiver write `a` before failing on `a/b`.
+    // Checked after the loop because wire order is not trusted.
+    for e in m.entries() {
+        for (i, _) in e.rel_path.match_indices('/') {
+            let ancestor = &e.rel_path[..i];
+            if m.get(ancestor).is_some_and(|a| a.kind == EntryKind::File) {
+                return Err(SyncError::Protocol(format!(
+                    "bad tree manifest: {:?} lies under the file {ancestor:?}",
+                    e.rel_path
+                )));
+            }
+        }
+    }
     Ok(m)
 }
 

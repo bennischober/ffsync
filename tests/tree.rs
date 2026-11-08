@@ -1624,6 +1624,83 @@ fn tree_wire_manifest_refuses_duplicate_paths() {
     assert!(manifest_from_wire(&[wire_file("a"), wire_file("a")]).is_err());
 }
 
+#[test]
+fn tree_wire_manifest_refuses_entries_under_a_file() {
+    // §16.2: no filesystem holds a file `a` and an entry `a/b`, so only a
+    // broken or hostile peer sends both (verification pilot, Observation
+    // 3). Wire order is not trusted: either order, any depth, is refused.
+    use ffsync::protocol::tree_sync::manifest_from_wire;
+    let dir = |rel: &str| {
+        let mut e = wire_file(rel);
+        e.kind = 1;
+        e.size = 0;
+        e
+    };
+    for wire in [
+        vec![wire_file("a"), wire_file("a/b")],
+        vec![wire_file("a/b"), wire_file("a")],
+        vec![wire_file("a"), dir("a/b")],
+        vec![wire_file("a/b"), wire_file("a/b/c/d")],
+    ] {
+        let err = manifest_from_wire(&wire).unwrap_err().to_string();
+        assert!(err.contains("lies under the file"), "{err}");
+    }
+    // Under a listed directory, under no listed entry, or a sibling whose
+    // name merely starts with the file's name: all fine.
+    assert!(manifest_from_wire(&[dir("a"), wire_file("a/b")]).is_ok());
+    assert!(manifest_from_wire(&[wire_file("x/y/z")]).is_ok());
+    assert!(manifest_from_wire(&[wire_file("a"), wire_file("ab/c"), wire_file("a-b")]).is_ok());
+}
+
+#[test]
+fn tree_receiver_refuses_a_manifest_with_an_entry_under_a_file() {
+    // Before the §16.2 check the receiver accepted the manifest, wrote
+    // `a`, and only failed when it reached `a/b`. Now it refuses the
+    // envelope with ERROR before anything is written.
+    use ffsync::protocol::framing::{T_ERROR, read_frame};
+    use ffsync::protocol::message::TreeBegin;
+    let dst = TempTree::new("entry_under_file");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let root = dst.path().to_path_buf();
+    let server = std::thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+        tree_receive(
+            &mut &tcp,
+            &TreeReceiveRequest {
+                root,
+                force_checksum: false,
+                no_delete: false,
+                excludes: Vec::new(),
+                accept_worker: std::sync::Arc::new(|| Err(std::io::Error::other("no workers"))),
+                dry_run: false,
+                eager: false,
+            },
+            &PipelineConfig::default(),
+            &mut |_p| {},
+        )
+    });
+    let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    let mut buf = Vec::new();
+    TreeBegin {
+        flags: 0,
+        parallel: 1,
+        excludes: Vec::new(),
+        entries: vec![wire_file("a"), wire_file("a/b")],
+    }
+    .into_frame()
+    .unwrap()
+    .encode(&mut buf)
+    .unwrap();
+    std::io::Write::write_all(&mut tcp, &buf).unwrap();
+    assert_eq!(read_frame(&mut tcp).unwrap().ftype, T_ERROR);
+    let err = server.join().unwrap().unwrap_err().to_string();
+    assert!(err.contains("lies under the file"), "{err}");
+    assert!(!dst.exists("a"));
+}
+
 /// Plays a hostile sender: writes one raw TREE_BEGIN naming `rel`, runs
 /// the real receiver against it, and returns the receiver's result plus
 /// the first frame type the "sender" got back (None if the connection

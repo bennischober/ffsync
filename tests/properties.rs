@@ -951,11 +951,18 @@ proptest! {
     }
 
     /// `manifest_from_wire` admits only validated, non-sidecar, unique
-    /// paths with a known kind and size-0 dirs.
+    /// paths with a known kind and size-0 dirs, none of them under a file
+    /// entry (§16.2).
     #[test]
     fn manifest_from_wire_admits_only_safe_entries(
         entries in prop::collection::vec(
-            (hostile_path_strategy(), 0u8..3, prop_oneof![Just(0u64), any::<u64>()]),
+            // Valid paths too, so that `a` + `a/b` pairs of otherwise
+            // admissible entries actually occur.
+            (
+                prop_oneof![hostile_path_strategy(), wire_path_strategy()],
+                0u8..3,
+                prop_oneof![Just(0u64), any::<u64>()],
+            ),
             0..5,
         ),
         sidecar in any::<bool>(),
@@ -972,7 +979,15 @@ proptest! {
                 && !tree::is_sidecar(&e.rel_path)
                 && e.kind <= 1
                 && (e.kind == 0 || e.size == 0)
-        }) && wire.iter().map(|e| &e.rel_path).collect::<BTreeSet<_>>().len() == wire.len();
+        }) && wire.iter().map(|e| &e.rel_path).collect::<BTreeSet<_>>().len() == wire.len()
+            && !wire.iter().any(|e| {
+                wire.iter().any(|f| {
+                    f.kind == 0
+                        && e.rel_path.len() > f.rel_path.len()
+                        && e.rel_path.starts_with(f.rel_path.as_str())
+                        && e.rel_path.as_bytes()[f.rel_path.len()] == b'/'
+                })
+            });
         prop_assert_eq!(manifest_from_wire(&wire).is_ok(), ok);
     }
 }
