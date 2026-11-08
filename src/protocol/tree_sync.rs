@@ -1255,6 +1255,8 @@ where
                 apply_mode: peer_meta.and_then(|(m, _)| m),
                 eager,
                 extra_sources,
+                // §16.4: the sender's HELLO must name this conversation.
+                expect_peer_path: Some(rel.to_string()),
             };
             let rel_c = rel.to_string();
             let outcome = match sync::receive(stream, &recv_req, pipeline, &mut |p| {

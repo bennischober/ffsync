@@ -199,6 +199,11 @@ pub struct ReceiveRequest {
     /// single-file mode leaves it empty. Every claim is hash-verified at
     /// read (D12) — a stale source costs an ERROR, never corruption.
     pub extra_sources: Vec<PathBuf>,
+    /// Tree mode (§16.4): the wire path the sender's per-file HELLO must
+    /// name, byte for byte. A mismatch is refused with ERROR `BadFrame`
+    /// before anything is written. `None` skips the check (single-file
+    /// mode: the sender's HELLO path is only a display name there).
+    pub expect_peer_path: Option<String>,
 }
 
 /// Outcome of a completed sync.
@@ -1052,6 +1057,21 @@ where
         // Version/role rejection: the peer must get an explicit ERROR.
         Err((code, msg)) => return Err(send_error_and_finish(stream, code, &msg)),
     };
+    // §16.4: in a tree session the HELLO must name the conversation we
+    // expect. Without this check a lying (or desynced) sender's bytes for
+    // one path were committed under another before the session failed.
+    if let Some(expected) = &request.expect_peer_path
+        && peer.path != *expected
+    {
+        return Err(send_error_and_finish(
+            stream,
+            ErrorCode::BadFrame,
+            &format!(
+                "conversation path mismatch: expected {expected:?}, peer HELLO names {:?}",
+                peer.path
+            ),
+        ));
+    }
     // §7.1: accept the dry-run offer with a marker frame, before manifest
     // or plan traffic. An old peer (bit ignored on decode) never reads it
     // here — it waits for our manifest, so the marker buffers and our
@@ -2279,6 +2299,7 @@ mod tests {
             tree: true,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
             apply_mtime: Some((1_600_000_000, 0)),
             apply_mode: None,
         };
@@ -2310,6 +2331,7 @@ mod tests {
             tree: true,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
             apply_mtime: Some((1_600_000_000, 123_400)),
             apply_mode: Some(0o444),
         };

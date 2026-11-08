@@ -122,6 +122,7 @@ mod tests {
                     apply_mtime: None,
                     eager: false,
                     extra_sources: Vec::new(),
+                    expect_peer_path: None,
                 };
                 let pipeline = ffsync::chunking::PipelineConfig::default();
                 let pipeline_recv = ffsync::chunking::PipelineConfig::default();

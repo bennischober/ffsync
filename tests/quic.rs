@@ -190,6 +190,7 @@ fn run_receive_over(
         apply_mtime: None,
         eager: false,
         extra_sources: Vec::new(),
+        expect_peer_path: None,
     };
     let pipeline = PipelineConfig::default();
     let out = receive(stream, &req, &pipeline, &mut |_p| {});

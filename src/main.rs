@@ -606,6 +606,7 @@ fn run_receive(
         apply_mode: None,
         apply_mtime: None,
         extra_sources: Vec::new(),
+        expect_peer_path: None,
     };
     let pipeline = PipelineConfig::default();
     let outcome = match receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
