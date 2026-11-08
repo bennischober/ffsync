@@ -1091,3 +1091,60 @@ mod tests {
         ));
     }
 }
+
+/// Kani proof harnesses (verification pilot,
+/// `evaluation/verification-pilot.md`). Run with `cargo kani` on
+/// Linux/WSL (see AGENTS.md).
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Fixed HELLO bytes before the path: magic 4, version 2, flags 2,
+    /// role 1, cdc 3×4, size 8, mtime 8, nanos 4, path_len 2.
+    const HELLO_FIXED: usize = 43;
+
+    /// `Hello::from_frame` on every payload that carries the magic and up
+    /// to 3 path bytes: no panic, and an accepted HELLO has only known
+    /// flag bits (strict codec), a valid role, and consumed every byte.
+    #[kani::proof]
+    #[kani::unwind(48)]
+    fn hello_decode_is_total_and_strict() {
+        let tail: [u8; HELLO_FIXED - 4 + 3] = kani::any();
+        let n: usize = kani::any_where(|&n| n <= tail.len());
+        let mut payload = MAGIC.to_vec();
+        payload.extend_from_slice(&tail[..n]);
+        let total = payload.len();
+        if let Ok(h) = Hello::from_frame(Frame::new(framing::T_HELLO, payload)) {
+            assert_eq!(h.flags & !HELLO_FLAG_KNOWN, 0);
+            assert!(matches!(h.role, Role::Sender | Role::Receiver));
+            assert_eq!(total, HELLO_FIXED + h.path.len());
+        }
+    }
+
+    /// Without the magic prefix fixed: short and garbage payloads (up to
+    /// 8 bytes) never panic and are never accepted.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn hello_decode_rejects_short_payloads() {
+        let bytes: [u8; 8] = kani::any();
+        let n: usize = kani::any_where(|&n| n <= bytes.len());
+        let r = Hello::from_frame(Frame::new(framing::T_HELLO, bytes[..n].to_vec()));
+        assert!(r.is_err());
+    }
+
+    /// COMMIT_ACK (D24): exactly the empty payload and the two outcome
+    /// bytes decode, each to its own meaning.
+    #[kani::proof]
+    fn commit_ack_decode_is_exact() {
+        let bytes: [u8; 2] = kani::any();
+        let n: usize = kani::any_where(|&n| n <= bytes.len());
+        match decode_commit_ack(&bytes[..n]) {
+            Ok(None) => assert_eq!(n, 0),
+            Ok(Some(w)) => {
+                assert_eq!(n, 1);
+                assert_eq!(bytes[0], if w { COMMIT_WRITTEN } else { COMMIT_UNCHANGED });
+            }
+            Err(_) => assert!(n == 2 || bytes[0] > COMMIT_WRITTEN),
+        }
+    }
+}

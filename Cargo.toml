@@ -42,4 +42,12 @@ path = "src/bin/bench.rs"
 
 [dev-dependencies]
 filetime = "0.2.29"
+# Property tests (tests/properties.rs, evaluation/verification-pilot.md).
+# std only: no fork/timeout machinery, keeps the dev tree small.
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+
+# Kani harnesses live in #[cfg(kani)] modules; the cfg is set by
+# `cargo kani`, so declare it to keep unexpected_cfgs quiet.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 

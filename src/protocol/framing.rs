@@ -309,3 +309,45 @@ mod tests {
         assert!(frame.encode(&mut buf).is_err());
     }
 }
+
+/// Kani proof harnesses (verification pilot,
+/// `evaluation/verification-pilot.md`). Bounded model checking over every
+/// input up to the stated size — not sampled like the property tests.
+/// Run with `cargo kani` on Linux/WSL (see AGENTS.md).
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// `read_frame` on every input of at most 9 bytes (a header plus up to
+    /// 4 payload bytes, so every length field — including > MAX_PAYLOAD
+    /// and "longer than the input" — is explored): no panic, no arithmetic
+    /// overflow, and an accepted frame is exactly the bytes it claims.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn read_frame_is_total_and_exact() {
+        let bytes: [u8; 9] = kani::any();
+        let n: usize = kani::any_where(|&n| n <= bytes.len());
+        let mut input = &bytes[..n];
+        match read_frame(&mut input) {
+            Ok(f) => {
+                let len = f.payload.len();
+                assert!(len <= MAX_PAYLOAD as usize);
+                assert!(5 + len <= n);
+                assert_eq!(f.ftype, bytes[0]);
+                assert_eq!(
+                    u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize,
+                    len
+                );
+                assert_eq!(&f.payload[..], &bytes[5..5 + len]);
+                assert_eq!(input.len(), n - 5 - len);
+            }
+            Err(FrameError::Eof) => assert_eq!(n, 0),
+            Err(FrameError::Truncated) => assert!(n > 0),
+            Err(FrameError::Io(_)) => {
+                // Only the oversize-length refusal; a slice never fails I/O.
+                assert!(n >= 5);
+                assert!(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) > MAX_PAYLOAD);
+            }
+        }
+    }
+}
