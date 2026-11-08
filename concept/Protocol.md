@@ -1072,9 +1072,22 @@ order globally, not per connection).
 **Failure semantics (fail-closed, unchanged in spirit).** A failed
 conversation aborts its connection (ERROR `Aborted`, §16.4). Workers stop
 before *starting* the next conversation once any worker has failed
-(in-flight conversations finish). The sender then reports ERROR on the
-control connection; the receiver applies deletions only after ALL
-conversations succeeded — a failed session never destroys data. Tree
+(in-flight conversations finish). The sender then fails the session
+WITHOUT its TREE_END: a failure on the control connection is announced
+there (ERROR `Aborted`, unless the failure is the receiver's own ERROR);
+after a worker failure the sender joins its workers and closes the
+control connection, and the reference sender sends no ERROR on it
+(amended 2026-11: the text said it did; the model check below found the
+mismatch, and either is fail-closed). The receiver therefore treats a
+control connection that ends without TREE_END exactly like an ERROR, and
+applies deletions only after ALL conversations succeeded — a failed
+session never destroys data. Its decision waits for every worker thread
+(join), so a worker's last frame is never outrun by the TREE_END on the
+control connection. Model-checked (TLA+, `concept/tla/`): membership
+exactly-once, deletes only after every expected conversation committed,
+and termination without relying on a timeout, against a reference sender
+with one fault and against an arbitrary one (results:
+`evaluation/verification-pilot.md`). Tree
 flags, excludes, resume, warm indexes, and mtime preservation are
 per-conversation concerns and work unchanged on any connection.
 
