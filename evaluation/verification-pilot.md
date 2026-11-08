@@ -6,10 +6,9 @@ bug hunts missed, and which TLA+ model would be worth building next.
 
 **Result in short:**
 
-- All 27 properties pass on Windows. None fails on current code. They have
-  not run on Linux yet: the local WSL distro has no C toolchain (`cc` is
-  missing; `rustls`, `zstd-safe` and others need one), so CI's Linux job
-  will be the first Linux run.
+- All 27 properties pass on Windows and on Linux (WSL Ubuntu 20.04, run
+  locally 2026-11-08 together with the rest of `cargo test`: every suite
+  passes). None fails on current code.
 - Planted bugs make them fail, so they have teeth. Mutation check: a session
   expectation that ignores `--no-delete`, an off-by-one in the reference
   glob's class ranges, and a halved mtime tolerance each produced a failing
@@ -32,8 +31,9 @@ bug hunts missed, and which TLA+ model would be worth building next.
   ERROR on the control connection after a worker failure, but it closes
   the connection without TREE_END instead. Both fail closed. See "TLA+
   model of the parallel-session barrier".
-- The Kani harnesses type-check but have **not been run**. Kani is not
-  installed here, and installing it was out of scope.
+- The Kani harnesses type-check but have **not been run**. Kani 0.68
+  installs in WSL, but its CBMC build needs glibc 2.34 or newer, and the
+  local distro (Ubuntu 20.04) has 2.31. See "Kani harnesses".
 
 ## How to run
 
@@ -55,7 +55,8 @@ cargo kani
 Kani runs on Linux or macOS only; on Windows, run it in WSL. One-time
 setup: `cargo install --locked kani-verifier && cargo kani setup`. The
 WSL distro also needs a C toolchain (`sudo apt install build-essential`)
-before the crate builds at all. It is not in CI.
+before the crate builds at all, and Kani 0.68 needs glibc 2.34 or newer
+(Ubuntu 22.04+; 20.04 is too old). It is not in CI.
 
 The harnesses were type-checked on Windows against a stub `kani` crate:
 `cargo rustc --lib --profile=check -- --cfg kani --extern kani=<stub>`.
@@ -147,9 +148,13 @@ existing pipeline tests.
 | `commit_ack_decode_is_exact` | `src/protocol/message.rs` | Exactly `[]`, `[0]` and `[1]` decode, each to its own meaning. |
 | `validated_paths_cannot_escape_the_root` | `src/tree.rs` | For every UTF-8 string of at most 4 bytes that `validate_rel_path` accepts, `/r` joined with it has only Normal components, one per segment. This is the unix half. On Windows, `check_local_name` carries the drive-prefix case, which `accepted_paths_stay_under_root` covers by sampling. |
 
-Status: written and type-checked; **not run**. The first `cargo kani` run
-in WSL will show whether the unwind bounds are enough and how long CBMC
-takes on the `format!` paths in `validate_rel_path`'s error branch.
+Status: written and type-checked; **not run**. A first attempt
+(2026-11-08) installed `kani-verifier` 0.68.0 in WSL, but its bundled
+toolchain needs glibc 2.34 or newer and the distro is Ubuntu 20.04
+(glibc 2.31). The run needs Ubuntu 22.04 or newer: another WSL distro, or
+a container such as `ubuntu:24.04`. That run will show whether the unwind
+bounds are enough and how long CBMC takes on the `format!` paths in
+`validate_rel_path`'s error branch.
 
 ## Hostile-sender properties
 
@@ -166,7 +171,8 @@ PROPTEST_CASES=1500 cargo test --test hostile_sender
 
 The default is 64 cases, about 5 s in a debug build, so plain
 `cargo test` and CI run it. The env override runs a longer search:
-1500 cases take about 2 minutes and pass on current code. The finding
+1500 cases take about 2 minutes and pass on current code, on Windows and
+on Linux (WSL, 120 s, 2026-11-08). The finding
 below shows why the long search matters.
 
 **Mutations.** Generic ones work on any frame: flip a byte, drop the
@@ -445,6 +451,26 @@ and covered by the hostile-sender suite), QUIC teardown (§17.6, see
 below), and more than K = 3 connections or 3 files. The guards do not
 depend on file count beyond "at least two, on different connections".
 
+## Mmap truncation (M1), reproduced
+
+The bug hunts left one item open: the scan memory-maps the file
+(`process_file`, the crate's only `unsafe` block), and another process may
+truncate it mid-scan. A scratch program (not in the repo) wrote a 1 GiB
+file, started `process_file`, truncated the file to 4 KiB after the first
+chunk event, then drained the pipeline.
+
+| Platform | Result |
+|---|---|
+| Linux (WSL Ubuntu 20.04) | The process dies with SIGBUS (exit status 135) right after the first chunk event. |
+| Windows 11 | `set_len` fails with os error 1224 (ERROR_USER_MAPPED_FILE); the pipeline finishes normally with all 1024 chunks. |
+
+The SIGBUS kills ffsync before it commits anything, so the target is
+untouched. A signal handler would be fragile and process-global; the real
+fix is a pread-based pipeline, which reopens the mmap decision and must be
+re-measured against `evaluation/chunking.md`. Decision for now: a known
+limitation, documented in the README, the root AGENTS.md gotchas, and the
+`SAFETY:` comment.
+
 ## Next: is a TLA+ model worth it?
 
 | Candidate | Worth it? | Why |
@@ -455,8 +481,9 @@ depend on file count beyond "at least two, on different connections".
 
 Other follow-ups:
 
-- **Run `cargo kani` once in WSL** and record the timings and any bound
-  adjustments here.
+- **Run `cargo kani` once on Ubuntu 22.04+** (Ubuntu 20.04's glibc is too
+  old for Kani 0.68) and record the timings and any bound adjustments
+  here.
 - ~~Add a scripted hostile sender to the property suite.~~ Done: see
   "Hostile-sender properties". It mutates the real sender's frames rather
   than scripting them, which keeps every case a plausible session.

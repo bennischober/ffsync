@@ -127,6 +127,7 @@ drift the scans exist to catch, in the scan output itself).
 | mtime-only `--size-only`-style modes | Out of niche; the metadata fast path already covers the common case. |
 | Windows long paths (>260 chars) | **VERIFIED WORKING (this day)**: an E2E tree sync with a 315/317-char file path over real TCP converged byte-identically (SHA-256 match); no `\\?\` handling needed in the tree scan or commit path. |
 | Open-file sync on Windows (AV lock, media player) | Rename over an open file fails with a sharing violation — loud error, retry works. Known limitation worth a README sentence, not a fix. |
+| Source truncated by another process mid-scan (M1, 2026-11-08) | The scan memory-maps the file. On Linux a truncation by another program kills ffsync with SIGBUS (reproduced: exit 135, nothing committed); on Windows the truncation is refused (os error 1224) and the sync finishes. Known limitation, documented in the README. The fix would be a pread pipeline, which must first be re-measured against `evaluation/chunking.md`. |
 | Hash truncation (§14.5) | Reserved with explicit analysis required — correct to leave. |
 
 ## Known security posture (honest limits)
