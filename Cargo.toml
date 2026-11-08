@@ -42,4 +42,7 @@ path = "src/bin/bench.rs"
 
 [dev-dependencies]
 filetime = "0.2.29"
+# Property tests (tests/properties.rs, evaluation/verification-pilot.md).
+# std only: no fork/timeout machinery, keeps the dev tree small.
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 
