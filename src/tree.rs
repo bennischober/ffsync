@@ -1560,3 +1560,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Kani proof harnesses (verification pilot,
+/// `evaluation/verification-pilot.md`). Run with `cargo kani` on
+/// Linux/WSL (see AGENTS.md); the harness checks the unix join, where
+/// `check_local_name` is a no-op, so `validate_rel_path` alone must hold
+/// the line.
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use std::path::{Component, Path};
+
+    /// Every UTF-8 string of at most 4 bytes that `validate_rel_path`
+    /// accepts names a path strictly under the root: joining it adds only
+    /// Normal components (no `..`, no `.`, no root or prefix), one per
+    /// wire segment.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn validated_paths_cannot_escape_the_root() {
+        let bytes: [u8; 4] = kani::any();
+        let n: usize = kani::any_where(|&n| n <= bytes.len());
+        let Ok(p) = std::str::from_utf8(&bytes[..n]) else {
+            return;
+        };
+        if validate_rel_path(p).is_err() {
+            return;
+        }
+        let root = Path::new("/r");
+        let joined = root.join(p);
+        assert!(joined.starts_with(root));
+        let mut segments = 0usize;
+        for c in joined.components().skip(2) {
+            assert!(matches!(c, Component::Normal(_)));
+            segments += 1;
+        }
+        assert_eq!(segments, p.split('/').count());
+    }
+}
