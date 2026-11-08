@@ -384,6 +384,7 @@ fn tree_v2_flow_rejects_tree_frames() {
             apply_mtime: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
         ffsync::protocol::sync::receive(&mut &tcp, &req, &PipelineConfig::default(), &mut |_p| {})
     });
@@ -1675,6 +1676,72 @@ fn hostile_tree_begin(
         .ok()
         .map(|f| f.ftype);
     (server.join().unwrap(), reply)
+}
+
+#[test]
+fn tree_receiver_refuses_hello_for_another_path() {
+    // §16.4: the per-file HELLO must name the conversation the receiver
+    // expects. Before the check, a sender that announced `a` in TREE_BEGIN
+    // but sent the HELLO (and bytes) of `b` had them committed as `a`
+    // (hostile-sender properties, evaluation/verification-pilot.md).
+    use ffsync::protocol::framing::{T_ERROR, T_HELLO, read_frame};
+    use ffsync::protocol::message::{Hello, Message, Role, TreeBegin};
+    let dst = TempTree::new("hello_path_mismatch");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let root = dst.path().to_path_buf();
+    let server = std::thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+        tree_receive(
+            &mut &tcp,
+            &TreeReceiveRequest {
+                root,
+                force_checksum: false,
+                no_delete: false,
+                excludes: Vec::new(),
+                accept_worker: std::sync::Arc::new(|| Err(std::io::Error::other("no workers"))),
+                dry_run: false,
+                eager: false,
+            },
+            &PipelineConfig::default(),
+            &mut |_p| {},
+        )
+    });
+    let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    let send = |tcp: &mut std::net::TcpStream, frame: ffsync::protocol::framing::Frame| {
+        let mut buf = Vec::new();
+        frame.encode(&mut buf).unwrap();
+        std::io::Write::write_all(tcp, &buf).unwrap();
+    };
+    let begin = TreeBegin {
+        flags: 0,
+        parallel: 1,
+        excludes: Vec::new(),
+        entries: vec![wire_file("a")],
+    };
+    send(&mut tcp, begin.into_frame().unwrap());
+    // The receiver's TREE_BEGIN (its tree is empty: `a` is a transfer).
+    read_frame(&mut tcp).unwrap();
+    let hello = Hello {
+        version: ffsync::protocol::VERSION,
+        flags: 0,
+        role: Role::Sender,
+        cdc_min: 16 * 1024,
+        cdc_avg: 64 * 1024,
+        cdc_max: 256 * 1024,
+        file_size: 1,
+        file_mtime: 1,
+        file_mtime_nanos: 0,
+        path: "b".into(),
+    };
+    send(&mut tcp, hello.into_frame().unwrap());
+    assert_eq!(read_frame(&mut tcp).unwrap().ftype, T_HELLO);
+    assert_eq!(read_frame(&mut tcp).unwrap().ftype, T_ERROR);
+    let err = server.join().unwrap().unwrap_err().to_string();
+    assert!(err.contains("path mismatch"), "{err}");
+    assert!(!dst.exists("a") && !dst.exists("b"));
 }
 
 #[cfg(windows)]

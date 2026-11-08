@@ -1705,6 +1705,7 @@ fn run_one_eager_session(
                 apply_mode: None,
                 apply_mtime: None,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             };
             receive(
                 &mut r_end,

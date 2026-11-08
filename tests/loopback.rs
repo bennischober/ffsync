@@ -217,6 +217,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
 
@@ -262,6 +263,7 @@ mod tests {
             apply_mtime: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
 
         // Sync 1 (cold): full scan both sides, index files written at commit.
@@ -390,6 +392,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         assert!(
@@ -422,6 +425,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         s2.expect("attempt 2 sender converges");
@@ -464,6 +468,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         s.expect("sender ok");
@@ -502,6 +507,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
 
@@ -547,6 +553,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
 
@@ -592,6 +599,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
 
@@ -711,6 +719,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
             64 * 1024,
         );
@@ -741,6 +750,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         let _ = s2.expect("resumed sender ok");
@@ -796,6 +806,7 @@ mod tests {
                 apply_mtime: None,
                 eager,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             };
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -874,6 +885,7 @@ mod tests {
                 apply_mtime: None,
                 eager: true,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
             64 * 1024,
         );
@@ -907,6 +919,7 @@ mod tests {
                 apply_mtime: None,
                 eager: true,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         let _ = s2.expect("resumed eager sender ok");
@@ -1008,6 +1021,7 @@ mod tests {
                 apply_mtime: None,
                 eager,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             };
             let writes = Arc::new(AtomicUsize::new(0));
             let recv_writes = Arc::clone(&writes);
@@ -1098,6 +1112,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
 
@@ -1181,6 +1196,7 @@ mod tests {
             apply_mtime: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
         let pipeline = PipelineConfig::default();
         let mut progress = |_p: Progress| {};
@@ -1234,6 +1250,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         let _s = s.expect("sender ok");
@@ -1317,6 +1334,7 @@ mod tests {
             apply_mtime: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
 
         // Sync 1: converges via the from-file's chunks (mostly Local).
@@ -1403,6 +1421,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         assert!(
@@ -1492,6 +1511,7 @@ mod tests {
             apply_mtime: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
 
         // Sync 1: converges; both indexes record the small-file parameters.
@@ -1575,6 +1595,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         s.expect("sender ok");
@@ -1645,6 +1666,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         s.expect("sender ok");
@@ -1712,6 +1734,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         let s = s.expect("sender ok");
@@ -1786,6 +1809,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         let s = s.expect("sender ok");
@@ -1868,6 +1892,7 @@ mod tests {
                         apply_mtime: None,
                         eager: false,
                         extra_sources: Vec::new(),
+                        expect_peer_path: None,
                     },
                 );
                 let s = s.expect("sender ok");
@@ -1913,6 +1938,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         let s = s.expect("sender ok");
@@ -1990,6 +2016,7 @@ mod tests {
                     apply_mtime: None,
                     eager: false,
                     extra_sources: Vec::new(),
+                    expect_peer_path: None,
                 },
             );
             let s = s.expect("sender ok");
@@ -2044,6 +2071,7 @@ mod tests {
                 apply_mtime: None,
                 eager: false,
                 extra_sources: Vec::new(),
+                expect_peer_path: None,
             },
         );
         let s = s.expect("sender ok");
@@ -2100,6 +2128,7 @@ mod tests {
             apply_mode: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
         let (s_out, r_out) = run_sync(s, r);
         assert!(
@@ -2150,6 +2179,7 @@ mod tests {
             apply_mode: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
         let (s_out, r_out) = run_sync(s, r);
         assert!(
@@ -2217,6 +2247,7 @@ mod tests {
             tree: false,
             eager: true,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
             apply_mtime: None,
             apply_mode: None,
         };
@@ -2263,6 +2294,7 @@ mod tests {
             apply_mtime: None,
             apply_mode: None,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
         let (s_out, r_out) = run_sync(s, r);
         match (&s_out, &r_out) {
@@ -2360,6 +2392,7 @@ mod tests {
             apply_mode: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
         let r = receive(
             &mut r_sock,

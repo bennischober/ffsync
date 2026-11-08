@@ -164,6 +164,7 @@ fn hundred_sessions_do_not_accumulate_memory() {
             apply_mtime: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
         run_session(send_req, recv_req);
 
@@ -255,6 +256,7 @@ fn hundred_sessions_alternating_deltas_and_full_transfers() {
             apply_mtime: None,
             eager: false,
             extra_sources: Vec::new(),
+            expect_peer_path: None,
         };
         run_session(send_req, recv_req);
         assert_eq!(read_file(&target), data, "session {i}: no convergence");

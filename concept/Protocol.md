@@ -743,7 +743,14 @@ initiates a conversation only for files in its `sync`/`transfer` set; the
 receiver expects conversations exactly for the same set (computed from the
 same two manifests), so no per-file negotiation is needed. A receiver that
 disagrees (it must not, given deterministic triage) fails loudly on the
-first unexpected HELLO.
+first unexpected HELLO. "Unexpected" is checked by name: the per-file
+HELLO's `path` MUST equal, byte for byte, the relative path of the
+conversation the receiver expects next (sequential) or the path the
+preceding TREE_FILE named (parallel, §16.8). On a mismatch the receiver
+answers ERROR `BadFrame` before anything is written for that file —
+otherwise a lying or desynced sender's bytes for one path would be
+committed under another (found by the hostile-sender properties,
+2026-11; `evaluation/verification-pilot.md`).
 
 Because the sender's fast-path decision (size+mtime equal, both trust
 times) is known *before* it would demand the receiver's manifest, tree

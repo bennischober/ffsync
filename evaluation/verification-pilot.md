@@ -17,6 +17,11 @@ bug hunts missed, and which TLA+ model would be worth building next.
 - Writing the properties surfaced one real bug next to them: a hostile tree
   sender could crash the receiver with an out-of-range mtime. It is fixed in
   its own commit, with a regression test.
+- A second suite, the hostile-sender properties, drives the real tree
+  receiver against a sender whose frames are mutated in flight. It found a
+  second real bug: the receiver did not check that a file conversation was
+  for the path it expected, so a lying manifest got one file's bytes
+  committed under another name. Fixed, with a regression test.
 - Three spec and API observations are recorded below; none of them is fixed.
 - The Kani harnesses type-check but have **not been run**. Kani is not
   installed here, and installing it was out of scope.
@@ -137,7 +142,130 @@ Status: written and type-checked; **not run**. The first `cargo kani` run
 in WSL will show whether the unwind bounds are enough and how long CBMC
 takes on the `format!` paths in `validate_rel_path`'s error branch.
 
+## Hostile-sender properties
+
+`tests/hostile_sender.rs` runs the **real** tree receiver (`tree_receive`,
+and through it `sync::receive`) against the real `tree_send`, over real
+TCP loopback. Every frame the sender writes passes through a proxy,
+`MutatingStream`, which applies one scripted mutation per case to the nth
+frame of one sender frame type. The receiver sees only the result.
+
+```bash
+cargo test --test hostile_sender
+PROPTEST_CASES=1500 cargo test --test hostile_sender
+```
+
+The default is 64 cases, about 5 s in a debug build, so plain
+`cargo test` and CI run it. The env override runs a longer search:
+1500 cases take about 2 minutes and pass on current code. The finding
+below shows why the long search matters.
+
+**Mutations.** Generic ones work on any frame: flip a byte, drop the
+frame, duplicate it, cut the connection after `keep` bytes, or inject an
+arbitrary frame (type `0x00..=0x12`, random payload). Lies decode the
+frame, change one field and re-encode it, so the frame stays well formed:
+
+- TREE_BEGIN: an entry's mtime, size, kind or mode; rename an entry; drop
+  one; add a child under a file; flip flags; a bad `parallel` count;
+- per-file HELLO: size, mtime, CDC parameters, flags, role, version, path;
+- PLAN entries: target offset, length, source, hash, or swap two entries;
+- DATA: a wrong hash, a zstd bomb (8 MiB of zeros), another chunk's bytes;
+- TREE_FILE: name another path; TREE_WORKER: a wrong index.
+
+Sizes are drawn from boundary values, not the GiB–TiB middle, so the
+receiver's pre-allocation cannot fill the disk. A mutation counts as
+applied only if it changed the bytes on the wire.
+
+**Fixture.** Up to six paths (`a`, `b`, `c`, `d/x`, `d/y`, `e/f/z`), each
+present or absent on the sender, empty, small or 40–120 KiB. The receiver
+holds nothing, the same file, an edited copy, or other content at each
+path, and sometimes a file `d` where the sender has a directory. Each case
+also draws `--no-delete`, `--parallel 1..=3` and `--eager`.
+
+**Watchdog.** Both peers run in their own threads under `catch_unwind`.
+After 1.5 s without sender I/O the watchdog shuts down every socket; a peer
+that has not returned 20 s later is a hang finding.
+
+**What must hold** (oracles checked after every case):
+
+1. Neither peer panics or hangs.
+2. Nothing outside the receiver's root changes: a canary file beside it
+   stays intact and the sender's tree is untouched.
+3. Every receiver file ends as its old content or as the sender's real
+   content at **that same path**.
+4. A file disappears only through the delete pass of a session the
+   receiver reported as successful (without `--no-delete` on either side,
+   and only if the accepted TREE_BEGIN does not list it), or through the
+   documented kind-conflict removal that TREE_BEGIN asked for.
+5. A receiver that reports success has converged on every file in the
+   TREE_BEGIN it accepted. A lie must fail loudly, not pass silently.
+6. Control: when the mutation never applied, both peers succeed and the
+   tree converges.
+
+`mutating_stream_forwards_honest_frames_unchanged` checks the proxy itself:
+with no mutation, a `--parallel 2` session converges, nothing counts as
+applied, and the watchdog never fires.
+
 ## Findings
+
+### Bug (fixed): the tree receiver did not check which file a conversation was for
+
+- **Where:** `sync::receive` validated the per-file HELLO's version and
+  role but never compared its `path` with the conversation the receiver
+  expected. The check now sits right after `validate_hello`
+  (`src/protocol/sync.rs:1063`), fed by `run_one`
+  (`src/protocol/tree_sync.rs:1259`). Protocol.md §16.4 already said the
+  receiver "fails loudly on the first unexpected HELLO", so the code
+  deviated from the spec.
+- **Minimal example** (shrunk by proptest): the sender has two empty files
+  `c` and `d/x`; the receiver is empty. The mutation adds an entry `d/q` to
+  the sender's TREE_BEGIN. Both sides triage the same lying manifest, so the
+  receiver expects conversations for `c`, `d/q`, `d/x`. The real sender
+  only knows `c` and `d/x`. The receiver ran its `d/q` conversation on the
+  HELLO for `d/x`, committed `d/x`'s content as `d/q`, and only then failed
+  on the next frame ("unexpected frame type 0x0D"). Oracle 3 fired:
+  `d/q` held content the sender never had at that path. With a non-empty
+  file the same desync writes one file's bytes under another name.
+- **Impact:** only a broken or hostile sender triggers it, and the session
+  still failed. But a file was written that should never have existed, and
+  in the parallel mode the same gap let a TREE_FILE/HELLO mismatch through.
+- **Fix:** `ReceiveRequest::expect_peer_path`. Tree conversations set it to
+  the expected wire path (sequential) or the path the preceding TREE_FILE
+  named (parallel §16.8). A mismatch is refused with ERROR `BadFrame` before
+  anything is written. Single-file mode passes `None`: there the sender's
+  path is only a display name. Protocol.md §16.4 now spells out that
+  "unexpected" is checked by name. Regression test:
+  `tree_receiver_refuses_hello_for_another_path` in `tests/tree.rs`.
+- **How it was found:** the first full run after the harness worked. It
+  failed after 82 passing cases, so the default 64 cases would not have
+  caught it reliably. Run the long search (`PROPTEST_CASES=1500`) after
+  changes to the tree receiver.
+
+
+### Harness finding (fixed in the harness): a "sender hang" that the CLI cannot have
+
+- **What failed:** one default run reported `HANG: the sender did not
+  return 20s after its sockets were cut`. The receiver had refused a
+  worker that announced index 16 (`--parallel 3`, a TREE_WORKER lie). The
+  next run, with different random cases, passed.
+- **Why:** it depends on timing. When the receiver accepts the lying worker
+  first, it refuses it and returns while the other worker's connection is
+  still unaccepted in the listener backlog. The harness held its own
+  reference to the listener until the case ended, so that connection was
+  never reset. On Windows a local `shutdown` does not wake a read on a
+  connection that no peer socket ever owned, so the sender's TREE_WORKER
+  ACK read blocked until its 30 s read timeout, past the 20 s budget.
+  A standalone probe on Windows confirmed both halves. A blocked read on
+  a never-accepted connection ignores a local `shutdown(Both)` and waits
+  out its timeout. Closing the listener fails that read at once with
+  `ConnectionReset`.
+- **Why it is not an ffsync bug:** the CLI receiver's listener closes when
+  the session ends (the process exits). That resets the pending
+  connection, and the sender's worker fails at once.
+- **Fix (harness only):** the receiver thread now owns the listener, so it
+  closes when `tree_receive` returns, as in the CLI. The watchdog's
+  `register` also checks `killed` under the lock `kill` holds, which
+  closes a smaller race of the same kind.
 
 ### Bug (fixed): a hostile tree sender could crash the receiver with an mtime
 
@@ -224,6 +352,8 @@ Other follow-ups:
 
 - **Run `cargo kani` once in WSL** and record the timings and any bound
   adjustments here.
-- **Add a scripted hostile sender to the property suite** (hand-written
-  frames over a duplex stream). Session-level properties could then cover
-  out-of-range wire values the way the finding above needed.
+- ~~Add a scripted hostile sender to the property suite.~~ Done: see
+  "Hostile-sender properties". It mutates the real sender's frames rather
+  than scripting them, which keeps every case a plausible session.
+- **Extend the hostile suite to a hostile receiver.** The sender side has
+  the same exposure (plans, ACKs, TREE_END reports) and no property yet.
