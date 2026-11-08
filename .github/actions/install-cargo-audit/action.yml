@@ -1,0 +1,44 @@
+name: Install cargo-audit
+description: >-
+  Puts a pinned cargo-audit on PATH without depending on one download host.
+  A cached binary is used when present; otherwise the prebuilt release binary
+  is downloaded, and if that download fails (e.g. a GitHub release 504) the
+  same version is built from crates.io instead.
+
+inputs:
+  version:
+    description: >-
+      cargo-audit version to install. It is also the cache key, so bump it
+      deliberately (check the RustSec release notes first).
+    required: false
+    default: "0.22.2"
+
+runs:
+  using: composite
+  steps:
+    - name: Restore cached cargo-audit
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-audit
+        key: cargo-audit-${{ runner.os }}-${{ inputs.version }}
+
+    # Fast path on a cache miss: the prebuilt release binary.
+    - name: Install cargo-audit (prebuilt)
+      id: prebuilt
+      if: steps.cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit@${{ inputs.version }}
+
+    # Slow path: the release download failed, so build the same version from
+    # crates.io (a different host) rather than failing the job.
+    - name: Install cargo-audit (from source)
+      if: steps.cache.outputs.cache-hit != 'true' && steps.prebuilt.outcome == 'failure'
+      shell: bash
+      run: cargo install --locked cargo-audit --version "${{ inputs.version }}"
+
+    - name: Check cargo-audit
+      shell: bash
+      run: cargo audit --version

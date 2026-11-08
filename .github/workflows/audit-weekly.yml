@@ -19,7 +19,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
+      # Shared with ci.yml: cached pinned binary, crates.io fallback.
+      - uses: ./.github/actions/install-cargo-audit
       - run: cargo audit
