@@ -79,7 +79,9 @@ Design documents (read before making architectural changes):
   64k/256k/1m defaults, and rsync delta comparison
 - `evaluation/verification-pilot.md` — the property-test (`tests/properties.rs`)
   and Kani pilot: what each property and harness checks, what they
-  found, and which TLA+ model to build next
+  found, and which TLA+ model to build next; plus the TLC results of the
+  §16.8 model in `concept/tla/` (each receiver guard, switched off, gives
+  a counterexample)
 - `evaluation/ship-readiness.md` — the feature-gap and readiness
   assessment (2026-10-23): verdict, pre-ship blockers, and the order to 1.0
 
@@ -101,6 +103,7 @@ Design documents (read before making architectural changes):
 | `cargo test --test decoder_smoke` | Adversarial decoder smoke: truncations, garbage, bombs — runs in normal CI (no sanitizer) |
 | `cargo test --test properties` | Property tests (proptest): triage model + real tree sessions, excludes vs a reference matcher, path safety, `mtimes_match`, chunk/plan coverage, codec round trips — runs in normal CI; see `evaluation/verification-pilot.md` |
 | `cargo test --test hostile_sender` | Hostile-sender properties: the real tree receiver against the real sender with one frame mutated in flight (byte flips, drops, injected frames, field lies); checks containment, no wrong-path content, no unearned deletes, loud failure. 64 cases by default; run `PROPTEST_CASES=1500` after tree-receiver changes — see `evaluation/verification-pilot.md` |
+| `java -cp tla2tools.jar tlc2.TLC -config <cfg> ParallelSession.tla` (in `concept/tla/`) | TLA+ model check of the §16.8 parallel-session barrier: membership exactly-once, deletes only after every conversation committed, termination; `Honest`/`Hostile`/`Witness` + one mutation config per receiver guard (expected results in `concept/tla/README.md`). Needs Java 11+ and `tla2tools.jar` (keep it and `-metadir` outside the repo). Re-run after changing the parallel branches of `tree_sync.rs`. Not in CI |
 | `cargo kani` | Kani bounded proofs (`#[cfg(kani)] mod verification` in `framing.rs`, `message.rs`, `tree.rs`): frame/HELLO/COMMIT_ACK decode totality, validated paths stay under the root. Linux/macOS only — on Windows run it in WSL; one-time setup `cargo install --locked kani-verifier && cargo kani setup`. Not in CI |
 
 CI (`.github/workflows/`) runs on push to `main` and on PRs, on

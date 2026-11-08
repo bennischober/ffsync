@@ -25,6 +25,13 @@ bug hunts missed, and which TLA+ model would be worth building next.
 - Three spec and API observations are recorded below. Observation 3 (a
   manifest listing a file `a` and an entry `a/b`) is now fixed; the other
   two need no change.
+- A TLA+ model of the §16.8 parallel-session barrier passes against the
+  reference sender (with one fault) and against an arbitrary sender. Each
+  of its four receiver guards, switched off, gives a counterexample. It
+  found one spec mismatch, now amended: §16.8 said the sender reports
+  ERROR on the control connection after a worker failure, but it closes
+  the connection without TREE_END instead. Both fail closed. See "TLA+
+  model of the parallel-session barrier".
 - The Kani harnesses type-check but have **not been run**. Kani is not
   installed here, and installing it was out of scope.
 
@@ -357,11 +364,92 @@ failed.
   also come from `wire_path_strategy`. With the check disabled it then
   fails with a shrunk counterexample; with the check in place it passes.
 
+## TLA+ model of the parallel-session barrier
+
+`concept/tla/ParallelSession.tla` (about 500 lines; the estimate below
+said 150) models the conversation phase of a §16.8 session at frame
+level. It starts after the worker handshake. Every connection carries a
+FIFO queue in each direction, plus open/closed flags (EOF comes only
+after the last queued frame) and a reset flag (a reset drops queued
+frames and turns reads into errors). Each file conversation is reduced
+to TREE_FILE + BODY from the sender and COMMIT_ACK or ERROR back; the
+receiver commits when it acks. The reference sender's work queue, its
+`stop` flag, its join and its TREE_END are modelled as implemented, and
+so are the receiver's `remaining` set, `first_error` + `cancel` (workers),
+`session_error` (control thread), the `cancel` check before each read
+(a thread already blocked in a read is not woken), the join, the
+decision, the `sender_end_consumed` gate, and the delete pass. The
+receiver's control thread differs from its workers, and the model keeps
+that difference: a membership failure there breaks without an ERROR
+frame and without setting `cancel`. `concept/tla/README.md` has the run
+commands.
+
+The faults are a connection reset, a sender worker that dies without
+raising `stop` (a panic), and a local failure inside a conversation on
+either side. Fairness covers progress actions only, never faults. So
+`Termination` means every behavior ends without needing a *further*
+fault, such as a socket timeout, to break a hang.
+
+Checked with TLC 2.19 (tla2tools v1.7.4), 16 workers:
+
+| Config | Result | Distinct states | Time |
+|---|---|---|---|
+| `Honest`: reference sender, K = 3, 3 files, ≤ 1 fault | no error: TypeOK, ExactlyOnce, NoStranger, DeleteSafe, FailClosed, SenderTruth, DecideClean, Termination, no deadlock | 322,874 (depth 30) | 17 s |
+| `Hostile`: arbitrary sender, K = 2, 2 files + a stranger path, 5 frames, ≤ 1 fault | no error: TypeOK, ExactlyOnce, NoStranger, DeleteSafe, DecideClean | 3,176,664 (depth 21) | 18 s |
+| `Witness` (`-continue`) | all three witnesses violated, as intended: success, a failure caught only by the decision, and the split outcome are all reachable | 322,874 | 6 s |
+| `NoBarrierGate` | **Termination violated**. With zero faults the sender waits for the delete report while the receiver blocks on a second TREE_END read. This is exactly the deadlock the gate's comment describes | 322,808 | 12 s |
+| `NoJoin` | **DeleteSafe violated** in 13 steps. A worker takes f1; the control connection takes and commits f2, then reads TREE_END; the decision runs before the join; the files are deleted while f1 is still uncommitted | — | 19 s |
+| `NoMembership` | **NoStranger and ExactlyOnce violated**: a path outside the set, or the same path twice, gets committed | 3,650,266 | 3 min (`-continue`) |
+| `NoRemaining` | **DeleteSafe violated** in 8 steps. The sender closes the worker connection and sends only TREE_END on the control connection; nothing is committed, and the deletes run | — | 6 s |
+
+What the model shows:
+
+- **Every guard is needed, but most of them only against a hostile
+  sender.** The mutations were also run against the reference sender.
+  Without the membership check or the empty-set check it still passes:
+  the reference sender never repeats a path, and it sends TREE_END only
+  after every conversation was acked. So those two guards defend against
+  a lying peer, not against our own concurrency. That makes them
+  hostile-peer guards, like the §16.2 path checks. The barrier gate is needed against the
+  reference sender itself. The join is needed against the reference
+  sender only for `DecideClean`: without it a reset on a worker
+  connection that arrives after the decision is ignored, though with an
+  honest peer every file has committed by then. Against a hostile sender
+  the join is load-bearing for `DeleteSafe`.
+- **Spec mismatch: the ERROR after a worker failure (amended).** §16.8
+  said "the sender then reports ERROR on the control connection". The
+  reference sender does that only when the failure happened on the
+  control connection itself. After a worker failure it joins and returns,
+  and the CLI closes the control connection without TREE_END. The model
+  checks the behavior as implemented: the receiver fails closed on the
+  missing TREE_END. The `NoQuietFailure` witness trace is this path: a
+  worker panics, the sender joins and closes, and the receiver decides
+  "fail" on the missing TREE_END. The spec
+  text now describes what the code does. Sending an ERROR there would
+  only change the receiver's error message.
+- **No cancel from the receiver's control thread.** A failure on the
+  control connection does not set `cancel`, so the receiver's workers
+  keep serving until the sender (whose `stop` is now raised) closes their
+  connections. The cost is wasted work, not a hang: `Termination` holds.
+  No change made.
+- **The split outcome is inherent.** If the connection resets after the
+  receiver sent its delete report, the receiver succeeded and the sender
+  reports failure. The witness reaches it. No protocol over a single
+  final message can rule this out (the two-generals problem). It is safe
+  because a retry converges: the deletes have already happened, and the
+  re-run is a fast-path no-op.
+
+What it does not cover: the TREE_WORKER handshake and worker
+authentication, the inner steps of a conversation (§4–§8 are sequential
+and covered by the hostile-sender suite), QUIC teardown (§17.6, see
+below), and more than K = 3 connections or 3 files. The guards do not
+depend on file count beyond "at least two, on different connections".
+
 ## Next: is a TLA+ model worth it?
 
 | Candidate | Worth it? | Why |
 |---|---|---|
-| §16.8 membership + TREE_END barrier | **Yes, first.** | This is the protocol's only real concurrency. K sender workers race over K connections; the receiver replaces wire order with membership; and the `sender_end_consumed` gate exists because removing it deadlocks. `tree_session_converges` exercises K ≤ 3 over 24 runs, which explores only a handful of interleavings. A TLA+ spec with K = 2–3, a few files, and lossy or failing workers could check exactly-once membership, deadlock freedom, and "deletes only after every conversation succeeded" over all interleavings. Expect a small spec of about 150 lines. |
+| §16.8 membership + TREE_END barrier | **Done** (see above). | This is the protocol's only real concurrency. K sender workers race over K connections; the receiver replaces wire order with membership; and the `sender_end_consumed` gate exists because removing it deadlocks. `tree_session_converges` exercises K ≤ 3 over 24 runs, which explores only a handful of interleavings. A TLA+ spec with K = 2–3, a few files, and lossy or failing workers could check exactly-once membership, deadlock freedom, and "deletes only after every conversation succeeded" over all interleavings. Expect a small spec of about 150 lines. |
 | §9.2 eager write gating | Yes, second (cheap). | This is a classic bounded-buffer deadlock question: two processes and two bounded channels, with the sender holding up to `EAGER_BUF_CAP` while the receiver streams its manifest. `eager_does_not_deadlock_on_small_transport_buffers` pins one configuration. A model would confirm that the gate "write after MANIFEST_DONE" is necessary and sufficient for every buffer size. Expect under 100 lines. |
 | §17.6 QUIC teardown | No. | The hazard lives in quinn's and RFC 9000's close semantics (unacknowledged stream data is discarded), not in ffsync's state machine. A faithful model would mostly restate QUIC. A loss-injecting integration test around `wait_for_peer_close` is the better tool. |
 
