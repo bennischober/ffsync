@@ -77,6 +77,9 @@ Design documents (read before making architectural changes):
   the threat-model table
 - `evaluation/rsync.md` — the chunk-size sweep (F1) that picked the
   64k/256k/1m defaults, and rsync delta comparison
+- `evaluation/verification-pilot.md` — the property-test (`tests/properties.rs`)
+  and Kani pilot: what each property and harness checks, what they
+  found, and which TLA+ model to build next
 - `evaluation/ship-readiness.md` — the feature-gap and readiness
   assessment (2026-10-23): verdict, pre-ship blockers, and the order to 1.0
 
@@ -86,7 +89,7 @@ Design documents (read before making architectural changes):
 | --- | --- |
 | `cargo build` | Build the binary |
 | `cargo check --tests` | Fast compile check including tests |
-| `cargo test` | Run unit and integration tests (six test files: `integration`, `loopback`, `tree`, `tls`, `quic`, `soak`) |
+| `cargo test` | Run unit and integration tests (`tests/`: `integration`, `loopback`, `tree`, `tls`, `quic`, `soak`, `decoder_smoke`, `fuzz_corpus`, `properties`) |
 | `cargo run` | Run the CLI (`ffsync send/receive`, see `--help`) |
 | `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--cdc m/a/M`, `--sweep`, `--rsync`, `--disconnect`, `--warm`, `--tree`, `--latency` (+ `--rtt-ms`, `--parallel K,...`), `--gen-tree`, `--out-dir P`, `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
@@ -96,6 +99,8 @@ Design documents (read before making architectural changes):
 | `cargo test --test fuzz_corpus` | Regenerate the fuzz corpus seeds under `fuzz/corpus/` (checked-in generator) |
 | `cargo fuzz run <target>` | Fuzz a wire decoder (needs nightly + a C toolchain locally; `.github/workflows/fuzz.yml` runs all six on a Monday schedule) |
 | `cargo test --test decoder_smoke` | Adversarial decoder smoke: truncations, garbage, bombs — runs in normal CI (no sanitizer) |
+| `cargo test --test properties` | Property tests (proptest): triage model + real tree sessions, excludes vs a reference matcher, path safety, `mtimes_match`, chunk/plan coverage, codec round trips — runs in normal CI; see `evaluation/verification-pilot.md` |
+| `cargo kani` | Kani bounded proofs (`#[cfg(kani)] mod verification` in `framing.rs`, `message.rs`, `tree.rs`): frame/HELLO/COMMIT_ACK decode totality, validated paths stay under the root. Linux/macOS only — on Windows run it in WSL; one-time setup `cargo install --locked kani-verifier && cargo kani setup`. Not in CI |
 
 CI (`.github/workflows/`) runs on push to `main` and on PRs, on
 Windows **and** Linux: `cargo fmt --check`, `cargo clippy --all-targets
