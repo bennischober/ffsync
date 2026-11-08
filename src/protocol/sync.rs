@@ -2141,6 +2141,19 @@ fn apply_commit_mtime(request: &ReceiveRequest) -> io::Result<()> {
     let Some((secs, nanos)) = request.apply_mtime else {
         return Ok(());
     };
+    // The values come from the peer's HELLO: out-of-range nanos would be
+    // carried silently into the seconds by `Duration::new`, and a time
+    // past `SystemTime`'s range panics in `UNIX_EPOCH + _`. Refuse both
+    // (the caller turns the error into a warning; the file stays written).
+    let mtime = (nanos < 1_000_000_000)
+        .then(|| UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos)))
+        .flatten()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("peer mtime ({secs}, {nanos}) is not a representable time"),
+            )
+        })?;
     // (0, 0) is applied literally, as the epoch: the wire mtime is unsigned,
     // so a sender file dated before 1970 (or with no readable mtime) reports
     // (0, 0). Skipping the write here left the receiver's own mtime in place,
@@ -2156,7 +2169,7 @@ fn apply_commit_mtime(request: &ReceiveRequest) -> io::Result<()> {
     #[cfg(not(windows))]
     opts.read(true);
     let f = opts.open(&request.path)?;
-    f.set_modified(UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+    f.set_modified(mtime)
 }
 
 /// Scans a file with progress callbacks bridged from the pipeline events.
@@ -2247,6 +2260,41 @@ mod tests {
         assert!(!windows_mode_is_read_only(0o464), "group write still wins");
         assert!(windows_mode_is_read_only(0o444));
         assert!(windows_mode_is_read_only(0o555));
+    }
+
+    #[test]
+    fn commit_metadata_survives_unrepresentable_peer_mtimes() {
+        // Tree mode applies the sender's HELLO mtime verbatim (§16.6). A
+        // hostile or corrupt peer can send any (u64, u32): the commit must
+        // warn and keep its own mtime, never panic (verification pilot:
+        // `Duration::new` / `UNIX_EPOCH + _` overflowed).
+        let dir = std::env::temp_dir().join(format!("ffsync-mtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.bin");
+        std::fs::write(&path, b"content").unwrap();
+        let mut req = ReceiveRequest {
+            path: path.clone(),
+            local_source: path.clone(),
+            force_checksum: false,
+            tree: true,
+            eager: false,
+            extra_sources: Vec::new(),
+            apply_mtime: Some((1_600_000_000, 0)),
+            apply_mode: None,
+        };
+        apply_commit_metadata(&req);
+        let before = crate::index::stat_mtime(&path).unwrap();
+        for bad in [
+            (u64::MAX, 0),
+            (u64::MAX, 999_999_999),
+            (1_600_000_000, 1_000_000_000),
+            (1_600_000_000, u32::MAX),
+        ] {
+            req.apply_mtime = Some(bad);
+            apply_commit_metadata(&req);
+            assert_eq!(crate::index::stat_mtime(&path).unwrap(), before, "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

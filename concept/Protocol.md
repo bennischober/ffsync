@@ -855,6 +855,13 @@ cannot be read) is reported as `(0, 0)`; the receiver must set exactly
 that, or its own scan reports a different mtime and the file re-syncs on
 every run (amended 2026-11; earlier builds skipped the write for `(0, 0)`).
 
+An mtime the receiver cannot represent — `file_mtime_nanos` ≥ 10⁹, or a
+time past the platform's `SystemTime` range — is not applied: the
+receiver warns and keeps the committed file's own mtime, like any other
+failed metadata write (amended 2026-11; earlier builds carried excess
+nanos into the seconds and panicked on an out-of-range time, so a hostile
+sender could abort the receiver).
+
 Single-file sync adopts the same behavior under protocol v3 (observable
 change: the receiver's file now carries the sender's mtime after a sync;
 this matches rsync's default `--times` behavior and is what users expect
