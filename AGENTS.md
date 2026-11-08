@@ -89,7 +89,7 @@ Design documents (read before making architectural changes):
 | --- | --- |
 | `cargo build` | Build the binary |
 | `cargo check --tests` | Fast compile check including tests |
-| `cargo test` | Run unit and integration tests (`tests/`: `integration`, `loopback`, `tree`, `tls`, `quic`, `soak`, `decoder_smoke`, `fuzz_corpus`, `properties`) |
+| `cargo test` | Run unit and integration tests (`tests/`: `integration`, `loopback`, `tree`, `tls`, `quic`, `soak`, `decoder_smoke`, `fuzz_corpus`, `properties`, `hostile_sender`) |
 | `cargo run` | Run the CLI (`ffsync send/receive`, see `--help`) |
 | `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--cdc m/a/M`, `--sweep`, `--rsync`, `--disconnect`, `--warm`, `--tree`, `--latency` (+ `--rtt-ms`, `--parallel K,...`), `--gen-tree`, `--out-dir P`, `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
@@ -100,6 +100,7 @@ Design documents (read before making architectural changes):
 | `cargo fuzz run <target>` | Fuzz a wire decoder (needs nightly + a C toolchain locally; `.github/workflows/fuzz.yml` runs all six on a Monday schedule) |
 | `cargo test --test decoder_smoke` | Adversarial decoder smoke: truncations, garbage, bombs — runs in normal CI (no sanitizer) |
 | `cargo test --test properties` | Property tests (proptest): triage model + real tree sessions, excludes vs a reference matcher, path safety, `mtimes_match`, chunk/plan coverage, codec round trips — runs in normal CI; see `evaluation/verification-pilot.md` |
+| `cargo test --test hostile_sender` | Hostile-sender properties: the real tree receiver against the real sender with one frame mutated in flight (byte flips, drops, injected frames, field lies); checks containment, no wrong-path content, no unearned deletes, loud failure. 64 cases by default; run `PROPTEST_CASES=1500` after tree-receiver changes — see `evaluation/verification-pilot.md` |
 | `cargo kani` | Kani bounded proofs (`#[cfg(kani)] mod verification` in `framing.rs`, `message.rs`, `tree.rs`): frame/HELLO/COMMIT_ACK decode totality, validated paths stay under the root. Linux/macOS only — on Windows run it in WSL; one-time setup `cargo install --locked kani-verifier && cargo kani setup`. Not in CI |
 
 CI (`.github/workflows/`) runs on push to `main` and on PRs, on
@@ -238,6 +239,12 @@ pre-existing.
   wire path traversal refused, vanished sender files fail closed,
   parallel sessions (§16.8: convergence, sequential-fallback rejection,
   fail-closed on worker error).
+- `tests/hostile_sender.rs` — hostile-sender properties: the real
+  `tree_send` → `MutatingStream` proxy (one mutation per case) → real
+  `tree_receive` over TCP loopback, with an idle watchdog and
+  `catch_unwind` on both peers; six oracles (no panic/hang, containment,
+  same-path content, earned deletes only, success ⇒ converged, honest
+  control converges).
 - `tests/integration.rs` — end-to-end test: reconstruct a modified file from
   an older local version plus simulated "network" chunks.
 
@@ -349,6 +356,13 @@ pre-existing.
   on every sender path BEFORE the receiver's TREE_BEGIN, and refuses the
   whole session on any hit. Never "soften" it into skipping entries —
   one-sided skips desync triage; the sender's `--exclude` is the way out.
+- Every tree conversation checks its HELLO's path (§16.4, 2026-11):
+  `run_one` passes `expect_peer_path: Some(rel)` and `sync::receive`
+  refuses a mismatch with `BadFrame` before writing. Without it a lying
+  manifest desynced the sequence and one file's bytes were committed under
+  another name (found by `tests/hostile_sender.rs`). Single-file mode
+  passes `None` (the path is only a display name there); do not drop the
+  check in tree mode.
 - Tree triage must be deterministic and identical on both peers (same two
   manifests, same flags — the receiver derives its flags from the sender's
   TREE_BEGIN). Any nondeterminism desyncs the per-file conversation
