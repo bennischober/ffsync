@@ -668,7 +668,12 @@ silently), and an ffsync sidecar name (`*.ffsync-tmp`, `*.ffsync-index`,
 `*.ffsync-index-tmp`): the scan never lists them (§16.7 note on
 `tree::is_sidecar`), so on the wire they can only come from a hostile or
 buggy sender, and they would let it overwrite the receiver's own temp or
-index files.
+index files. It also refuses a path that lies under another entry of
+kind file (`a` as a file plus `a/b`): no filesystem holds both, so a scan
+never lists them, and accepting the manifest let the receiver write `a`
+before it failed on `a/b` (amended 2026-11, found by the verification
+pilot). A path under a listed directory, or under no listed entry at all,
+is fine.
 
 **Receiver-side path safety (amended 2026-11).** A syntactically valid
 path can still name the wrong object on the receiver's filesystem. Before

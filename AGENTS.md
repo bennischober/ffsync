@@ -356,6 +356,10 @@ pre-existing.
   on every sender path BEFORE the receiver's TREE_BEGIN, and refuses the
   whole session on any hit. Never "soften" it into skipping entries —
   one-sided skips desync triage; the sender's `--exclude` is the way out.
+  Before that, the decoder (`manifest_from_wire`) already refuses a
+  manifest with a duplicate path, a sidecar name, or an entry under a
+  file entry (`a` + `a/b`); keep such checks in the decoder, which runs on
+  both peers, and never trust wire order for them.
 - Every tree conversation checks its HELLO's path (§16.4, 2026-11):
   `run_one` passes `expect_peer_path: Some(rel)` and `sync::receive`
   refuses a mismatch with `BadFrame` before writing. Without it a lying
