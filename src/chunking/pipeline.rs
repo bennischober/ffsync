@@ -115,11 +115,18 @@ where
     H: Hasher + 'static,
 {
     let file = File::open(path)?;
-    // SAFETY: the file is opened read-only and no writer touches it for
-    // the lifetime of the mapping — the pipeline holds the only reference,
-    // hash workers just slice it, and (receiving) commits go through a
-    // separate temp file. Modifying or truncating a mapped file is UB;
-    // this invariant is documented in the root AGENTS.md gotchas.
+    // SAFETY: the file is opened read-only and nothing in ffsync writes it
+    // for the lifetime of the mapping: the pipeline holds the only
+    // reference, hash workers just slice it, and (receiving) commits go
+    // through a separate temp file. Another process can still change it,
+    // and unix offers no way to forbid that. A concurrent in-place write
+    // only changes the bytes we hash (the receiver's final hash check then
+    // fails the sync). A truncation below a page we then touch raises
+    // SIGBUS on Linux and kills the process; nothing is committed and the
+    // target is untouched. Windows refuses the truncation instead (os
+    // error 1224, ERROR_USER_MAPPED_FILE). Both reproduced 2026-11-08.
+    // This is a known limitation (M1: README, root AGENTS.md gotchas);
+    // closing it means replacing the mmap with positional reads.
     let mmap = unsafe { Mmap::map(&file)? };
     let mmap = Arc::new(mmap);
 
