@@ -288,7 +288,14 @@ pre-existing.
   needs its own stateful chunker instance; the `Hasher` is shared via `Arc`
   because it is stateless (`Send + Sync`). Preserve this split.
 - The mmap is created with `unsafe { Mmap::map }`; the underlying file must not
-  be modified while the pipeline holds the mapping.
+  be modified while the pipeline holds the mapping. ffsync itself never
+  writes a mapped file, but another process can (M1, known limitation):
+  truncating the sender's source or the receiver's basis file mid-scan
+  kills the process with SIGBUS on Linux (nothing committed, target
+  untouched); Windows refuses the `set_len` with os error 1224. A SIGBUS
+  handler is not the fix (fragile, process-global); the only real fix is
+  a pread-based pipeline, which reopens the mmap decision and must be
+  re-measured against `evaluation/chunking.md` first.
 - Sidecar names APPEND their suffix: the temp is `a.mkv.ffsync-tmp`
   (`Reconstructor::temp_path_for`, D6 amendment 2026-11) and the index is
   `a.mkv.ffsync-index` (`index_path_for`). Never derive either with

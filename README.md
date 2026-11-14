@@ -295,6 +295,11 @@ Known limitations:
 - A file that is **open for writing on the receiver** (antivirus scan,
   media player) blocks the final rename with a sharing violation. The error
   is loud, nothing is corrupted, and a retry after the file closes succeeds.
+- On Linux, if **another program truncates a file while ffsync is hashing
+  it** (the sender's source, or the receiver's existing copy), ffsync is
+  killed by `SIGBUS`. Nothing is committed and the target is untouched;
+  rerun once the file is stable. On Windows the other program's truncation
+  fails instead, and ffsync finishes normally.
 - `ffsync` syncs **file content, size, mtime, and POSIX mode bits**. Other
   metadata (xattrs, alternate data streams, hardlink identity) is out of
   scope by design (D9).

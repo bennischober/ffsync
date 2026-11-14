@@ -6,10 +6,9 @@ bug hunts missed, and which TLA+ model would be worth building next.
 
 **Result in short:**
 
-- All 27 properties pass on Windows. None fails on current code. They have
-  not run on Linux yet: the local WSL distro has no C toolchain (`cc` is
-  missing; `rustls`, `zstd-safe` and others need one), so CI's Linux job
-  will be the first Linux run.
+- All 27 properties pass on Windows and on Linux (WSL Ubuntu 20.04, run
+  locally 2026-11-08 together with the rest of `cargo test`: every suite
+  passes). None fails on current code.
 - Planted bugs make them fail, so they have teeth. Mutation check: a session
   expectation that ignores `--no-delete`, an off-by-one in the reference
   glob's class ranges, and a halved mtime tolerance each produced a failing
@@ -32,8 +31,12 @@ bug hunts missed, and which TLA+ model would be worth building next.
   ERROR on the control connection after a worker failure, but it closes
   the connection without TREE_END instead. Both fail closed. See "TLA+
   model of the parallel-session barrier".
-- The Kani harnesses type-check but have **not been run**. Kani is not
-  installed here, and installing it was out of scope.
+- Kani ran on 2026-11-14 in an `ubuntu:24.04` container. Two of the five
+  harnesses prove: COMMIT_ACK decoding, and the refusal of short HELLO
+  payloads. The other three do not finish symbolic execution within a
+  15-minute cap. No run found a counterexample. Getting even two to finish
+  took harness and decoder changes, which are recorded with the lessons in
+  "Kani harnesses".
 
 ## How to run
 
@@ -55,14 +58,20 @@ cargo kani
 Kani runs on Linux or macOS only; on Windows, run it in WSL. One-time
 setup: `cargo install --locked kani-verifier && cargo kani setup`. The
 WSL distro also needs a C toolchain (`sudo apt install build-essential`)
-before the crate builds at all. It is not in CI.
+before the crate builds at all, and Kani 0.68 needs glibc 2.34 or newer
+(Ubuntu 22.04+; 20.04 is too old). Where the distro is too old, a
+container works: `ubuntu:24.04` with `build-essential` and `curl`, then
+rustup and the setup above. A named volume on `/root` keeps the toolchain
+between runs. Run one harness at a time
+(`cargo kani --harness <name>`) under `timeout`: three of them do not
+finish (see "Kani harnesses"). It is not in CI.
 
 The harnesses were type-checked on Windows against a stub `kani` crate:
 `cargo rustc --lib --profile=check -- --cfg kani --extern kani=<stub>`.
 Without the stub the same build fails with 19 unresolved `kani` paths, which
-shows the `#[cfg(kani)]` modules really compile. The unwind bounds are
-estimates and have not been checked: if `cargo kani` reports an unwinding
-assertion failure, raise the harness's `#[kani::unwind(N)]`.
+shows the `#[cfg(kani)]` modules really compile. The unwind bounds held
+in the two harnesses that finished: Kani checks unwinding assertions by
+default, and none failed.
 
 ## Properties (`tests/properties.rs`)
 
@@ -145,11 +154,66 @@ existing pipeline tests.
 | `hello_decode_is_total_and_strict` | `src/protocol/message.rs` | Covers every payload with the magic plus up to 42 symbolic bytes, which reaches the Ok path with paths of up to 3 bytes. No panic. Accepted HELLOs have only known flag bits, a valid role, and no trailing bytes. |
 | `hello_decode_rejects_short_payloads` | `src/protocol/message.rs` | Every payload of at most 8 bytes is refused without panicking. |
 | `commit_ack_decode_is_exact` | `src/protocol/message.rs` | Exactly `[]`, `[0]` and `[1]` decode, each to its own meaning. |
-| `validated_paths_cannot_escape_the_root` | `src/tree.rs` | For every UTF-8 string of at most 4 bytes that `validate_rel_path` accepts, `/r` joined with it has only Normal components, one per segment. This is the unix half. On Windows, `check_local_name` carries the drive-prefix case, which `accepted_paths_stay_under_root` covers by sampling. |
+| `validated_paths_cannot_escape_the_root` | `src/tree.rs` | For every UTF-8 string of at most 4 bytes that `validate_rel_path` accepts, the path has only Normal components, one per segment. That is exactly what joining it onto a root appends, since a path with no root or prefix of its own cannot replace the root. This is the unix half. On Windows, `check_local_name` carries the drive-prefix case, which `accepted_paths_stay_under_root` covers by sampling. |
 
-Status: written and type-checked; **not run**. The first `cargo kani` run
-in WSL will show whether the unwind bounds are enough and how long CBMC
-takes on the `format!` paths in `validate_rel_path`'s error branch.
+Status (2026-11-14): **two of five prove; three do not finish.** The
+first attempt (2026-11-08) failed before it started: WSL's Ubuntu 20.04
+has glibc 2.31, and Kani 0.68's toolchain needs 2.34. The run below used
+Kani 0.68.0 with CBMC 6.11.0 in an `ubuntu:24.04` container under Docker
+Desktop: a WSL2 VM with about 15.6 GB of memory, and a 15-minute cap per
+harness.
+
+| Harness | Result | Time |
+|---|---|---|
+| `commit_ack_decode_is_exact` | **SUCCESSFUL** | 8 s (286 VCCs, solver 0.3 s) |
+| `hello_decode_rejects_short_payloads` | **SUCCESSFUL** | 863 s (symex 608 s, 36 061 VCCs, solver 106 s) |
+| `read_frame_is_total_and_exact` | Not finished | Still in symbolic execution at 15 min |
+| `hello_decode_is_total_and_strict` | Not finished | Still in symbolic execution at 15 min |
+| `validated_paths_cannot_escape_the_root` | Not finished | Still in symbolic execution at 15 min |
+
+No harness produced a counterexample; every failure was a resource
+limit. It took four runs to get here:
+
+1. **As written.** `read_frame` spent over an hour in symbolic execution
+   on the oversize branch's `format!("frame payload of {len} bytes …")`:
+   integer formatting over a symbolic length. The refusal is now a
+   `PayloadTooLarge(u32)` error type whose message is rendered only on
+   `Display` (same text, pinned by `oversized_length_rejected`). With that,
+   symex finished in 220 s, but CBMC then ran out of memory building the
+   formula. `hello_decode_rejects_short_payloads` ran out of memory the
+   same way (259 s). The other two hit the cap. `validate_rel_path`'s
+   `{p:?}` message is split off the same way: the harness calls the new
+   `rel_path_problem`, which returns the reason without formatting, and
+   unit tests pin the four message texts.
+2. **`mem::forget` on the results**, on the theory that dropping an
+   `io::Error` (a tagged-pointer repr with a boxed `dyn Error`) was the
+   cost. No effect: the formula sizes were within 2% of run 1. Reverted.
+3. **Concrete lengths.** The harnesses drew the input length as
+   `n = kani::any()`, which keeps every bounds check symbolic, so symex
+   cannot prune the paths a short input never takes. Each harness now
+   loops over every length up to its bound: each unrolled iteration has a
+   concrete length, and the bytes stay symbolic. The short-HELLO harness
+   stopped running out of memory but now hit the cap.
+4. **Lengths CBMC can see.** The HELLO payload reached the decoder in a
+   `Vec`, and CBMC lost its length through the heap. The decode is now
+   `decode_hello(&[u8])`, which `Hello::from_frame` calls after the type
+   check, and the harnesses pass a stack buffer. The path is read as the
+   rest of the payload after the trailing-bytes check, so its length is
+   concrete too. The error variants and texts are unchanged. The path
+   harness checks `Path::new(p).components()` instead of `root.join(p)`,
+   which avoids the `PathBuf` allocation. With this,
+   `hello_decode_rejects_short_payloads` proves. A `cfg(kani)` cap on
+   `read_frame`'s preallocation, tried in the same run, had no visible
+   effect and was reverted.
+
+What this shows: the cost is in standard-library code whose lengths CBMC
+cannot fold. Examples are UTF-8 validation (`run_utf8_validation` was
+unrolled over 800 times even for payloads of at most 8 bytes, all of
+which fail before the path), `read_to_end`'s buffer handling, and
+`Path::components`. Memory is not the limit for the remaining three: they
+never reach the solver. Formatting and allocation in error paths are
+expensive under Kani, which is why a proof-friendly codec keeps them out
+of the decision.
 
 ## Hostile-sender properties
 
@@ -166,7 +230,8 @@ PROPTEST_CASES=1500 cargo test --test hostile_sender
 
 The default is 64 cases, about 5 s in a debug build, so plain
 `cargo test` and CI run it. The env override runs a longer search:
-1500 cases take about 2 minutes and pass on current code. The finding
+1500 cases take about 2 minutes and pass on current code, on Windows and
+on Linux (WSL, 120 s, 2026-11-08). The finding
 below shows why the long search matters.
 
 **Mutations.** Generic ones work on any frame: flip a byte, drop the
@@ -445,6 +510,26 @@ and covered by the hostile-sender suite), QUIC teardown (§17.6, see
 below), and more than K = 3 connections or 3 files. The guards do not
 depend on file count beyond "at least two, on different connections".
 
+## Mmap truncation (M1), reproduced
+
+The bug hunts left one item open: the scan memory-maps the file
+(`process_file`, the crate's only `unsafe` block), and another process may
+truncate it mid-scan. A scratch program (not in the repo) wrote a 1 GiB
+file, started `process_file`, truncated the file to 4 KiB after the first
+chunk event, then drained the pipeline.
+
+| Platform | Result |
+|---|---|
+| Linux (WSL Ubuntu 20.04) | The process dies with SIGBUS (exit status 135) right after the first chunk event. |
+| Windows 11 | `set_len` fails with os error 1224 (ERROR_USER_MAPPED_FILE); the pipeline finishes normally with all 1024 chunks. |
+
+The SIGBUS kills ffsync before it commits anything, so the target is
+untouched. A signal handler would be fragile and process-global; the real
+fix is a pread-based pipeline, which reopens the mmap decision and must be
+re-measured against `evaluation/chunking.md`. Decision for now: a known
+limitation, documented in the README, the root AGENTS.md gotchas, and the
+`SAFETY:` comment.
+
 ## Next: is a TLA+ model worth it?
 
 | Candidate | Worth it? | Why |
@@ -455,8 +540,14 @@ depend on file count beyond "at least two, on different connections".
 
 Other follow-ups:
 
-- **Run `cargo kani` once in WSL** and record the timings and any bound
-  adjustments here.
+- ~~Run `cargo kani` once on Ubuntu 22.04+.~~ Done 2026-11-14: two of
+  five prove (see "Kani harnesses").
+- **Make the other three Kani harnesses finish.** Try smaller bounds first:
+  `read_frame` 9 → 6 bytes (header plus one payload byte), the strict
+  HELLO harness with paths of at most 1 byte, and the path harness 4 → 2
+  bytes. If that is still not enough, stub `str::from_utf8` and
+  `Path::components` with `kani::stub` (needs `-Z stubbing`), or raise the
+  cap. Each attempt costs up to 15 minutes per harness.
 - ~~Add a scripted hostile sender to the property suite.~~ Done: see
   "Hostile-sender properties". It mutates the real sender's frames rather
   than scripting them, which keeps every case a plausible session.

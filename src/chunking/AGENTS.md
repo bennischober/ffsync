@@ -44,7 +44,10 @@ delta unit — this module is wire-protocol-relevant (D2, D19).
 ## ANTI-PATTERNS (THIS PROJECT)
 - Modifying the file while the pipeline holds the mapping. The mmap is
   `unsafe { Mmap::map }` in `process_file` — the crate's only unsafe block
-  (its `SAFETY:` comment records the invariant).
+  (its `SAFETY:` comment records the invariant). Another process
+  truncating the file mid-scan is a known limitation (SIGBUS on Linux,
+  refused on Windows; root AGENTS.md gotchas), not something to "fix" with
+  a signal handler.
 - Changing `REGION_SIZE`: it is part of the chunk-layout definition (a
   forced boundary every 256 MiB), so every peer and every existing D15
   index would disagree past the first seam.
