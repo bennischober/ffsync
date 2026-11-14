@@ -882,6 +882,14 @@ mod tests {
         });
     }
 
+    /// The empty HELLO payload is refused. This is the length-0 case of
+    /// the Kani `hello_short_*` harnesses: one concrete input, and Kani
+    /// ran out of memory on the zero-length array.
+    #[test]
+    fn hello_rejects_empty_payload() {
+        assert!(decode_hello(&[]).is_err());
+    }
+
     #[test]
     fn manifest_chunk_round_trip() {
         round_trip(ManifestChunk {
@@ -1117,24 +1125,20 @@ mod verification {
     /// to 3 path bytes: no panic, and an accepted HELLO has only known
     /// flag bits (strict codec), a valid role, and consumed every byte.
     ///
-    /// Lengths are loop variables, not `kani::any()`, as in
-    /// `framing::verification`, and the payload is a stack buffer passed to
-    /// `decode_hello`: with a symbolic length, or a length held in a `Vec`,
-    /// symex could not prune the paths a short payload never takes.
-    #[kani::proof]
-    #[kani::unwind(48)]
-    fn hello_decode_is_total_and_strict() {
-        let tail: [u8; HELLO_FIXED - 4 + 3] = kani::any();
-        for n in 0..=tail.len() {
-            hello_with_magic(&tail, n);
-        }
-    }
-
-    fn hello_with_magic(tail: &[u8; HELLO_FIXED - 4 + 3], n: usize) {
+    /// `N` is the number of bytes after the magic. One harness per length
+    /// (below, named by the payload length), not one harness looping over
+    /// the lengths: Kani's unwind bound is global, so the bound the loop
+    /// needed (48) also applied to every std loop inside (UTF-8
+    /// validation, copies), and symex never finished. With the length a
+    /// constant each harness proves at `unwind(6)` in under a minute. The
+    /// payload is a stack buffer: a symbolic length, or one held in a
+    /// `Vec`, keeps every bounds check symbolic and CBMC ran out of memory.
+    fn hello_with_magic<const N: usize>() {
+        let tail: [u8; N] = kani::any();
         let mut payload = [0u8; HELLO_FIXED + 3];
         payload[..4].copy_from_slice(&MAGIC);
-        payload[4..4 + n].copy_from_slice(&tail[..n]);
-        let total = 4 + n;
+        payload[4..4 + N].copy_from_slice(&tail);
+        let total = 4 + N;
         if let Ok(h) = decode_hello(&payload[..total]) {
             assert_eq!(h.flags & !HELLO_FLAG_KNOWN, 0);
             assert!(matches!(h.role, Role::Sender | Role::Receiver));
@@ -1142,15 +1146,49 @@ mod verification {
         }
     }
 
-    /// Without the magic prefix fixed: short and garbage payloads (up to
-    /// 8 bytes) never panic and are never accepted.
-    #[kani::proof]
-    #[kani::unwind(10)]
-    fn hello_decode_rejects_short_payloads() {
-        let bytes: [u8; 8] = kani::any();
-        for n in 0..=bytes.len() {
-            assert!(decode_hello(&bytes[..n]).is_err());
-        }
+    /// Without the magic prefix fixed: short and garbage payloads of `N`
+    /// bytes (1 to 8, one harness each) never panic and are never
+    /// accepted. Length 0 is the unit test `hello_rejects_empty_payload`:
+    /// a `[u8; 0]` harness ran out of memory in CBMC, reproducibly, while
+    /// lengths 1–8 prove in about 25 s.
+    fn hello_rejects_short<const N: usize>() {
+        let bytes: [u8; N] = kani::any();
+        assert!(decode_hello(&bytes).is_err());
+    }
+
+    /// One `#[kani::proof]` per `name = N`, each running `check::<N>()`.
+    macro_rules! harnesses {
+        ($check:ident: $($name:ident = $n:literal),* $(,)?) => {
+            $(
+                #[kani::proof]
+                #[kani::unwind(6)]
+                fn $name() {
+                    $check::<$n>();
+                }
+            )*
+        };
+    }
+
+    // Magic + 0..=42 bytes: every payload length up to HELLO_FIXED + 3.
+    harnesses! {
+        hello_with_magic:
+        hello_strict_04 = 0, hello_strict_05 = 1, hello_strict_06 = 2, hello_strict_07 = 3,
+        hello_strict_08 = 4, hello_strict_09 = 5, hello_strict_10 = 6, hello_strict_11 = 7,
+        hello_strict_12 = 8, hello_strict_13 = 9, hello_strict_14 = 10, hello_strict_15 = 11,
+        hello_strict_16 = 12, hello_strict_17 = 13, hello_strict_18 = 14, hello_strict_19 = 15,
+        hello_strict_20 = 16, hello_strict_21 = 17, hello_strict_22 = 18, hello_strict_23 = 19,
+        hello_strict_24 = 20, hello_strict_25 = 21, hello_strict_26 = 22, hello_strict_27 = 23,
+        hello_strict_28 = 24, hello_strict_29 = 25, hello_strict_30 = 26, hello_strict_31 = 27,
+        hello_strict_32 = 28, hello_strict_33 = 29, hello_strict_34 = 30, hello_strict_35 = 31,
+        hello_strict_36 = 32, hello_strict_37 = 33, hello_strict_38 = 34, hello_strict_39 = 35,
+        hello_strict_40 = 36, hello_strict_41 = 37, hello_strict_42 = 38, hello_strict_43 = 39,
+        hello_strict_44 = 40, hello_strict_45 = 41, hello_strict_46 = 42,
+    }
+
+    harnesses! {
+        hello_rejects_short:
+        hello_short_1 = 1, hello_short_2 = 2, hello_short_3 = 3, hello_short_4 = 4,
+        hello_short_5 = 5, hello_short_6 = 6, hello_short_7 = 7, hello_short_8 = 8,
     }
 
     /// COMMIT_ACK (D24): exactly the empty payload and the two outcome
