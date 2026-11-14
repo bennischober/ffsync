@@ -151,7 +151,16 @@ impl From<io::Error> for FrameError {
 /// Payload bytes [`read_frame`] reserves up front; larger frames grow as
 /// their bytes arrive (2 MiB covers the largest chunk plus compression
 /// overhead, so DATA frames never reallocate).
+#[cfg(not(kani))]
 const PREALLOC_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Under Kani the reservation is capped at a few bytes: with the header's
+/// length symbolic, a 2 MiB cap gave `read_to_end` a symbolic spare
+/// capacity of up to 2 MiB to zero-fill, and CBMC ran out of memory
+/// bit-blasting that loop. The cap only sizes the first allocation —
+/// `read_to_end` grows past it — so frame contents are unaffected.
+#[cfg(kani)]
+const PREALLOC_LIMIT: usize = 4;
 
 /// The oversize-length refusal of [`read_frame`]. A type rather than a
 /// `format!`ed string, so the message is rendered only when displayed: the
@@ -342,33 +351,18 @@ mod tests {
 }
 
 /// Kani proof harnesses (verification pilot,
-/// `evaluation/verification-pilot.md`). Bounded model checking over every
-/// input up to the stated size — not sampled like the property tests.
-/// Run with `cargo kani` on Linux/WSL (see AGENTS.md).
+/// `evaluation/verification-pilot.md`). Bounded model checking: every
+/// byte that is not pinned below is symbolic — not sampled like the
+/// property tests. Run with `cargo kani` on Linux/WSL (see AGENTS.md).
 #[cfg(kani)]
 mod verification {
     use super::*;
 
-    /// `read_frame` on every input of at most 9 bytes (a header plus up to
-    /// 4 payload bytes, so every length field — including > MAX_PAYLOAD
-    /// and "longer than the input" — is explored): no panic, no arithmetic
-    /// overflow, and an accepted frame is exactly the bytes it claims.
-    ///
-    /// The input length is a loop variable, not `kani::any()`: with a
-    /// symbolic length every bounds check stays symbolic, symex cannot prune
-    /// the paths a short input never takes, and CBMC ran out of memory. Each
-    /// unrolled iteration has a concrete length; the bytes stay symbolic.
-    #[kani::proof]
-    #[kani::unwind(12)]
-    fn read_frame_is_total_and_exact() {
-        let bytes: [u8; 9] = kani::any();
-        for n in 0..=bytes.len() {
-            read_frame_on(&bytes, n);
-        }
-    }
-
-    fn read_frame_on(bytes: &[u8; 9], n: usize) {
-        let mut input = &bytes[..n];
+    /// `read_frame` on `bytes`: no panic, no arithmetic overflow, and an
+    /// accepted frame is exactly the bytes it claims.
+    fn read_frame_on(bytes: &[u8]) {
+        let n = bytes.len();
+        let mut input = bytes;
         match read_frame(&mut input) {
             Ok(f) => {
                 let len = f.payload.len();
@@ -390,5 +384,58 @@ mod verification {
                 assert!(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) > MAX_PAYLOAD);
             }
         }
+    }
+
+    /// `N` symbolic bytes, too few for a header (N < 5): Eof or Truncated.
+    fn short_input<const N: usize>() {
+        let bytes: [u8; N] = kani::any();
+        read_frame_on(&bytes);
+    }
+
+    /// `N` bytes whose header claims `L` payload bytes; the type byte and
+    /// everything after the header stay symbolic.
+    ///
+    /// The length field is pinned per harness because a symbolic one does
+    /// not finish: it flows into `take(len).read_to_end`, whose buffer
+    /// loops then have symbolic bounds, and CBMC ran out of memory turning
+    /// them into a formula — even on 5 bytes, even with the Kani-only
+    /// `PREALLOC_LIMIT`. Nothing else in `read_frame` branches on the
+    /// payload, so the claims below cover every control path: empty, exact,
+    /// leftover input, one byte short, far short, the largest legal
+    /// length, the first refused one, and `u32::MAX`.
+    fn frame_claiming<const N: usize, const L: u32>() {
+        let mut bytes: [u8; N] = kani::any();
+        bytes[1..5].copy_from_slice(&L.to_le_bytes());
+        read_frame_on(&bytes);
+    }
+
+    /// One `#[kani::proof]` per `name = check`.
+    macro_rules! harnesses {
+        ($($name:ident = $check:expr),* $(,)?) => {
+            $(
+                #[kani::proof]
+                #[kani::unwind(10)]
+                fn $name() {
+                    $check;
+                }
+            )*
+        };
+    }
+
+    harnesses! {
+        frame_short_0 = short_input::<0>(),
+        frame_short_1 = short_input::<1>(),
+        frame_short_2 = short_input::<2>(),
+        frame_short_3 = short_input::<3>(),
+        frame_short_4 = short_input::<4>(),
+        frame_5_claims_0 = frame_claiming::<5, 0>(),
+        frame_5_claims_1 = frame_claiming::<5, 1>(),
+        frame_9_claims_0 = frame_claiming::<9, 0>(),
+        frame_9_claims_1 = frame_claiming::<9, 1>(),
+        frame_9_claims_4 = frame_claiming::<9, 4>(),
+        frame_9_claims_5 = frame_claiming::<9, 5>(),
+        frame_9_claims_max = frame_claiming::<9, MAX_PAYLOAD>(),
+        frame_9_claims_max_plus_1 = frame_claiming::<9, { MAX_PAYLOAD + 1 }>(),
+        frame_9_claims_u32_max = frame_claiming::<9, { u32::MAX }>(),
     }
 }

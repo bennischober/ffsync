@@ -1128,6 +1128,54 @@ mod tests {
         );
     }
 
+    /// Every string of up to 6 characters over the alphabet that path
+    /// parsing distinguishes (a letter, `.`, `/`, `\`, `:`, space) that both
+    /// receiver checks accept names exactly one object under the root:
+    /// joining it adds one Normal component per wire segment, verbatim.
+    ///
+    /// Exhaustive rather than a Kani harness: std's string searching
+    /// (`split`, `memchr`, `Path::components`) turns every loop bound
+    /// symbolic once the bytes are, and CBMC ran out of memory even on a
+    /// 1-byte path. Enumeration also runs on Windows, where drive prefixes
+    /// (`a:`) and trailing dots/spaces make the platform matter — Kani
+    /// only runs on Linux/macOS.
+    #[test]
+    fn accepted_short_paths_stay_under_root() {
+        const ALPHABET: [char; 6] = ['a', '.', '/', '\\', ':', ' '];
+        let root = std::env::temp_dir().join("ffsync_root");
+        let root_len = root.components().count();
+        let mut checked = 0usize;
+        let mut accepted = 0usize;
+        let mut word = Vec::new();
+        loop {
+            let p: String = word.iter().map(|&i| ALPHABET[i]).collect();
+            checked += 1;
+            if validate_rel_path(&p).is_ok() && check_local_name(&p).is_ok() {
+                accepted += 1;
+                let joined = root.join(p.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let tail: Vec<_> = joined.components().skip(root_len).collect();
+                let segs: Vec<&str> = p.split('/').collect();
+                assert!(joined.starts_with(&root), "{p:?} escapes to {joined:?}");
+                assert_eq!(tail.len(), segs.len(), "{p:?} -> {joined:?}");
+                for (c, s) in tail.iter().zip(&segs) {
+                    let want = std::path::Component::Normal(std::ffi::OsStr::new(s));
+                    assert_eq!(*c, want, "{p:?}");
+                }
+            }
+            // Next word in length-then-lexicographic order.
+            match word.iter().rposition(|&i| i + 1 < ALPHABET.len()) {
+                Some(k) => {
+                    word[k] += 1;
+                    word[k + 1..].fill(0);
+                }
+                None if word.len() < 6 => word = vec![0; word.len() + 1],
+                None => break,
+            }
+        }
+        assert_eq!(checked, (0..=6).map(|n| 6usize.pow(n)).sum::<usize>());
+        assert!(accepted > 0);
+    }
+
     #[test]
     fn manifest_scan_and_canonical_order() {
         let dir = std::env::temp_dir().join(format!("ffsync_tree_scan_{}", std::process::id()));
@@ -1582,51 +1630,5 @@ mod tests {
         );
         assert_eq!(link_ancestor(&dir, "missing/a/b", &mut cache), None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// Kani proof harnesses (verification pilot,
-/// `evaluation/verification-pilot.md`). Run with `cargo kani` on
-/// Linux/WSL (see AGENTS.md); the harness checks the unix join, where
-/// `check_local_name` is a no-op, so `validate_rel_path` alone must hold
-/// the line.
-#[cfg(kani)]
-mod verification {
-    use super::*;
-    use std::path::{Component, Path};
-
-    /// Every UTF-8 string of at most 4 bytes that `validate_rel_path`
-    /// accepts names a path strictly under the root: joining it adds only
-    /// Normal components (no `..`, no `.`, no root or prefix), one per
-    /// wire segment.
-    ///
-    /// The length is a loop variable, not `kani::any()`, as in
-    /// `framing::verification`: with a symbolic length symex did not finish.
-    #[kani::proof]
-    #[kani::unwind(8)]
-    fn validated_paths_cannot_escape_the_root() {
-        let bytes: [u8; 4] = kani::any();
-        for n in 0..=bytes.len() {
-            stays_under_root(&bytes[..n]);
-        }
-    }
-
-    fn stays_under_root(bytes: &[u8]) {
-        let Ok(p) = std::str::from_utf8(bytes) else {
-            return;
-        };
-        if rel_path_problem(p).is_some() {
-            return;
-        }
-        // Joining a path onto a root adds exactly that path's components
-        // unless the path has a root or prefix of its own, so checking
-        // `Path::new(p)` proves the join property without the PathBuf
-        // allocation, whose heap-held length CBMC could not track.
-        let mut segments = 0usize;
-        for c in Path::new(p).components() {
-            assert!(matches!(c, Component::Normal(_)));
-            segments += 1;
-        }
-        assert_eq!(segments, p.split('/').count());
     }
 }
