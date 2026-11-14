@@ -239,45 +239,55 @@ impl Message for Hello {
         if frame.ftype != Self::TYPE {
             return Err(MessageError::UnexpectedType(frame.ftype));
         }
-        let p = &frame.payload;
-        let mut pos = 0usize;
-        let magic = read_bytes(p, &mut pos, 4)?;
-        if magic != MAGIC {
-            return Err(MessageError::Malformed("bad magic"));
-        }
-        let version = read_u16_le(p, &mut pos)?;
-        let flags = read_u16_le(p, &mut pos)?;
-        if flags & !HELLO_FLAG_KNOWN != 0 {
-            return Err(MessageError::Malformed("HELLO has unknown flag bits"));
-        }
-        let role_byte = read_bytes(p, &mut pos, 1)?[0];
-        let role = Role::from_u8(role_byte).ok_or(MessageError::Malformed("invalid role"))?;
-        let cdc_min = read_u32_le(p, &mut pos)?;
-        let cdc_avg = read_u32_le(p, &mut pos)?;
-        let cdc_max = read_u32_le(p, &mut pos)?;
-        let file_size = read_u64_le(p, &mut pos)?;
-        let file_mtime = read_u64_le(p, &mut pos)?;
-        let file_mtime_nanos = read_u32_le(p, &mut pos)?;
-        let path_len = read_u16_le(p, &mut pos)? as usize;
-        let path_bytes = read_bytes(p, &mut pos, path_len)?;
-        if pos != p.len() {
-            return Err(MessageError::Malformed("trailing bytes after HELLO"));
-        }
-        let path = String::from_utf8(path_bytes.to_vec())
-            .map_err(|_| MessageError::Malformed("path is not UTF-8"))?;
-        Ok(Hello {
-            version,
-            flags,
-            role,
-            cdc_min,
-            cdc_avg,
-            cdc_max,
-            file_size,
-            file_mtime,
-            file_mtime_nanos,
-            path,
-        })
+        decode_hello(&frame.payload)
     }
+}
+
+/// The payload half of [`Hello::from_frame`]. It works on a slice, so the
+/// Kani harnesses can pass a stack buffer whose length CBMC tracks; through
+/// a `Vec` the length was lost and every bound stayed symbolic.
+fn decode_hello(p: &[u8]) -> Result<Hello, MessageError> {
+    let mut pos = 0usize;
+    let magic = read_bytes(p, &mut pos, 4)?;
+    if magic != MAGIC {
+        return Err(MessageError::Malformed("bad magic"));
+    }
+    let version = read_u16_le(p, &mut pos)?;
+    let flags = read_u16_le(p, &mut pos)?;
+    if flags & !HELLO_FLAG_KNOWN != 0 {
+        return Err(MessageError::Malformed("HELLO has unknown flag bits"));
+    }
+    let role_byte = read_bytes(p, &mut pos, 1)?[0];
+    let role = Role::from_u8(role_byte).ok_or(MessageError::Malformed("invalid role"))?;
+    let cdc_min = read_u32_le(p, &mut pos)?;
+    let cdc_avg = read_u32_le(p, &mut pos)?;
+    let cdc_max = read_u32_le(p, &mut pos)?;
+    let file_size = read_u64_le(p, &mut pos)?;
+    let file_mtime = read_u64_le(p, &mut pos)?;
+    let file_mtime_nanos = read_u32_le(p, &mut pos)?;
+    let path_len = read_u16_le(p, &mut pos)? as usize;
+    let path_start = pos;
+    read_bytes(p, &mut pos, path_len)?;
+    if pos != p.len() {
+        return Err(MessageError::Malformed("trailing bytes after HELLO"));
+    }
+    // After the trailing check the path is exactly the rest of the
+    // payload; slicing it so keeps its length concrete for Kani.
+    let path = std::str::from_utf8(&p[path_start..])
+        .map_err(|_| MessageError::Malformed("path is not UTF-8"))?
+        .to_owned();
+    Ok(Hello {
+        version,
+        flags,
+        role,
+        cdc_min,
+        cdc_avg,
+        cdc_max,
+        file_size,
+        file_mtime,
+        file_mtime_nanos,
+        path,
+    })
 }
 
 impl Message for ManifestChunk {
@@ -1106,15 +1116,26 @@ mod verification {
     /// `Hello::from_frame` on every payload that carries the magic and up
     /// to 3 path bytes: no panic, and an accepted HELLO has only known
     /// flag bits (strict codec), a valid role, and consumed every byte.
+    ///
+    /// Lengths are loop variables, not `kani::any()`, as in
+    /// `framing::verification`, and the payload is a stack buffer passed to
+    /// `decode_hello`: with a symbolic length, or a length held in a `Vec`,
+    /// symex could not prune the paths a short payload never takes.
     #[kani::proof]
     #[kani::unwind(48)]
     fn hello_decode_is_total_and_strict() {
         let tail: [u8; HELLO_FIXED - 4 + 3] = kani::any();
-        let n: usize = kani::any_where(|&n| n <= tail.len());
-        let mut payload = MAGIC.to_vec();
-        payload.extend_from_slice(&tail[..n]);
-        let total = payload.len();
-        if let Ok(h) = Hello::from_frame(Frame::new(framing::T_HELLO, payload)) {
+        for n in 0..=tail.len() {
+            hello_with_magic(&tail, n);
+        }
+    }
+
+    fn hello_with_magic(tail: &[u8; HELLO_FIXED - 4 + 3], n: usize) {
+        let mut payload = [0u8; HELLO_FIXED + 3];
+        payload[..4].copy_from_slice(&MAGIC);
+        payload[4..4 + n].copy_from_slice(&tail[..n]);
+        let total = 4 + n;
+        if let Ok(h) = decode_hello(&payload[..total]) {
             assert_eq!(h.flags & !HELLO_FLAG_KNOWN, 0);
             assert!(matches!(h.role, Role::Sender | Role::Receiver));
             assert_eq!(total, HELLO_FIXED + h.path.len());
@@ -1127,9 +1148,9 @@ mod verification {
     #[kani::unwind(10)]
     fn hello_decode_rejects_short_payloads() {
         let bytes: [u8; 8] = kani::any();
-        let n: usize = kani::any_where(|&n| n <= bytes.len());
-        let r = Hello::from_frame(Frame::new(framing::T_HELLO, bytes[..n].to_vec()));
-        assert!(r.is_err());
+        for n in 0..=bytes.len() {
+            assert!(decode_hello(&bytes[..n]).is_err());
+        }
     }
 
     /// COMMIT_ACK (D24): exactly the empty payload and the two outcome

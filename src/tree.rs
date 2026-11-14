@@ -864,21 +864,31 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 /// leading/trailing slash, no backslash (Windows is source-side too; the
 /// wire form is always `/`-separated).
 pub fn validate_rel_path(p: &str) -> Result<(), String> {
+    match rel_path_problem(p) {
+        None => Ok(()),
+        Some(why) if p.is_empty() => Err(why.to_string()),
+        Some(why) => Err(format!("{why}: {p:?}")),
+    }
+}
+
+/// The decision behind [`validate_rel_path`], without the message
+/// formatting: `None` if `p` is a valid §16.2 path, else the reason. Kept
+/// separate so the Kani harness checks the decision without executing
+/// `format!` over a symbolic string.
+fn rel_path_problem(p: &str) -> Option<&'static str> {
     if p.is_empty() {
-        return Err("empty path".to_string());
+        return Some("empty path");
     }
     if p.starts_with('/') || p.ends_with('/') {
-        return Err(format!("leading or trailing slash: {p:?}"));
+        return Some("leading or trailing slash");
     }
     if p.contains('\\') {
-        return Err(format!(
-            "backslash in path (wire form is /-separated): {p:?}"
-        ));
+        return Some("backslash in path (wire form is /-separated)");
     }
     if p.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
-        return Err(format!("empty, '.', or '..' path component: {p:?}"));
+        return Some("empty, '.', or '..' path component");
     }
-    Ok(())
+    None
 }
 
 /// Checks that a (validated, §16.2) wire path names exactly one object
@@ -1102,6 +1112,20 @@ mod tests {
         assert!(validate_rel_path("a/./b").is_err());
         assert!(validate_rel_path("..").is_err());
         assert!(validate_rel_path("a\\b").is_err());
+        // Messages read as before the rel_path_problem split.
+        assert_eq!(validate_rel_path("").unwrap_err(), "empty path");
+        assert_eq!(
+            validate_rel_path("/abs").unwrap_err(),
+            r#"leading or trailing slash: "/abs""#
+        );
+        assert_eq!(
+            validate_rel_path("a\\b").unwrap_err(),
+            r#"backslash in path (wire form is /-separated): "a\\b""#
+        );
+        assert_eq!(
+            validate_rel_path("a/../b").unwrap_err(),
+            r#"empty, '.', or '..' path component: "a/../b""#
+        );
     }
 
     #[test]
@@ -1575,22 +1599,31 @@ mod verification {
     /// accepts names a path strictly under the root: joining it adds only
     /// Normal components (no `..`, no `.`, no root or prefix), one per
     /// wire segment.
+    ///
+    /// The length is a loop variable, not `kani::any()`, as in
+    /// `framing::verification`: with a symbolic length symex did not finish.
     #[kani::proof]
     #[kani::unwind(8)]
     fn validated_paths_cannot_escape_the_root() {
         let bytes: [u8; 4] = kani::any();
-        let n: usize = kani::any_where(|&n| n <= bytes.len());
-        let Ok(p) = std::str::from_utf8(&bytes[..n]) else {
+        for n in 0..=bytes.len() {
+            stays_under_root(&bytes[..n]);
+        }
+    }
+
+    fn stays_under_root(bytes: &[u8]) {
+        let Ok(p) = std::str::from_utf8(bytes) else {
             return;
         };
-        if validate_rel_path(p).is_err() {
+        if rel_path_problem(p).is_some() {
             return;
         }
-        let root = Path::new("/r");
-        let joined = root.join(p);
-        assert!(joined.starts_with(root));
+        // Joining a path onto a root adds exactly that path's components
+        // unless the path has a root or prefix of its own, so checking
+        // `Path::new(p)` proves the join property without the PathBuf
+        // allocation, whose heap-held length CBMC could not track.
         let mut segments = 0usize;
-        for c in joined.components().skip(2) {
+        for c in Path::new(p).components() {
             assert!(matches!(c, Component::Normal(_)));
             segments += 1;
         }

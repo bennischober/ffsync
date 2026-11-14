@@ -153,6 +153,25 @@ impl From<io::Error> for FrameError {
 /// overhead, so DATA frames never reallocate).
 const PREALLOC_LIMIT: usize = 2 * 1024 * 1024;
 
+/// The oversize-length refusal of [`read_frame`]. A type rather than a
+/// `format!`ed string, so the message is rendered only when displayed: the
+/// Kani harness would otherwise have to execute integer formatting over a
+/// symbolic length, which CBMC did not finish in an hour.
+#[derive(Debug)]
+struct PayloadTooLarge(u32);
+
+impl std::fmt::Display for PayloadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "frame payload of {} bytes exceeds {}",
+            self.0, MAX_PAYLOAD
+        )
+    }
+}
+
+impl std::error::Error for PayloadTooLarge {}
+
 /// Reads one frame. Clean EOF before any byte of a frame is reported as
 /// `Err(FrameError::Eof)` (callers match on it explicitly); a header or
 /// payload that ends mid-frame is `FrameError::Truncated`.
@@ -176,7 +195,7 @@ pub fn read_frame(inp: &mut (impl Read + ?Sized)) -> Result<Frame, FrameError> {
     if len > MAX_PAYLOAD {
         return Err(FrameError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame payload of {} bytes exceeds {}", len, MAX_PAYLOAD),
+            PayloadTooLarge(len),
         )));
     }
     // Grow with the bytes that actually arrive instead of trusting the
@@ -240,7 +259,19 @@ mod tests {
         buf.extend_from_slice(&(MAX_PAYLOAD + 1).to_le_bytes());
         let mut cursor = Cursor::new(buf);
         let err = read_frame(&mut cursor).unwrap_err();
-        assert!(matches!(err, FrameError::Io(_)));
+        let FrameError::Io(e) = err else {
+            panic!("expected Io, got {err:?}");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        // The message is rendered lazily (PayloadTooLarge) but reads as before.
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "frame payload of {} bytes exceeds {}",
+                MAX_PAYLOAD + 1,
+                MAX_PAYLOAD
+            )
+        );
     }
 
     #[test]
@@ -322,11 +353,21 @@ mod verification {
     /// 4 payload bytes, so every length field — including > MAX_PAYLOAD
     /// and "longer than the input" — is explored): no panic, no arithmetic
     /// overflow, and an accepted frame is exactly the bytes it claims.
+    ///
+    /// The input length is a loop variable, not `kani::any()`: with a
+    /// symbolic length every bounds check stays symbolic, symex cannot prune
+    /// the paths a short input never takes, and CBMC ran out of memory. Each
+    /// unrolled iteration has a concrete length; the bytes stay symbolic.
     #[kani::proof]
     #[kani::unwind(12)]
     fn read_frame_is_total_and_exact() {
         let bytes: [u8; 9] = kani::any();
-        let n: usize = kani::any_where(|&n| n <= bytes.len());
+        for n in 0..=bytes.len() {
+            read_frame_on(&bytes, n);
+        }
+    }
+
+    fn read_frame_on(bytes: &[u8; 9], n: usize) {
         let mut input = &bytes[..n];
         match read_frame(&mut input) {
             Ok(f) => {
