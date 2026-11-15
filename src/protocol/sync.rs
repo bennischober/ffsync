@@ -419,19 +419,21 @@ where
     progress(Progress::Diffing);
 
     // ---- HELLO ----
+    // §7.1/§9.2: a dry-run preview sends no DATA, so a dry-run sender never
+    // offers eager. Eager DATA leaves during the manifest exchange, before
+    // the receiver's would-change answer: a `--eager --dry-run` preview
+    // streamed the file's bytes (found by tests/hostile_receiver.rs).
+    let offer_eager = request.eager && !request.dry_run;
     let hello_flags = (if request.force_checksum {
         0
     } else {
         FLAG_TRUST_TIMES
-    }) | if request.eager {
-        message::FLAG_EAGER
-    } else {
-        0
-    } | if request.dry_run {
-        message::FLAG_DRY_RUN
-    } else {
-        0
-    };
+    }) | if offer_eager { message::FLAG_EAGER } else { 0 }
+        | if request.dry_run {
+            message::FLAG_DRY_RUN
+        } else {
+            0
+        };
     let hello = Hello {
         version: super::VERSION,
         flags: hello_flags,
@@ -495,8 +497,8 @@ where
     // declined) never would — proceeding eagerly would deadlock it at
     // PLAN_DONE (its data loop starts only after the plan), so the
     // session fails loudly instead of silently degrading.
-    let eager_active = request.eager && peer.flags & message::FLAG_EAGER != 0;
-    if request.eager && !eager_active {
+    let eager_active = offer_eager && peer.flags & message::FLAG_EAGER != 0;
+    if offer_eager && !eager_active {
         let _ = send_error_and_finish(
             stream,
             ErrorCode::Version,

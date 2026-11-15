@@ -2194,6 +2194,105 @@ mod tests {
         );
     }
 
+    /// Records the type of every complete frame written through it.
+    struct FrameTypeTap {
+        inner: DuplexEnd,
+        pending: Vec<u8>,
+        types: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Read for FrameTypeTap {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for FrameTypeTap {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.pending.extend_from_slice(&buf[..n]);
+            while self.pending.len() >= 5 {
+                let len = u32::from_le_bytes(self.pending[1..5].try_into().unwrap()) as usize;
+                if self.pending.len() < 5 + len {
+                    break;
+                }
+                self.types.lock().unwrap().push(self.pending[0]);
+                self.pending.drain(..5 + len);
+            }
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn eager_dry_run_sends_no_data() {
+        // §7.1: a dry-run preview sends no DATA. With `--eager` on both
+        // peers the sender used to offer eager and stream the file's chunks
+        // during the manifest exchange, before the receiver's would-change
+        // answer (found by tests/hostile_receiver.rs). A dry-run sender now
+        // never offers eager.
+        let fx = Fixture::new("dry_run_eager");
+        let src_data: Vec<u8> = (0..3 * 1024 * 1024u32)
+            .map(|i| (i * 7 + i / 4096) as u8)
+            .collect();
+        create_file(fx.source(), &src_data);
+        let target = fx.path("target.bin");
+
+        let (sender_end, mut receiver_end) = DuplexPair::new(64);
+        let types = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tap = FrameTypeTap {
+            inner: sender_end,
+            pending: Vec::new(),
+            types: types.clone(),
+        };
+        let s = SendRequest {
+            path: fx.source().to_path_buf(),
+            display_path: "src.bin".into(),
+            mtime: None,
+            force_checksum: false,
+            tree: false,
+            dry_run: true,
+            eager: true,
+        };
+        let r = ReceiveRequest {
+            path: target.clone(),
+            local_source: target.clone(),
+            force_checksum: false,
+            tree: false,
+            apply_mtime: None,
+            apply_mode: None,
+            eager: true,
+            extra_sources: Vec::new(),
+            expect_peer_path: None,
+        };
+        let s_handle =
+            std::thread::spawn(move || send(&mut tap, &s, &PipelineConfig::default(), &mut |_| {}));
+        let r_out = receive(
+            &mut receiver_end,
+            &r,
+            &PipelineConfig::default(),
+            &mut |_| {},
+        );
+        let s_out = s_handle.join().unwrap();
+        assert!(
+            matches!(s_out, Ok(SyncOutcome::WouldChange)),
+            "sender: {s_out:?}"
+        );
+        assert!(
+            matches!(r_out, Ok(SyncOutcome::WouldChange)),
+            "receiver: {r_out:?}"
+        );
+        let types = types.lock().unwrap();
+        assert!(
+            !types.contains(&ffsync::protocol::framing::T_DATA),
+            "a dry-run sender wrote DATA: {types:02X?}"
+        );
+        assert!(!target.exists());
+    }
+
     #[test]
     fn hello_with_unknown_flag_bit_is_rejected() {
         // Strict-codec doctrine: a HELLO with bits this build does not know

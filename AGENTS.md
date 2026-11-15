@@ -91,7 +91,7 @@ Design documents (read before making architectural changes):
 | --- | --- |
 | `cargo build` | Build the binary |
 | `cargo check --tests` | Fast compile check including tests |
-| `cargo test` | Run unit and integration tests (`tests/`: `integration`, `loopback`, `tree`, `tls`, `quic`, `soak`, `decoder_smoke`, `fuzz_corpus`, `properties`, `hostile_sender`) |
+| `cargo test` | Run unit and integration tests (`tests/`: `integration`, `loopback`, `tree`, `tls`, `quic`, `soak`, `decoder_smoke`, `fuzz_corpus`, `properties`, `hostile_sender`, `hostile_receiver`) |
 | `cargo run` | Run the CLI (`ffsync send/receive`, see `--help`) |
 | `cargo run --bin bench` | Run the benchmark harness (fixture variants, delta simulation, reconstruction, link-speed projections; `--quick`, `--size-mib N`, `--seed N`, `--cdc m/a/M`, `--sweep`, `--rsync`, `--disconnect`, `--warm`, `--tree`, `--latency` (+ `--rtt-ms`, `--parallel K,...`), `--gen-tree`, `--out-dir P`, `--json`) |
 | `cargo fmt` | Format (default rustfmt style; no `rustfmt.toml`) |
@@ -103,6 +103,7 @@ Design documents (read before making architectural changes):
 | `cargo test --test decoder_smoke` | Adversarial decoder smoke: truncations, garbage, bombs — runs in normal CI (no sanitizer) |
 | `cargo test --test properties` | Property tests (proptest): triage model + real tree sessions, excludes vs a reference matcher, path safety, `mtimes_match`, chunk/plan coverage, codec round trips — runs in normal CI; see `evaluation/verification-pilot.md` |
 | `cargo test --test hostile_sender` | Hostile-sender properties: the real tree receiver against the real sender with one frame mutated in flight (byte flips, drops, injected frames, field lies); checks containment, no wrong-path content, no unearned deletes, loud failure. 64 cases by default; run `PROPTEST_CASES=1500` after tree-receiver changes — see `evaluation/verification-pilot.md` |
+| `cargo test --test hostile_receiver` | Hostile-receiver properties (the mirror): the real sender (tree and single-file) against the real receiver with one receiver frame mutated in flight (lied manifests/HELLOs/manifest chunks, floods, forged COMMIT_ACK and TREE_END, refusals), plus a tap on every sender frame; checks no panic/hang, sender tree untouched, every sent path and DATA byte is the sender's own (none in dry-run), bounded heap (counting allocator), no unearned success. 64 cases per property by default; run `PROPTEST_CASES=1500` after sender changes |
 | `java -cp tla2tools.jar tlc2.TLC -config <cfg> ParallelSession.tla` (in `concept/tla/`) | TLA+ model check of the §16.8 parallel-session barrier: membership exactly-once, deletes only after every conversation committed, termination; `Honest`/`Hostile`/`Witness` + one mutation config per receiver guard (expected results in `concept/tla/README.md`). Needs Java 11+ and `tla2tools.jar` (keep it and `-metadir` outside the repo). Re-run after changing the parallel branches of `tree_sync.rs`. Not in CI |
 | `cargo kani` | Kani bounded proofs (`#[cfg(kani)] mod verification` in `framing.rs`, `message.rs`): frame/HELLO/COMMIT_ACK decode totality, 66 harnesses, one per concrete length (Kani's unwind bound is global — keep lengths concrete and bytes symbolic; see `evaluation/verification-pilot.md`). Path containment is the exhaustive unit test `tree::tests::accepted_short_paths_stay_under_root`, not a harness. Linux/macOS only — on Windows run it in WSL or an `ubuntu:24.04` container (Kani 0.68 needs glibc ≥ 2.34); one-time setup `cargo install --locked kani-verifier && cargo kani setup`. Not in CI |
 
@@ -248,6 +249,12 @@ pre-existing.
   `catch_unwind` on both peers; six oracles (no panic/hang, containment,
   same-path content, earned deletes only, success ⇒ converged, honest
   control converges).
+- `tests/hostile_receiver.rs` — the mirror: the real `tree_send` /
+  `sync::send` against the real receiver behind a `MutatingStream` on the
+  receiver's frames, with a `TapStream` checking every sender frame and a
+  counting global allocator; eight oracles (no panic/hang, sender tree
+  untouched, wire content is the sender's own, bounded heap, no unearned
+  success, receiver safe, reports agree, honest control converges).
 - `tests/integration.rs` — end-to-end test: reconstruct a modified file from
   an older local version plus simulated "network" chunks.
 
@@ -442,6 +449,9 @@ pre-existing.
   remaining manifest. Held bytes are capped at `EAGER_BUF_CAP` (= the
   receiver's cap). Do not "optimize" the writes back into the manifest
   loop; `eager_does_not_deadlock_on_small_transport_buffers` pins it.
+- Dry-run never runs eager (§7.1, 2026-11): `sync::send` clears its
+  eager offer when `dry_run` is set, because eager DATA leaves before the
+  receiver's would-change answer. `eager_dry_run_sends_no_data` pins it.
 - COMMIT_ACK carries the receiver's outcome byte (D24, §8): every
   receiver COMMIT_ACK send must pass `encode_commit_ack(written)` with
   `written` matching the label it returns (Transferred ⇔ true). The

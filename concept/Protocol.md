@@ -297,6 +297,14 @@ The preview's zero-mutation guarantee is structural: no temp file is
 created on the receiver in the would-change path, and the sender requests
 no DATA.
 
+**Dry-run never runs eager** (2026-11): a dry-run sender does not offer
+eager (§9.2) — HELLO flag bit 1 stays clear even with `--eager`, so an
+opted-in receiver never activates it. Eager DATA leaves during the
+manifest exchange, before the receiver's would-change answer exists;
+before this rule an `--eager --dry-run` preview streamed the file's
+chunks (found by `tests/hostile_receiver.rs`). No wire change: the
+receiver sees a sender that did not offer eager.
+
 **Receiver write order (D10, empirically decided):** the receiver executes
 plan entries in order, resolving each PLAN_LOCAL chunk per hash from its union
 manifest (temp file before old file) and writing it *before* receiving the
