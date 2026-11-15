@@ -18,7 +18,7 @@ commands.
 
 </div>
 
-> **Status: v1.4.0 (stable).** Single-file and directory-tree sync between two
+> **Status: v2.0.0 (stable).** Single-file and directory-tree sync between two
 > peers over TLS, with resume, excludes, parallel conversations, QUIC,
 > warm starts, and rename detection — all measured, no daemon, no config.
 > Details and per-feature flags: [Using it](#using-it) · history: [CHANGELOG](CHANGELOG.md) · [roadmap](#roadmap).
@@ -450,6 +450,7 @@ Shipped, one line each (full notes in the
 - **1.2** Rename detection: renamed files move with zero wire bytes (D22).
 - **1.3** Code-review hardening: case-only renames on NTFS/APFS (D23), the `--eager` deadlock fix, `receive --bind`, buffered connections.
 - **1.4** `receive --from` and resume correctness, COMMIT_ACK outcome byte (D24), size-aware scan threads.
+- **2.0** Hostile-peer hardening (receiver path safety, per-conversation path checks, property tests, a TLA+ model of §16.8), and a library API that grows without breaking callers (D25). Same wire: syncs with every 1.x peer.
 
 **Deliberately not planned** (positioning, D9): daemon/continuous sync
 (Syncthing's job), cloud remotes (rclone's job), xattrs/hardlinks,

@@ -2,13 +2,13 @@
 
 Guidance for AI coding agents (and humans) working in this repository.
 
-**Last refreshed:** 2026-11-07 (ffsync 1.4.0, protocol v4) · **Commit:** 308dedb · **Branch:** main
+**Last refreshed:** 2026-11-15 (ffsync 2.0.0, protocol v4) · **Commit:** 36d558c · **Branch:** main
 
 ## What this project is
 
 `ffsync` is a file synchronization tool written in Rust that syncs data at the
 chunk level to minimize transfer and I/O, similar in spirit to rsync. As of
-v0.8.0 (the feature baseline; current release 1.4.0), single-file sync **and directory-tree sync** between two peers over
+v0.8.0 (the feature baseline; current release 2.0.0), single-file sync **and directory-tree sync** between two peers over
 TCP or QUIC work end-to-end: parallel chunking/hashing pipeline, file
 reconstruction, manifest/plan exchange, zstd-compressed transfer,
 chunk-root verification, mtime/size fast path (sub-second mtimes),
