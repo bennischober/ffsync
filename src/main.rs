@@ -100,6 +100,16 @@ Notes:
   Port 0 on receive binds an OS-assigned port; the actual port is printed.
 ";
 
+/// `--version`: the release and the wire protocol it speaks (D25). Peers
+/// sync when their protocol numbers match, whatever their releases.
+fn print_version() {
+    println!(
+        "ffsync {} (protocol {})",
+        env!("CARGO_PKG_VERSION"),
+        ffsync::protocol::VERSION
+    );
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("error: {}", msg);
     eprintln!("try 'ffsync --help'");
@@ -1276,7 +1286,7 @@ fn main() {
             print!("{}", USAGE);
         }
         "--version" | "-V" | "version" => {
-            println!("ffsync {}", env!("CARGO_PKG_VERSION"));
+            print_version();
         }
         "send" => {
             let mut positional: Vec<String> = Vec::new();
@@ -1332,7 +1342,7 @@ fn main() {
                         return;
                     }
                     "--version" | "-V" => {
-                        println!("ffsync {}", env!("CARGO_PKG_VERSION"));
+                        print_version();
                         return;
                     }
                     other => positional.push(other.to_string()),
@@ -1440,7 +1450,7 @@ fn main() {
                         return;
                     }
                     "--version" | "-V" => {
-                        println!("ffsync {}", env!("CARGO_PKG_VERSION"));
+                        print_version();
                         return;
                     }
                     other => positional.push(other.to_string()),

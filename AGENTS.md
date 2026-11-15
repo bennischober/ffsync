@@ -261,6 +261,14 @@ pre-existing.
 ## Conventions
 
 - Conventional Commits for commit messages.
+- Two version numbers (D25). The release version (`Cargo.toml`, semver)
+  covers the CLI, the public library API and on-disk state
+  (`identity.bin`, `pins.conf`): adding a public field to a struct that
+  callers build with a literal is a major release. `protocol::VERSION`
+  covers the wire only, and the HELLO equality check is the one peer
+  compatibility check. A `VERSION` bump is a major release too. Never
+  compare release versions between peers; the release may appear only in
+  human-readable text, such as the ERROR(Version) message.
 - Doc comments (`///`) on public traits, structs, and functions.
 - Swappable behavior goes behind traits (`Chunker`, `Hasher`, `FileExt`); add
   new strategies as implementations instead of hardcoding or adding enums with

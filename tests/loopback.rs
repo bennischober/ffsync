@@ -1178,9 +1178,16 @@ mod tests {
                         "expected ERROR frame, got 0x{:02X}",
                         frame.ftype
                     );
-                    let (code, _msg) =
+                    let (code, msg) =
                         ffsync::protocol::message::read_error_payload(&frame).unwrap();
                     assert_eq!(code, ffsync::protocol::message::ErrorCode::Version);
+                    // D25: the text names the rejecting release, so the user
+                    // knows which machine to upgrade.
+                    let release = format!("ffsync {}", env!("CARGO_PKG_VERSION"));
+                    assert!(
+                        msg.contains(&release),
+                        "ERROR(Version) text {msg:?} lacks {release:?}"
+                    );
                     return Err(std::io::Error::other("peer rejected (correct)"));
                 }
             });

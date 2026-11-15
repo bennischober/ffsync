@@ -4,6 +4,11 @@ All notable changes to ffsync are documented here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking for library users, so the next release is 2.0.0.** `ReceiveRequest` has a new public field, `expect_peer_path`; code that builds it with a struct literal must add `expect_peer_path: None` for the old behavior. The CLI and the wire are unchanged: the next release still speaks protocol 4 and syncs with every 1.x peer. The versioning policy behind this is recorded as D25 in `concept/Design Decisions.md`: the release version covers the CLI, the library and on-disk state; the protocol version alone decides which peers can sync.
+- `ffsync --version` also prints the protocol version (`ffsync 1.4.0 (protocol 4)`). Peers sync when their protocol numbers match. When a peer is rejected for its protocol version, the error text now names the rejecting side's release, so it is clear which machine to upgrade.
+
 ### Fixed
 
 - **Tree receivers refuse sender paths they cannot store safely.** A tree receiver now checks every sender path before it writes anything, and fails the session with a clear error if a path would resolve to the wrong place. Before, a Windows receiver let `C:x` escape the sync root, wrote `a:b` into an alternate data stream, and stored `a.` as `a`, which the next session's delete pass then removed. Device names such as `nul` are refused too. On every platform, the receiver no longer writes through a directory symlink or junction in its tree, which used to land files outside the root. To sync the rest of the tree, exclude the reported paths on the sender (`--exclude`). Unix receivers still accept `a:b` and trailing dots.

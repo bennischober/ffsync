@@ -1211,3 +1211,54 @@ prediction (unchanged, including the `FLAG_RESUMING`/size guards of
   manifest content and interacts with the §6.2 eager position gate.
 - A protocol version bump. That costs every mixed-version pair, all
   to fix a cosmetic label.
+
+## D25 — Two version numbers: the release (semver) and the protocol VERSION (2026-11-15)
+
+**Problem.** The 1.0.0 changelog promised "the 1.x compatibility
+commitment" without saying what it covers. The question became concrete
+after 1.4.0: `ReceiveRequest` gained a public field
+(`expect_peer_path`), which breaks library code that builds the struct
+with a literal, while the wire did not change at all. Does that make the
+next release 2.0.0? And should peers check each other's release version,
+so incompatible releases cannot sync?
+
+**Decision.** ffsync carries two version numbers, and each answers one
+question.
+
+1. **The release version** (`Cargo.toml`, Semantic Versioning) covers
+   what a user or a program builds on: the CLI (commands, flags, the
+   meaning of exit status), the public Rust library API (`ffsync::…`),
+   and the on-disk state a newer release must keep reading
+   (`identity.bin`, `pins.conf`). A breaking change to any of them is a
+   major release. The D15 index is a cache, not state: a format change
+   (`FFSYIX01` → `FFSYIX02`, D19) costs one cold scan and is not a break.
+2. **The protocol `VERSION`** (`protocol::VERSION`, HELLO) covers only the
+   bytes on the wire, and the HELLO equality check (Protocol.md §4) is
+   the one compatibility check between peers. Two peers that speak the
+   same `VERSION` interoperate, whatever their release versions. Wire
+   changes follow Protocol.md's rule: a `VERSION` bump, or a flag bit
+   that the strict decoders let ship additively. A `VERSION` bump stops
+   the new release from syncing with every older one, so it is a major
+   release too.
+3. **The release version never gates a session.** It appears on the
+   wire only in human-readable text: the ERROR(Version) message names
+   the rejecting peer's release, so the user learns which machine to
+   upgrade. `ffsync --version` prints both numbers.
+
+**Consequence.** The `expect_peer_path` field makes the next release
+2.0.0. Its wire stays at `VERSION` 4, so 2.0.0 and every 1.x release sync
+with each other.
+
+**Rejected.**
+- Checking the release version in HELLO. It would refuse pairs that
+  speak the same wire (1.4.0 and 2.0.0 both speak v4) and force every
+  machine to upgrade in lockstep for changes that never touched the
+  wire. The protocol `VERSION` already answers "can these two talk".
+- Version-range negotiation (each peer announces min..max, the session
+  runs the highest common version). It lets a new peer serve old ones,
+  but every old protocol path must stay alive and tested. Flags for
+  additive changes have carried v2 through v4 without it. Revisit when a
+  v5 is planned and old machines cannot easily be upgraded.
+- Declaring the library outside semver to keep 1.x. The crate is
+  published with a documented library target; narrowing the promise
+  after the fact is weaker than a major release.
