@@ -1249,6 +1249,20 @@ question.
 2.0.0. Its wire stays at `VERSION` 4, so 2.0.0 and every 1.x release sync
 with each other.
 
+The same release makes the session API extensible, so the next new option
+is not another major release. The request types (`SendRequest`,
+`ReceiveRequest`, `TreeSendRequest`, `TreeReceiveRequest`),
+`PipelineConfig` and `TreeOutcome` are `#[non_exhaustive]`, and callers
+build the requests with constructors whose options all start off. The
+enums callers match on (`SyncError`, `SyncOutcome`, `Progress`,
+`TreeProgress`) are `#[non_exhaustive]` too. A new field or variant there
+is a minor release. The wire message structs (`message::Hello`,
+`TreeBegin`, …) stay exhaustive, because a new field there is a wire
+change, which rule 2 already covers. The cost falls on this crate's own
+CLI, bench and tests, which are separate crates: their matches need `_`
+arms, so the compiler no longer flags a new event that the CLI does not
+render.
+
 **Rejected.**
 - Checking the release version in HELLO. It would refuse pairs that
   speak the same wire (1.4.0 and 2.0.0 both speak v4) and force every

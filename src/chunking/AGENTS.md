@@ -28,7 +28,7 @@ delta unit — this module is wire-protocol-relevant (D2, D19).
 | Task | Location | Notes |
 |------|----------|-------|
 | New chunking strategy | implement `Chunker` in `chunker.rs` | re-export via `mod.rs` |
-| Pipeline concurrency | `PipelineConfig` / `thread_counts` (`pipeline.rs`) | `read_buffer_size` is deprecated and ignored (wire-relevant, now `REGION_SIZE`) |
+| Pipeline concurrency | `PipelineConfig` / `thread_counts` (`pipeline.rs`) | Concurrency only; the region size is the protocol constant `REGION_SIZE` (the ignored `read_buffer_size` field was removed in 2.0.0) |
 | CDC policy | `cdc_params_for_size` / `sane_cdc_params` | see ANTI-PATTERNS |
 | Chunk integrity | `chunk_root` (`types.rs`) | shared with the D15 index |
 

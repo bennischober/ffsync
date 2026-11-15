@@ -31,7 +31,7 @@
 //!   *answered* is therefore only safe when the writer holds the
 //!   connection until the reply is read; the session functions do that
 //!   (the returned [`QuicSession`] keeps the connection alive), and the
-//!   receiver-side helper [`wait_for_peer_close`] bounds the final wait.
+//!   receiver-side helper [`QuicSession::wait_for_peer_close`] bounds the final wait.
 
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -147,7 +147,7 @@ fn transport_config() -> TransportConfig {
 /// §16.8 worker closures need their own handle on their own thread (the
 /// TCP path hands each worker a fresh socket; the QUIC path hands each a
 /// clone). The connection closes when the LAST handle drops — after
-/// unACKed stream data MAY be discarded, hence [`wait_for_peer_close`]
+/// unACKed stream data MAY be discarded, hence [`QuicSession::wait_for_peer_close`]
 /// on the receiver's final wait (§17.6).
 pub struct QuicSession {
     connection: Connection,
@@ -177,7 +177,7 @@ impl QuicSession {
     }
 
     /// Accepts a new bidirectional stream — the receiver-side counterpart
-    /// of [`open_stream`] (a §16.8 worker arriving on the shared
+    /// of [`open_stream`](Self::open_stream) (a §16.8 worker arriving on the shared
     /// connection instead of a new TCP connection).
     pub fn accept_stream(&self) -> io::Result<QuicStream> {
         let (send, recv) = block_on(self.connection.accept_bi())

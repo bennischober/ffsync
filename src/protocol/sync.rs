@@ -73,6 +73,7 @@ enum LocalOrigin {
 
 /// Errors from the sync state machines.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SyncError {
     /// The peer sent an ERROR frame; connection is dead.
     Peer(ErrorCode, String),
@@ -116,6 +117,7 @@ impl From<FrameError> for SyncError {
 
 /// Progress events emitted during a sync (§11): the CLI displays these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Progress {
     /// Scanning own file: (bytes hashed so far, file size).
     Scanning(u64, u64),
@@ -144,6 +146,11 @@ pub enum Progress {
 }
 
 /// Everything the sender needs to know about the file being sent.
+///
+/// Build one with [`SendRequest::new`] and set the optional fields
+/// afterwards; the struct is `#[non_exhaustive]` so that new options are
+/// not a breaking change (D25).
+#[non_exhaustive]
 pub struct SendRequest {
     pub path: PathBuf,
     /// Peer-reachable path/name reported in HELLO (display only).
@@ -170,7 +177,12 @@ pub struct SendRequest {
 }
 
 /// The receiver's view of what to build.
+///
+/// Build one with [`ReceiveRequest::new`] and set the optional fields
+/// afterwards; the struct is `#[non_exhaustive]` so that new options are
+/// not a breaking change (D25).
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ReceiveRequest {
     pub path: PathBuf,
     /// The file we already have (used as the manifest source); may not exist.
@@ -206,8 +218,47 @@ pub struct ReceiveRequest {
     pub expect_peer_path: Option<String>,
 }
 
+impl SendRequest {
+    /// A request to send `path`, announced to the peer as `display_path`.
+    /// Every option starts off: the mtime is read from the file, the
+    /// size+mtime fast path is on, and the session is a lazy, single-file,
+    /// non-dry-run sync.
+    pub fn new(path: PathBuf, display_path: String) -> Self {
+        Self {
+            path,
+            display_path,
+            mtime: None,
+            force_checksum: false,
+            eager: false,
+            dry_run: false,
+            tree: false,
+        }
+    }
+}
+
+impl ReceiveRequest {
+    /// A request to build `path`, using `local_source` (which may not
+    /// exist) as the basis whose chunks are reused. Every option starts
+    /// off: single-file mode, no metadata applied, no extra sources, no
+    /// peer-path check.
+    pub fn new(path: PathBuf, local_source: PathBuf) -> Self {
+        Self {
+            path,
+            local_source,
+            force_checksum: false,
+            tree: false,
+            apply_mtime: None,
+            apply_mode: None,
+            eager: false,
+            extra_sources: Vec::new(),
+            expect_peer_path: None,
+        }
+    }
+}
+
 /// Outcome of a completed sync.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SyncOutcome {
     /// Receiver converged; nothing was transferred.
     InSync,

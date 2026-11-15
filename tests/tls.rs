@@ -104,25 +104,17 @@ mod tests {
                 let path = dir.join("data.bin");
                 std::fs::write(&path, vec![1u8; 256 * 1024]).unwrap();
 
-                let send_req = ffsync::protocol::sync::SendRequest {
-                    path: path.clone(),
-                    display_path: "data.bin".into(),
-                    mtime: None,
-                    force_checksum: true,
-                    tree: false,
-                    dry_run: false,
-                    eager: false,
+                let send_req = {
+                    let mut rq =
+                        ffsync::protocol::sync::SendRequest::new(path.clone(), "data.bin".into());
+                    rq.force_checksum = true;
+                    rq
                 };
-                let recv_req = ffsync::protocol::sync::ReceiveRequest {
-                    path: path.clone(),
-                    local_source: path.clone(),
-                    force_checksum: true,
-                    tree: false,
-                    apply_mode: None,
-                    apply_mtime: None,
-                    eager: false,
-                    extra_sources: Vec::new(),
-                    expect_peer_path: None,
+                let recv_req = {
+                    let mut rq =
+                        ffsync::protocol::sync::ReceiveRequest::new(path.clone(), path.clone());
+                    rq.force_checksum = true;
+                    rq
                 };
                 let pipeline = ffsync::chunking::PipelineConfig::default();
                 let pipeline_recv = ffsync::chunking::PipelineConfig::default();

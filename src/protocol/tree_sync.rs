@@ -60,6 +60,7 @@ enum ConvEvent {
 
 /// Tree-level progress events (bridged to the CLI display).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TreeProgress {
     /// Scanning the local tree (stat-only; no file contents are read).
     Scanning,
@@ -79,6 +80,11 @@ pub enum TreeProgress {
 }
 
 /// Everything the sender needs for a tree session.
+///
+/// Build one with [`TreeSendRequest::new`] and set the optional fields
+/// afterwards; the struct is `#[non_exhaustive]` so that new options are
+/// not a breaking change (D25).
+#[non_exhaustive]
 pub struct TreeSendRequest {
     /// The local tree root to send.
     pub root: PathBuf,
@@ -114,6 +120,11 @@ pub struct TreeSendRequest {
 }
 
 /// Everything the receiver needs for a tree session.
+///
+/// Build one with [`TreeReceiveRequest::new`] and set the optional fields
+/// afterwards; the struct is `#[non_exhaustive]` so that new options are
+/// not a breaking change (D25).
+#[non_exhaustive]
 pub struct TreeReceiveRequest {
     /// The local tree root to converge toward the sender's.
     pub root: PathBuf,
@@ -141,6 +152,53 @@ pub struct TreeReceiveRequest {
     pub eager: bool,
 }
 
+/// The worker hooks a request starts with: a sequential session never
+/// calls them, and a parallel session that was not given real ones fails
+/// loudly on the first worker connection.
+fn no_worker_hook() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "parallel session without a worker connection hook",
+    )
+}
+
+impl TreeSendRequest {
+    /// A request to send the tree at `root`. Every option starts off: a
+    /// sequential session (`parallel` = 1) with the metadata fast path,
+    /// deletes, no excludes, lazy diff, not a dry run. A parallel session
+    /// needs `parallel` and `connect_worker` set together.
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            force_checksum: false,
+            no_delete: false,
+            excludes: Vec::new(),
+            parallel: 1,
+            dry_run: false,
+            eager: false,
+            connect_worker: std::sync::Arc::new(|_| Err(no_worker_hook())),
+        }
+    }
+}
+
+impl TreeReceiveRequest {
+    /// A request to converge the tree at `root` toward the sender's. Every
+    /// option starts off: no excludes, no eager opt-in, not a dry run. Set
+    /// `accept_worker` to serve parallel sessions; without it, a sender's
+    /// parallel session fails loudly.
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            force_checksum: false,
+            no_delete: false,
+            excludes: Vec::new(),
+            accept_worker: std::sync::Arc::new(|| Err(no_worker_hook())),
+            dry_run: false,
+            eager: false,
+        }
+    }
+}
+
 /// Object-safe read+write stream (worker connections come back as these).
 /// `Send` because each worker connection lives on its own thread.
 pub trait ReadWrite: Read + Write + Send {}
@@ -148,6 +206,7 @@ impl<T: Read + Write + Send> ReadWrite for T {}
 
 /// Outcome of a completed tree session.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TreeOutcome {
     /// Per-file outcomes in conversation order.
     pub files: usize,

@@ -1098,16 +1098,13 @@ fn run_hostile_session(
             let worker_shared = shared.clone();
             tree_receive(
                 &mut tcp,
-                &TreeReceiveRequest {
-                    root,
-                    force_checksum: false,
-                    no_delete,
-                    excludes: Vec::new(),
-                    accept_worker: Arc::new(move || {
-                        Ok(Box::new(accept_one(&listener, &worker_shared)?))
-                    }),
-                    dry_run: false,
-                    eager,
+                &{
+                    let mut rq = TreeReceiveRequest::new(root);
+                    rq.no_delete = no_delete;
+                    rq.accept_worker =
+                        Arc::new(move || Ok(Box::new(accept_one(&listener, &worker_shared)?)));
+                    rq.eager = eager;
+                    rq
                 },
                 &PipelineConfig::default(),
                 &mut |_| {},
@@ -1127,15 +1124,13 @@ fn run_hostile_session(
             let worker_shared = shared.clone();
             tree_send(
                 &mut control,
-                &TreeSendRequest {
-                    root,
-                    force_checksum: false,
-                    no_delete,
-                    excludes: Vec::new(),
-                    parallel,
-                    dry_run: false,
-                    eager,
-                    connect_worker: Arc::new(move |_| Ok(Box::new(connect(&worker_shared)?))),
+                &{
+                    let mut rq = TreeSendRequest::new(root);
+                    rq.no_delete = no_delete;
+                    rq.parallel = parallel;
+                    rq.eager = eager;
+                    rq.connect_worker = Arc::new(move |_| Ok(Box::new(connect(&worker_shared)?)));
+                    rq
                 },
                 &PipelineConfig::default(),
                 &mut |_| {},

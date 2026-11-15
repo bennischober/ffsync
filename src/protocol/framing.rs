@@ -75,7 +75,7 @@ impl Frame {
 
     /// Encodes the frame into `out`.
     ///
-    /// A frame up to [`COALESCE_LIMIT`] payload bytes goes out as ONE
+    /// A frame up to `COALESCE_LIMIT` (64 KiB) payload bytes goes out as ONE
     /// `write_all` (header and payload together): on an unbuffered stream
     /// three writes per frame meant three syscalls, three TLS records and —
     /// with `TCP_NODELAY` — up to three segments for a 49-byte manifest

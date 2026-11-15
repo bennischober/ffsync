@@ -131,7 +131,7 @@ length-prefixed, no protobuf.
 | rsync (comparison only) | Baseline | The tool this project is measured against, and its delta algorithm is respected, not wrapped |
 
 Design decisions and their alternatives are recorded in
-[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1–D24).
+[`concept/Design Decisions.md`](concept/Design%20Decisions.md) (D1–D25).
 
 ## Using it
 
@@ -315,6 +315,15 @@ with bytes, throughput, and elapsed time per phase. A scan-bound sync says so
 instead of being silently disk-busy/network-idle — that silence in rsync is
 why this project exists.
 
+### As a library
+
+The crate is also a library: the same sync engine runs over any
+`Read + Write` stream (`ffsync::protocol::sync::{send, receive}` for one
+file, `ffsync::protocol::tree_sync::{tree_send, tree_receive}` for a tree).
+The [crate docs](https://docs.rs/ffsync) have a runnable example. Semantic
+Versioning covers the library API as well as the CLI; the protocol version
+alone decides which peers can sync (D25).
+
 ## Benchmark
 
 32 MiB fixtures, seeded pseudo-random data, release build, all reconstructions
@@ -406,7 +415,7 @@ The reasoning is the product; it is all recorded:
 
 - [`concept/Positioning.md`](concept/Positioning.md) — why this exists, the
   niche, why "build around rsync" does not work
-- [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D24 with
+- [`concept/Design Decisions.md`](concept/Design%20Decisions.md) — D1–D25 with
   alternatives and rejected options
 - [`concept/Protocol.md`](concept/Protocol.md) — the wire protocol
   (tracks all versions; currently v4), frame by frame

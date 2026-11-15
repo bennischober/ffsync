@@ -269,6 +269,13 @@ pre-existing.
   compatibility check. A `VERSION` bump is a major release too. Never
   compare release versions between peers; the release may appear only in
   human-readable text, such as the ERROR(Version) message.
+  The session API is `#[non_exhaustive]` (2.0.0) so it can grow in
+  minor releases: requests are built with `X::new(required)` plus field
+  assignments, and every option's default is "off". A new public type
+  that callers build or match on follows the same pattern; wire message
+  structs (`message::*`) stay exhaustive (a new field there is a wire
+  change). The bins and `tests/` are external crates, so their matches
+  on these enums need `_` arms.
 - Doc comments (`///`) on public traits, structs, and functions.
 - Swappable behavior goes behind traits (`Chunker`, `Hasher`, `FileExt`); add
   new strategies as implementations instead of hardcoding or adding enums with
