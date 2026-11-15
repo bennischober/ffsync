@@ -1506,20 +1506,18 @@ fn run_one_latency_session(
         // call and deadlock the accept closure).
         let mut control_end =
             ffsync::protocol::BufStream::new(receiver_ends.lock().unwrap().remove(0));
+        let mut request = TreeReceiveRequest::new(recv_root2);
+        request.accept_worker = {
+            let ends = std::sync::Arc::clone(&receiver_ends);
+            std::sync::Arc::new(move || {
+                Ok(Box::new(ffsync::protocol::BufStream::new(
+                    ends.lock().unwrap().remove(0),
+                )) as Box<dyn ReadWrite>)
+            })
+        };
         tree_receive(
             &mut control_end,
-            &{
-let mut rq = TreeReceiveRequest::new(recv_root2);
-rq.accept_worker = {
-                    let ends = std::sync::Arc::clone(&receiver_ends);
-                    std::sync::Arc::new(move || {
-                        Ok(Box::new(ffsync::protocol::BufStream::new(
-                            ends.lock().unwrap().remove(0),
-                        )) as Box<dyn ReadWrite>)
-                    })
-                };
-rq
-},
+            &request,
             &PipelineConfig::default(),
             &mut |_p| {},
         )

@@ -1805,14 +1805,12 @@ proptest! {
             shared,
             move |accept| {
                 let mut conn = accept().map_err(|e| format!("accept: {e}"))?;
+                let mut request = ReceiveRequest::new(rp.clone(), rp);
+                request.force_checksum = checksum;
+                request.eager = eager;
                 receive(
                     &mut conn,
-                    &{
-let mut rq = ReceiveRequest::new(rp.clone(), rp);
-rq.force_checksum = checksum;
-rq.eager = eager;
-rq
-},
+                    &request,
                     &PipelineConfig::default(),
                     &mut |_| {},
                 )
@@ -1820,15 +1818,13 @@ rq
             },
             move |connect| {
                 let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+                let mut request = SendRequest::new(sp, "f".into());
+                request.force_checksum = checksum;
+                request.eager = eager;
+                request.dry_run = dry_run;
                 send(
                     &mut conn,
-                    &{
-let mut rq = SendRequest::new(sp, "f".into());
-rq.force_checksum = checksum;
-rq.eager = eager;
-rq.dry_run = dry_run;
-rq
-},
+                    &request,
                     &PipelineConfig::default(),
                     &mut |_| {},
                 )
