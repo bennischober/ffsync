@@ -1460,14 +1460,14 @@ fn run_tree_session(
             let mut control = accept().map_err(|e| format!("accept: {e}"))?;
             tree_receive(
                 &mut control,
-                &TreeReceiveRequest {
-                    root: r,
-                    force_checksum: k.checksum,
-                    no_delete: k.no_delete,
-                    excludes: Vec::new(),
-                    accept_worker: Arc::new(move || Ok(Box::new(accept()?) as Box<dyn ReadWrite>)),
-                    dry_run: false,
-                    eager: k.eager,
+                &{
+                    let mut rq = TreeReceiveRequest::new(r);
+                    rq.force_checksum = k.checksum;
+                    rq.no_delete = k.no_delete;
+                    rq.accept_worker =
+                        Arc::new(move || Ok(Box::new(accept()?) as Box<dyn ReadWrite>));
+                    rq.eager = k.eager;
+                    rq
                 },
                 &PipelineConfig::default(),
                 &mut |_| {},
@@ -1478,15 +1478,15 @@ fn run_tree_session(
             let mut control = connect().map_err(|e| format!("connect: {e}"))?;
             tree_send(
                 &mut control,
-                &TreeSendRequest {
-                    root: s,
-                    force_checksum: k.checksum,
-                    no_delete: k.no_delete,
-                    excludes: Vec::new(),
-                    parallel: k.parallel,
-                    dry_run: k.dry_run,
-                    eager: k.eager,
-                    connect_worker: Arc::new(move |_| Ok(Box::new(connect()?))),
+                &{
+                    let mut rq = TreeSendRequest::new(s);
+                    rq.force_checksum = k.checksum;
+                    rq.no_delete = k.no_delete;
+                    rq.parallel = k.parallel;
+                    rq.dry_run = k.dry_run;
+                    rq.eager = k.eager;
+                    rq.connect_worker = Arc::new(move |_| Ok(Box::new(connect()?)));
+                    rq
                 },
                 &PipelineConfig::default(),
                 &mut |_| {},
@@ -1807,17 +1807,12 @@ proptest! {
                 let mut conn = accept().map_err(|e| format!("accept: {e}"))?;
                 receive(
                     &mut conn,
-                    &ReceiveRequest {
-                        path: rp.clone(),
-                        local_source: rp,
-                        force_checksum: checksum,
-                        tree: false,
-                        apply_mtime: None,
-                        apply_mode: None,
-                        eager,
-                        extra_sources: Vec::new(),
-                        expect_peer_path: None,
-                    },
+                    &{
+let mut rq = ReceiveRequest::new(rp.clone(), rp);
+rq.force_checksum = checksum;
+rq.eager = eager;
+rq
+},
                     &PipelineConfig::default(),
                     &mut |_| {},
                 )
@@ -1827,15 +1822,13 @@ proptest! {
                 let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
                 send(
                     &mut conn,
-                    &SendRequest {
-                        path: sp,
-                        display_path: "f".into(),
-                        mtime: None,
-                        force_checksum: checksum,
-                        eager,
-                        dry_run,
-                        tree: false,
-                    },
+                    &{
+let mut rq = SendRequest::new(sp, "f".into());
+rq.force_checksum = checksum;
+rq.eager = eager;
+rq.dry_run = dry_run;
+rq
+},
                     &PipelineConfig::default(),
                     &mut |_| {},
                 )

@@ -7,6 +7,8 @@ All notable changes to ffsync are documented here. The format follows [Keep a Ch
 ### Changed
 
 - **Breaking for library users, so the next release is 2.0.0.** `ReceiveRequest` has a new public field, `expect_peer_path`; code that builds it with a struct literal must add `expect_peer_path: None` for the old behavior. The CLI and the wire are unchanged: the next release still speaks protocol 4 and syncs with every 1.x peer. The versioning policy behind this is recorded as D25 in `concept/Design Decisions.md`: the release version covers the CLI, the library and on-disk state; the protocol version alone decides which peers can sync.
+- **Library: the session types can grow without another major release.** `SendRequest`, `ReceiveRequest`, `TreeSendRequest`, `TreeReceiveRequest`, `TreeOutcome` and `PipelineConfig` are `#[non_exhaustive]`, and so are the enums `SyncError`, `SyncOutcome`, `Progress` and `TreeProgress`. Build a request with its new constructor (`SendRequest::new(path, display_path)`, `ReceiveRequest::new(path, local_source)`, `TreeSendRequest::new(root)`, `TreeReceiveRequest::new(root)`; `PipelineConfig::default()`), then set the options you need on the public fields. Every option starts off. Matches on the enums need a `_` arm. After this, a new option or event is a minor release.
+- Library: the deprecated `PipelineConfig::read_buffer_size` is removed. It has been ignored since 1.4.0; the region size is the protocol constant `chunking::REGION_SIZE`.
 - `ffsync --version` also prints the protocol version (`ffsync 1.4.0 (protocol 4)`). Peers sync when their protocol numbers match. When a peer is rejected for its protocol version, the error text now names the rejecting side's release, so it is clear which machine to upgrade.
 
 ### Fixed

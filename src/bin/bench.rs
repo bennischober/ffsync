@@ -1508,22 +1508,18 @@ fn run_one_latency_session(
             ffsync::protocol::BufStream::new(receiver_ends.lock().unwrap().remove(0));
         tree_receive(
             &mut control_end,
-            &TreeReceiveRequest {
-                root: recv_root2,
-                force_checksum: false,
-                no_delete: false,
-                excludes: Vec::new(),
-                accept_worker: {
+            &{
+let mut rq = TreeReceiveRequest::new(recv_root2);
+rq.accept_worker = {
                     let ends = std::sync::Arc::clone(&receiver_ends);
                     std::sync::Arc::new(move || {
                         Ok(Box::new(ffsync::protocol::BufStream::new(
                             ends.lock().unwrap().remove(0),
                         )) as Box<dyn ReadWrite>)
                     })
-                },
-                dry_run: false,
-                eager: false,
-            },
+                };
+rq
+},
             &PipelineConfig::default(),
             &mut |_p| {},
         )
@@ -1532,22 +1528,18 @@ fn run_one_latency_session(
     let t = Instant::now();
     let send_res = tree_send(
         &mut ffsync::protocol::BufStream::new(sender_ends.remove(0)),
-        &TreeSendRequest {
-            root: send_root,
-            force_checksum: false,
-            no_delete: false,
-            excludes: Vec::new(),
-            parallel,
-            dry_run: false,
-            eager: false,
-            connect_worker: {
+        &{
+            let mut rq = TreeSendRequest::new(send_root);
+            rq.parallel = parallel;
+            rq.connect_worker = {
                 let ends = std::sync::Mutex::new(sender_ends);
                 std::sync::Arc::new(move |_| {
                     Ok(Box::new(ffsync::protocol::BufStream::new(
                         ends.lock().unwrap().remove(0),
                     )) as Box<dyn ReadWrite>)
                 })
-            },
+            };
+            rq
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -1696,16 +1688,10 @@ fn run_one_eager_session(
     let target_cleanup = target.clone();
     let recv_thread = std::thread::spawn(
         move || -> Result<SyncOutcome, ffsync::protocol::sync::SyncError> {
-            let request = ReceiveRequest {
-                path: target_r.clone(),
-                local_source: target_r.clone(),
-                force_checksum: false,
-                tree: false,
-                eager,
-                apply_mode: None,
-                apply_mtime: None,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            let request = {
+                let mut rq = ReceiveRequest::new(target_r.clone(), target_r.clone());
+                rq.eager = eager;
+                rq
             };
             receive(
                 &mut r_end,
@@ -1717,14 +1703,10 @@ fn run_one_eager_session(
     );
 
     let t = Instant::now();
-    let send_req = SendRequest {
-        path: variant_p,
-        display_path: "eager_sim.bin".into(),
-        mtime: None,
-        force_checksum: false,
-        tree: false,
-        eager,
-        dry_run: false,
+    let send_req = {
+        let mut rq = SendRequest::new(variant_p, "eager_sim.bin".into());
+        rq.eager = eager;
+        rq
     };
     let send_res = send(
         &mut s_end,
@@ -1736,8 +1718,8 @@ fn run_one_eager_session(
     let elapsed = t.elapsed();
     let bytes = match send_res {
         SyncOutcome::Transferred { bytes, .. } => bytes,
-        SyncOutcome::InSync => 0,
-        SyncOutcome::WouldChange => 0,
+        // InSync, WouldChange: nothing moved.
+        _ => 0,
     };
     recv_thread
         .join()

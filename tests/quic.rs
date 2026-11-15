@@ -154,14 +154,10 @@ fn run_send_over(
     let path = dir.join("data.bin");
     fs::write(&path, vec![1u8; 256 * 1024]).unwrap();
 
-    let req = SendRequest {
-        path: path.clone(),
-        display_path: "data.bin".into(),
-        mtime: None,
-        force_checksum: true,
-        tree: false,
-        dry_run: false,
-        eager: false,
+    let req = {
+        let mut rq = SendRequest::new(path.clone(), "data.bin".into());
+        rq.force_checksum = true;
+        rq
     };
     let pipeline = PipelineConfig::default();
     let out = send(stream, &req, &pipeline, &mut |_p| {});
@@ -181,16 +177,10 @@ fn run_receive_over(
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("data.bin");
-    let req = ReceiveRequest {
-        path: path.clone(),
-        local_source: path.clone(),
-        force_checksum: true,
-        tree: false,
-        apply_mode: None,
-        apply_mtime: None,
-        eager: false,
-        extra_sources: Vec::new(),
-        expect_peer_path: None,
+    let req = {
+        let mut rq = ReceiveRequest::new(path.clone(), path.clone());
+        rq.force_checksum = true;
+        rq
     };
     let pipeline = PipelineConfig::default();
     let out = receive(stream, &req, &pipeline, &mut |_p| {});
@@ -231,12 +221,11 @@ fn run_tree_session(
             ffsync::transport::quic::server_session(endpoint).unwrap();
         let res = tree_receive(
             &mut control,
-            &TreeReceiveRequest {
-                root: recv_root,
-                force_checksum: checksum,
-                no_delete,
-                excludes: Vec::new(),
-                accept_worker: std::sync::Arc::new({
+            &{
+                let mut rq = TreeReceiveRequest::new(recv_root);
+                rq.force_checksum = checksum;
+                rq.no_delete = no_delete;
+                rq.accept_worker = std::sync::Arc::new({
                     let session = session.clone();
                     move || {
                         let s = session.accept_stream().map_err(|e| {
@@ -244,9 +233,8 @@ fn run_tree_session(
                         })?;
                         Ok(Box::new(s))
                     }
-                }),
-                dry_run: false,
-                eager: false,
+                });
+                rq
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -265,15 +253,12 @@ fn run_tree_session(
     .unwrap();
     let send_res = tree_send(
         &mut control,
-        &TreeSendRequest {
-            root: sender_root.to_path_buf(),
-            force_checksum: checksum,
-            no_delete,
-            excludes: Vec::new(),
-            parallel,
-            dry_run: false,
-            eager: false,
-            connect_worker: std::sync::Arc::new({
+        &{
+            let mut rq = TreeSendRequest::new(sender_root.to_path_buf());
+            rq.force_checksum = checksum;
+            rq.no_delete = no_delete;
+            rq.parallel = parallel;
+            rq.connect_worker = std::sync::Arc::new({
                 let session = session.clone();
                 move |_index: u16| {
                     let s = session
@@ -281,7 +266,8 @@ fn run_tree_session(
                         .map_err(|e| std::io::Error::other(format!("cannot open worker: {e}")))?;
                     Ok(Box::new(s))
                 }
-            }),
+            });
+            rq
         },
         &PipelineConfig::default(),
         &mut |_p| {},

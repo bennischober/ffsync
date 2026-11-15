@@ -146,26 +146,8 @@ fn hundred_sessions_do_not_accumulate_memory() {
         }
         create_file(&source, &data);
 
-        let send_req = SendRequest {
-            path: source.clone(),
-            display_path: "source.bin".into(),
-            mtime: None,
-            force_checksum: false,
-            tree: false,
-            dry_run: false,
-            eager: false,
-        };
-        let recv_req = ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            apply_mode: None,
-            apply_mtime: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        let send_req = SendRequest::new(source.clone(), "source.bin".into());
+        let recv_req = ReceiveRequest::new(target.clone(), target.clone());
         run_session(send_req, recv_req);
 
         assert_eq!(
@@ -238,26 +220,8 @@ fn hundred_sessions_alternating_deltas_and_full_transfers() {
             create_file(&target, &src_data[..256 * 1024]);
         }
 
-        let send_req = SendRequest {
-            path: source.clone(),
-            display_path: "source.bin".into(),
-            mtime: None,
-            force_checksum: false,
-            tree: false,
-            dry_run: false,
-            eager: false,
-        };
-        let recv_req = ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            apply_mode: None,
-            apply_mtime: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        let send_req = SendRequest::new(source.clone(), "source.bin".into());
+        let recv_req = ReceiveRequest::new(target.clone(), target.clone());
         run_session(send_req, recv_req);
         assert_eq!(read_file(&target), data, "session {i}: no convergence");
     }

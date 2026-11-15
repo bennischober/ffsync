@@ -121,12 +121,12 @@ fn run_tree_session_full(
         tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
         tree_receive(
             &mut &tcp,
-            &TreeReceiveRequest {
-                root: recv_root,
-                force_checksum: checksum,
-                no_delete,
-                excludes: recv_excludes,
-                accept_worker: std::sync::Arc::new(move || {
+            &{
+                let mut rq = TreeReceiveRequest::new(recv_root);
+                rq.force_checksum = checksum;
+                rq.no_delete = no_delete;
+                rq.excludes = recv_excludes;
+                rq.accept_worker = std::sync::Arc::new(move || {
                     let (tcp, _wpeer) = listener2
                         .accept()
                         .map_err(|e| std::io::Error::other(format!("cannot accept worker: {e}")))?;
@@ -134,9 +134,10 @@ fn run_tree_session_full(
                     tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
                     tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
                     Ok(Box::new(tcp))
-                }),
-                dry_run,
-                eager,
+                });
+                rq.dry_run = dry_run;
+                rq.eager = eager;
+                rq
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -151,22 +152,23 @@ fn run_tree_session_full(
     let send_excludes: Vec<String> = sender_excludes.iter().map(|s| s.to_string()).collect();
     let send_res = tree_send(
         &mut &tcp,
-        &TreeSendRequest {
-            root: sender_root.to_path_buf(),
-            force_checksum: checksum,
-            no_delete,
-            excludes: send_excludes,
-            parallel,
-            dry_run,
-            eager,
-            connect_worker: std::sync::Arc::new(move |_index: u16| {
+        &{
+            let mut rq = TreeSendRequest::new(sender_root.to_path_buf());
+            rq.force_checksum = checksum;
+            rq.no_delete = no_delete;
+            rq.excludes = send_excludes;
+            rq.parallel = parallel;
+            rq.dry_run = dry_run;
+            rq.eager = eager;
+            rq.connect_worker = std::sync::Arc::new(move |_index: u16| {
                 let tcp = std::net::TcpStream::connect(send_addr)
                     .map_err(|e| std::io::Error::other(format!("cannot connect worker: {e}")))?;
                 tcp.set_nodelay(true).ok();
                 tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
                 tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
                 Ok(Box::new(tcp))
-            }),
+            });
+            rq
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -375,17 +377,10 @@ fn tree_v2_flow_rejects_tree_frames() {
         let (tcp, _peer) = listener.accept().unwrap();
         tcp.set_nodelay(true).ok();
         tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
-        let req = ffsync::protocol::sync::ReceiveRequest {
-            path: recv_root.join("a.bin"),
-            local_source: recv_root.join("a.bin"),
-            force_checksum: false,
-            tree: false,
-            apply_mode: None,
-            apply_mtime: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        let req = ffsync::protocol::sync::ReceiveRequest::new(
+            recv_root.join("a.bin"),
+            recv_root.join("a.bin"),
+        );
         ffsync::protocol::sync::receive(&mut &tcp, &req, &PipelineConfig::default(), &mut |_p| {})
     });
 
@@ -394,17 +389,12 @@ fn tree_v2_flow_rejects_tree_frames() {
     tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
     let send_res = tree_send(
         &mut &tcp,
-        &TreeSendRequest {
-            root: sender.path().to_path_buf(),
-            force_checksum: false,
-            no_delete: false,
-            excludes: Vec::new(),
-            parallel: 1,
-            eager: false,
-            connect_worker: std::sync::Arc::new(|_| {
+        &{
+            let mut rq = TreeSendRequest::new(sender.path().to_path_buf());
+            rq.connect_worker = std::sync::Arc::new(|_| {
                 Err(std::io::Error::other("no workers in sequential sessions"))
-            }),
-            dry_run: false,
+            });
+            rq
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -475,16 +465,12 @@ fn sender_vanished_file_fails_loudly() {
         tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
         tree_receive(
             &mut &tcp,
-            &TreeReceiveRequest {
-                root: recv_root,
-                force_checksum: false,
-                no_delete: false,
-                excludes: Vec::new(),
-                accept_worker: std::sync::Arc::new(|| {
+            &{
+                let mut rq = TreeReceiveRequest::new(recv_root);
+                rq.accept_worker = std::sync::Arc::new(|| {
                     Err(std::io::Error::other("no workers in sequential sessions"))
-                }),
-                dry_run: false,
-                eager: false,
+                });
+                rq
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -506,17 +492,12 @@ fn sender_vanished_file_fails_loudly() {
 
     let send_res = tree_send(
         &mut &tcp,
-        &TreeSendRequest {
-            root: sender.path().to_path_buf(),
-            force_checksum: false,
-            no_delete: false,
-            excludes: Vec::new(),
-            parallel: 1,
-            eager: false,
-            connect_worker: std::sync::Arc::new(|_| {
+        &{
+            let mut rq = TreeSendRequest::new(sender.path().to_path_buf());
+            rq.connect_worker = std::sync::Arc::new(|_| {
                 Err(std::io::Error::other("no workers in sequential sessions"))
-            }),
-            dry_run: false,
+            });
+            rq
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -753,17 +734,13 @@ fn tree_parallel_sequential_fallback_interops() {
         tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
         tree_receive(
             &mut &tcp,
-            &TreeReceiveRequest {
-                root: recv_root,
-                force_checksum: false,
-                no_delete: false,
-                excludes: Vec::new(),
-                accept_worker: std::sync::Arc::new(move || {
+            &{
+                let mut rq = TreeReceiveRequest::new(recv_root);
+                rq.accept_worker = std::sync::Arc::new(move || {
                     // Sequential receiver: refuses extra connections.
                     Err(std::io::Error::other("no worker connections accepted"))
-                }),
-                dry_run: false,
-                eager: false,
+                });
+                rq
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -776,19 +753,15 @@ fn tree_parallel_sequential_fallback_interops() {
     let send_addr = addr;
     let send_res = tree_send(
         &mut &tcp,
-        &TreeSendRequest {
-            root: sender.path().to_path_buf(),
-            force_checksum: false,
-            no_delete: false,
-            excludes: Vec::new(),
-            parallel: 4,
-            eager: false,
-            connect_worker: std::sync::Arc::new(move |_index: u16| {
+        &{
+            let mut rq = TreeSendRequest::new(sender.path().to_path_buf());
+            rq.parallel = 4;
+            rq.connect_worker = std::sync::Arc::new(move |_index: u16| {
                 std::net::TcpStream::connect(send_addr)
                     .map(|t| Box::new(t) as Box<dyn ffsync::protocol::tree_sync::ReadWrite>)
                     .map_err(std::io::Error::other)
-            }),
-            dry_run: false,
+            });
+            rq
         },
         &PipelineConfig::default(),
         &mut |_p| {},
@@ -1668,14 +1641,10 @@ fn tree_receiver_refuses_a_manifest_with_an_entry_under_a_file() {
         tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
         tree_receive(
             &mut &tcp,
-            &TreeReceiveRequest {
-                root,
-                force_checksum: false,
-                no_delete: false,
-                excludes: Vec::new(),
-                accept_worker: std::sync::Arc::new(|| Err(std::io::Error::other("no workers"))),
-                dry_run: false,
-                eager: false,
+            &{
+                let mut rq = TreeReceiveRequest::new(root);
+                rq.accept_worker = std::sync::Arc::new(|| Err(std::io::Error::other("no workers")));
+                rq
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -1722,14 +1691,10 @@ fn hostile_tree_begin(
         tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
         tree_receive(
             &mut &tcp,
-            &TreeReceiveRequest {
-                root,
-                force_checksum: false,
-                no_delete: false,
-                excludes: Vec::new(),
-                accept_worker: std::sync::Arc::new(|| Err(std::io::Error::other("no workers"))),
-                dry_run: false,
-                eager: false,
+            &{
+                let mut rq = TreeReceiveRequest::new(root);
+                rq.accept_worker = std::sync::Arc::new(|| Err(std::io::Error::other("no workers")));
+                rq
             },
             &PipelineConfig::default(),
             &mut |_p| {},
@@ -1772,14 +1737,10 @@ fn tree_receiver_refuses_hello_for_another_path() {
         tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
         tree_receive(
             &mut &tcp,
-            &TreeReceiveRequest {
-                root,
-                force_checksum: false,
-                no_delete: false,
-                excludes: Vec::new(),
-                accept_worker: std::sync::Arc::new(|| Err(std::io::Error::other("no workers"))),
-                dry_run: false,
-                eager: false,
+            &{
+                let mut rq = TreeReceiveRequest::new(root);
+                rq.accept_worker = std::sync::Arc::new(|| Err(std::io::Error::other("no workers")));
+                rq
             },
             &PipelineConfig::default(),
             &mut |_p| {},

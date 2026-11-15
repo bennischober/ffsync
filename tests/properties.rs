@@ -533,18 +533,16 @@ fn run_session(
         timeouts(&tcp);
         tree_receive(
             &mut &tcp,
-            &TreeReceiveRequest {
-                root: recv_root,
-                force_checksum: false,
-                no_delete,
-                excludes: Vec::new(),
-                accept_worker: std::sync::Arc::new(move || {
+            &{
+                let mut rq = TreeReceiveRequest::new(recv_root);
+                rq.no_delete = no_delete;
+                rq.accept_worker = std::sync::Arc::new(move || {
                     let (tcp, _) = listener2.accept()?;
                     timeouts(&tcp);
                     Ok(Box::new(tcp))
-                }),
-                dry_run: false,
-                eager,
+                });
+                rq.eager = eager;
+                rq
             },
             &PipelineConfig::default(),
             &mut |_| {},
@@ -554,19 +552,17 @@ fn run_session(
     timeouts(&tcp);
     let send = tree_send(
         &mut &tcp,
-        &TreeSendRequest {
-            root: sender_root.to_path_buf(),
-            force_checksum: false,
-            no_delete,
-            excludes: Vec::new(),
-            parallel,
-            dry_run: false,
-            eager,
-            connect_worker: std::sync::Arc::new(move |_| {
+        &{
+            let mut rq = TreeSendRequest::new(sender_root.to_path_buf());
+            rq.no_delete = no_delete;
+            rq.parallel = parallel;
+            rq.eager = eager;
+            rq.connect_worker = std::sync::Arc::new(move |_| {
                 let tcp = std::net::TcpStream::connect(addr)?;
                 timeouts(&tcp);
                 Ok(Box::new(tcp))
-            }),
+            });
+            rq
         },
         &PipelineConfig::default(),
         &mut |_| {},
@@ -1138,10 +1134,8 @@ fn scan_bytes(
 ) -> Vec<Chunk> {
     let path = dir.join(name);
     fs::write(&path, bytes).unwrap();
-    let config = PipelineConfig {
-        hash_workers: workers,
-        ..PipelineConfig::default()
-    };
+    let mut config = PipelineConfig::default();
+    config.hash_workers = workers;
     let (hashed, chunks) = scan_file_ordered(&path, &config, cdc).unwrap();
     assert_eq!(hashed, bytes.len() as u64);
     chunks

@@ -199,25 +199,15 @@ mod tests {
         create_file(&target, &old_data);
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true, // keep the test deterministic
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true; // keep the test deterministic
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq
             },
         );
 
@@ -245,26 +235,9 @@ mod tests {
         let target = fx.path("target.bin");
         create_file(&target, &src_data[..1024 * 1024]);
 
-        let mk_send = || SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "source.bin".into(),
-            mtime: None,
-            force_checksum: false, // warm start needs the default mode
-            tree: false,
-            dry_run: false,
-            eager: false,
-        };
-        let mk_recv = || ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            apply_mode: None,
-            apply_mtime: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        // Warm start needs the default mode (no --checksum).
+        let mk_send = || SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+        let mk_recv = || ReceiveRequest::new(target.clone(), target.clone());
 
         // Sync 1 (cold): full scan both sides, index files written at commit.
         let (s1, r1) = run_sync(mk_send(), mk_recv());
@@ -374,26 +347,8 @@ mod tests {
         // the sender's lying index must be invalidated so the retry
         // cold-scans and succeeds (no poison loop).
         let (s1, r1) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
         assert!(
             matches!(&s1, Err(SyncError::Peer(code, _)) if *code == ErrorCode::HashMismatch),
@@ -407,26 +362,8 @@ mod tests {
 
         // Attempt 2: cold scan on both sides; must converge.
         let (s2, r2) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
         s2.expect("attempt 2 sender converges");
         r2.expect("attempt 2 receiver converges");
@@ -450,25 +387,15 @@ mod tests {
         std::fs::write(&orphan_index, vec![0u8; 64]).unwrap();
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq
             },
         );
         s.expect("sender ok");
@@ -489,25 +416,15 @@ mod tests {
         create_file(&target, &data);
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq
             },
         );
 
@@ -535,26 +452,8 @@ mod tests {
         create_file(&target, &receiver_data);
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
 
         let s = s.expect("sender ok");
@@ -581,25 +480,15 @@ mod tests {
         let target = fx.path("target.bin");
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(), // does not exist yet
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq
             },
         );
 
@@ -701,25 +590,15 @@ mod tests {
 
         // Attempt 1: crash the sender after ~64 KiB of DATA.
         let (s1, r1) = run_sync_resumable(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq
             },
             64 * 1024,
         );
@@ -732,25 +611,15 @@ mod tests {
 
         // Attempt 2: reconnect. The receiver now unions temp + old file.
         let (s2, r2) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq
             },
         );
         let _ = s2.expect("resumed sender ok");
@@ -788,25 +657,17 @@ mod tests {
         for eager in [false, true] {
             create_file(&target, &old_data);
 
-            let send_req = SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager,
+            let send_req = {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq.eager = eager;
+                rq
             };
-            let recv_req = ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            let recv_req = {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq.eager = eager;
+                rq
             };
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -867,25 +728,17 @@ mod tests {
         // The kill counter counts eager DATA too (it rides the Transferring
         // progress), so the crash lands mid-manifest or mid-data — both fine.
         let (s1, r1) = run_sync_resumable(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: true,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq.eager = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: true,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq.eager = true;
+                rq
             },
             64 * 1024,
         );
@@ -901,25 +754,17 @@ mod tests {
 
         // Attempt 2: reconnect, eager again.
         let (s2, r2) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: true,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq.eager = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: true,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq.eager = true;
+                rq
             },
         );
         let _ = s2.expect("resumed eager sender ok");
@@ -1003,25 +848,18 @@ mod tests {
                         .unwrap();
                 }
             }
-            let send_req = SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: trust.then_some(t),
-                force_checksum: !trust,
-                tree: false,
-                dry_run: false,
-                eager,
+            let send_req = {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.mtime = trust.then_some(t);
+                rq.force_checksum = !trust;
+                rq.eager = eager;
+                rq
             };
-            let recv_req = ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: !trust,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            let recv_req = {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = !trust;
+                rq.eager = eager;
+                rq
             };
             let writes = Arc::new(AtomicUsize::new(0));
             let recv_writes = Arc::clone(&writes);
@@ -1094,26 +932,12 @@ mod tests {
         filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(t)).unwrap();
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: Some(t),
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.mtime = Some(t);
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
 
         assert!(matches!(s.unwrap(), SyncOutcome::InSync));
@@ -1194,17 +1018,7 @@ mod tests {
 
         let (sock, _) = listener.accept().unwrap();
         let mut sock = sock;
-        let request = ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            apply_mode: None,
-            apply_mtime: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        let request = ReceiveRequest::new(target.clone(), target.clone());
         let pipeline = PipelineConfig::default();
         let mut progress = |_p: Progress| {};
         let r = receive(&mut sock, &request, &pipeline, &mut progress);
@@ -1239,25 +1053,15 @@ mod tests {
         // is Local, and the target is still rewritten from from.bin (the
         // from-file matching the sender says nothing about the target).
         let (s, r) = run_sync(
-            SendRequest {
-                path: from_file.clone(),
-                display_path: "from.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(from_file.clone(), "from.bin".into());
+                rq.force_checksum = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: from_file.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), from_file.clone());
+                rq.force_checksum = true;
+                rq
             },
         );
         let _s = s.expect("sender ok");
@@ -1323,25 +1127,15 @@ mod tests {
         }
         create_file(fx.source(), &new_data);
 
-        let mk_send = || SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "new.bin".into(),
-            mtime: None,
-            force_checksum: true, // deterministic; also defeats the fast path
-            tree: false,
-            dry_run: false,
-            eager: false,
+        let mk_send = || {
+            let mut rq = SendRequest::new(fx.source().to_path_buf(), "new.bin".into());
+            rq.force_checksum = true; // deterministic; also defeats the fast path
+            rq
         };
-        let mk_recv = || ReceiveRequest {
-            path: fx.path("target.bin"),
-            local_source: from_file.clone(),
-            force_checksum: true,
-            tree: false,
-            apply_mode: None,
-            apply_mtime: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
+        let mk_recv = || {
+            let mut rq = ReceiveRequest::new(fx.path("target.bin"), from_file.clone());
+            rq.force_checksum = true;
+            rq
         };
 
         // Sync 1: converges via the from-file's chunks (mostly Local).
@@ -1410,26 +1204,8 @@ mod tests {
         // Sender's source == old file content now (no changes), so the sync
         // is InSync relative to the from-file — the warm start still ran.
         let (_s2_events, r2_events) = run_sync_recording(
-            SendRequest {
-                path: from_file.clone(),
-                display_path: "from.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: fx.path("target.bin"),
-                local_source: from_file.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(from_file.clone(), "from.bin".into()),
+            ReceiveRequest::new(fx.path("target.bin"), from_file.clone()),
         );
         assert!(
             r2_events
@@ -1500,26 +1276,8 @@ mod tests {
         let target = fx.path("target.bin");
         create_file(&target, &src_data[..1024 * 1024]);
 
-        let mk_send = || SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "source.bin".into(),
-            mtime: None,
-            force_checksum: false,
-            tree: false,
-            dry_run: false,
-            eager: false,
-        };
-        let mk_recv = || ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            apply_mode: None,
-            apply_mtime: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        let mk_send = || SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+        let mk_recv = || ReceiveRequest::new(target.clone(), target.clone());
 
         // Sync 1: converges; both indexes record the small-file parameters.
         let (s1, r1) = run_sync(mk_send(), mk_recv());
@@ -1584,26 +1342,8 @@ mod tests {
         create_file(&target, Vec::new().as_slice());
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
         s.expect("sender ok");
         r.expect("receiver ok");
@@ -1655,26 +1395,8 @@ mod tests {
 
         // The sync still works (cold scan) and rewrites the index as v2.
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
         s.expect("sender ok");
         r.expect("receiver ok");
@@ -1723,26 +1445,8 @@ mod tests {
         std::fs::copy(&target, &temp_path).unwrap();
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
         let s = s.expect("sender ok");
         let r = r.expect("receiver ok");
@@ -1798,26 +1502,8 @@ mod tests {
         create_file(&temp_path, &body);
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
         let s = s.expect("sender ok");
         let r = r.expect("receiver ok");
@@ -1881,25 +1567,16 @@ mod tests {
                 }
 
                 let (s, r) = run_sync(
-                    SendRequest {
-                        path: fx.source().to_path_buf(),
-                        display_path: "source.bin".into(),
-                        mtime: None,
-                        force_checksum: checksum,
-                        tree: false,
-                        dry_run: false,
-                        eager: false,
+                    {
+                        let mut rq =
+                            SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                        rq.force_checksum = checksum;
+                        rq
                     },
-                    ReceiveRequest {
-                        path: target.clone(),
-                        local_source: from_file.clone(),
-                        force_checksum: checksum,
-                        tree: false,
-                        apply_mode: None,
-                        apply_mtime: None,
-                        eager: false,
-                        extra_sources: Vec::new(),
-                        expect_peer_path: None,
+                    {
+                        let mut rq = ReceiveRequest::new(target.clone(), from_file.clone());
+                        rq.force_checksum = checksum;
+                        rq
                     },
                 );
                 let s = s.expect("sender ok");
@@ -1927,26 +1604,8 @@ mod tests {
         create_file(&target, &vec![0x77u8; 100 * 1024]);
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: false,
-                tree: false,
-                dry_run: false,
-                eager: false,
-            },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: false,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
-            },
+            SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+            ReceiveRequest::new(target.clone(), target.clone()),
         );
         let s = s.expect("sender ok");
         let r = r.expect("receiver ok");
@@ -2005,26 +1664,8 @@ mod tests {
             create_file(&temp_path, &data);
 
             let (s, r) = run_sync(
-                SendRequest {
-                    path: fx.source().to_path_buf(),
-                    display_path: "source.bin".into(),
-                    mtime: None,
-                    force_checksum: false,
-                    tree: false,
-                    dry_run: false,
-                    eager: false,
-                },
-                ReceiveRequest {
-                    path: target.clone(),
-                    local_source: target.clone(),
-                    force_checksum: false,
-                    tree: false,
-                    apply_mode: None,
-                    apply_mtime: None,
-                    eager: false,
-                    extra_sources: Vec::new(),
-                    expect_peer_path: None,
-                },
+                SendRequest::new(fx.source().to_path_buf(), "source.bin".into()),
+                ReceiveRequest::new(target.clone(), target.clone()),
             );
             let s = s.expect("sender ok");
             let r = r.expect("receiver ok");
@@ -2060,25 +1701,15 @@ mod tests {
         create_file(&temp_path, &vec![0xA5u8; 1024 * 1024]);
 
         let (s, r) = run_sync(
-            SendRequest {
-                path: fx.source().to_path_buf(),
-                display_path: "source.bin".into(),
-                mtime: None,
-                force_checksum: true,
-                tree: false,
-                dry_run: false,
-                eager: false,
+            {
+                let mut rq = SendRequest::new(fx.source().to_path_buf(), "source.bin".into());
+                rq.force_checksum = true;
+                rq
             },
-            ReceiveRequest {
-                path: target.clone(),
-                local_source: target.clone(),
-                force_checksum: true,
-                tree: false,
-                apply_mode: None,
-                apply_mtime: None,
-                eager: false,
-                extra_sources: Vec::new(),
-                expect_peer_path: None,
+            {
+                let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+                rq.force_checksum = true;
+                rq
             },
         );
         let s = s.expect("sender ok");
@@ -2117,26 +1748,12 @@ mod tests {
         create_file(&target, &old_data);
         let before = std::fs::metadata(&target).unwrap().modified().unwrap();
 
-        let s = SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "src.bin".into(),
-            mtime: None,
-            force_checksum: false,
-            tree: false,
-            dry_run: true,
-            eager: false,
+        let s = {
+            let mut rq = SendRequest::new(fx.source().to_path_buf(), "src.bin".into());
+            rq.dry_run = true;
+            rq
         };
-        let r = ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            apply_mtime: None,
-            apply_mode: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        let r = ReceiveRequest::new(target.clone(), target.clone());
         let (s_out, r_out) = run_sync(s, r);
         assert!(
             matches!(s_out, Ok(SyncOutcome::WouldChange)),
@@ -2168,25 +1785,16 @@ mod tests {
         let target = fx.path("target.bin");
         create_file(&target, &src_data.clone());
 
-        let s = SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "src.bin".into(),
-            mtime: None,
-            force_checksum: true, // defeat the fast path so a plan is built
-            tree: false,
-            dry_run: true,
-            eager: false,
+        let s = {
+            let mut rq = SendRequest::new(fx.source().to_path_buf(), "src.bin".into());
+            rq.force_checksum = true; // defeat the fast path so a plan is built
+            rq.dry_run = true;
+            rq
         };
-        let r = ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: true,
-            tree: false,
-            apply_mtime: None,
-            apply_mode: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
+        let r = {
+            let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+            rq.force_checksum = true;
+            rq
         };
         let (s_out, r_out) = run_sync(s, r);
         assert!(
@@ -2255,25 +1863,16 @@ mod tests {
             pending: Vec::new(),
             types: types.clone(),
         };
-        let s = SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "src.bin".into(),
-            mtime: None,
-            force_checksum: false,
-            tree: false,
-            dry_run: true,
-            eager: true,
+        let s = {
+            let mut rq = SendRequest::new(fx.source().to_path_buf(), "src.bin".into());
+            rq.dry_run = true;
+            rq.eager = true;
+            rq
         };
-        let r = ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            apply_mtime: None,
-            apply_mode: None,
-            eager: true,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
+        let r = {
+            let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+            rq.eager = true;
+            rq
         };
         let s_handle =
             std::thread::spawn(move || send(&mut tap, &s, &PipelineConfig::default(), &mut |_| {}));
@@ -2337,25 +1936,15 @@ mod tests {
         let target = fx.path("target.bin");
         create_file(&target, &old_data);
 
-        let s = SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "src.bin".into(),
-            mtime: None,
-            force_checksum: false,
-            tree: false,
-            eager: true,
-            dry_run: false,
+        let s = {
+            let mut rq = SendRequest::new(fx.source().to_path_buf(), "src.bin".into());
+            rq.eager = true;
+            rq
         };
-        let r = ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            eager: true,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-            apply_mtime: None,
-            apply_mode: None,
+        let r = {
+            let mut rq = ReceiveRequest::new(target.clone(), target.clone());
+            rq.eager = true;
+            rq
         };
         let (s_out, r_out) = run_sync(s, r);
         assert!(
@@ -2382,26 +1971,13 @@ mod tests {
         let target = fx.path("target.bin");
         create_file(&target, &src_data.clone());
 
-        let s = SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "src.bin".into(),
-            mtime: None,
-            force_checksum: false,
-            tree: false,
-            eager: true, // sender offers
-            dry_run: false,
+        let s = {
+            let mut rq = SendRequest::new(fx.source().to_path_buf(), "src.bin".into());
+            rq.eager = true; // sender offers
+            rq
         };
-        let r = ReceiveRequest {
-            path: target.clone(),
-            local_source: target.clone(),
-            force_checksum: false,
-            tree: false,
-            eager: false, // receiver declines
-            apply_mtime: None,
-            apply_mode: None,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        // The receiver declines: eager stays off by default.
+        let r = ReceiveRequest::new(target.clone(), target.clone());
         let (s_out, r_out) = run_sync(s, r);
         match (&s_out, &r_out) {
             // The sender rejects (its own error); the receiver is TOLD why.
@@ -2489,17 +2065,7 @@ mod tests {
             let _ = peer.read_to_end(&mut sink);
             out
         });
-        let req = ReceiveRequest {
-            path: target.clone(),
-            local_source: target,
-            force_checksum: false,
-            tree: false,
-            apply_mtime: None,
-            apply_mode: None,
-            eager: false,
-            extra_sources: Vec::new(),
-            expect_peer_path: None,
-        };
+        let req = ReceiveRequest::new(target.clone(), target);
         let r = receive(
             &mut r_sock,
             &req,
@@ -2558,14 +2124,10 @@ mod tests {
             let mut sink = Vec::new();
             let _ = peer.read_to_end(&mut sink);
         });
-        let req = SendRequest {
-            path: fx.source().to_path_buf(),
-            display_path: "src.bin".into(),
-            mtime: None,
-            force_checksum: true,
-            eager: false,
-            dry_run: false,
-            tree: false,
+        let req = {
+            let mut rq = SendRequest::new(fx.source().to_path_buf(), "src.bin".into());
+            rq.force_checksum = true;
+            rq
         };
         let r = send(
             &mut s_sock,

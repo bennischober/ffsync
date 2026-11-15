@@ -217,6 +217,8 @@ impl ProgressDisplay {
             Progress::Verifying => "verifying comparing final root hash".to_string(),
             Progress::NothingToDo => "up to date".to_string(),
             Progress::CreatedEmpty => "created (empty file)".to_string(),
+            // A newer library event this CLI does not render yet.
+            _ => return,
         };
         // Single-line update via carriage return; final states end with a
         // newline via the caller printing the outcome.
@@ -320,6 +322,7 @@ fn report_outcome(role: &str, outcome: SyncOutcome, display: &mut ProgressDispla
                 fmt_secs(elapsed)
             );
         }
+        _ => println!("{}: done", role),
     }
 }
 
@@ -454,17 +457,17 @@ fn run_send(file: PathBuf, addr: String, opts: CliOptions) -> std::io::Result<()
     let mut stream = buffered(stream);
 
     let display = &mut ProgressDisplay::new();
-    let request = SendRequest {
-        path: file.clone(),
-        display_path: file
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        mtime: None,
-        force_checksum: opts.force_checksum,
-        tree: false,
-        eager,
-        dry_run,
+    let request = {
+        let mut rq = SendRequest::new(
+            file.clone(),
+            file.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+        rq.force_checksum = opts.force_checksum;
+        rq.eager = eager;
+        rq.dry_run = dry_run;
+        rq
     };
     let pipeline = PipelineConfig::default();
     let outcome = match send(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -607,16 +610,11 @@ fn run_receive(
     let mut stream = buffered(stream);
 
     let display = &mut ProgressDisplay::new();
-    let request = ReceiveRequest {
-        path: file.clone(),
-        local_source,
-        force_checksum,
-        tree: false,
-        eager,
-        apply_mode: None,
-        apply_mtime: None,
-        extra_sources: Vec::new(),
-        expect_peer_path: None,
+    let request = {
+        let mut rq = ReceiveRequest::new(file.clone(), local_source);
+        rq.force_checksum = force_checksum;
+        rq.eager = eager;
+        rq
     };
     let pipeline = PipelineConfig::default();
     let outcome = match receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -728,15 +726,15 @@ fn run_tree_send(opts: TreeSendOpts) -> std::io::Result<()> {
         (stream, connect_worker)
     };
     let mut stream = buffered(stream);
-    let request = TreeSendRequest {
-        root,
-        force_checksum,
-        no_delete: false, // the sender never deletes; the flag is receiver-side
-        excludes,
-        parallel,
-        dry_run,
-        eager,
-        connect_worker: std::sync::Arc::new(connect_worker),
+    let request = {
+        let mut rq = TreeSendRequest::new(root);
+        rq.force_checksum = force_checksum;
+        rq.excludes = excludes;
+        rq.parallel = parallel;
+        rq.dry_run = dry_run;
+        rq.eager = eager;
+        rq.connect_worker = std::sync::Arc::new(connect_worker);
+        rq
     };
     let pipeline = PipelineConfig::default();
     let outcome = match tree_send(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -877,14 +875,15 @@ fn run_tree_receive(opts: TreeReceiveOpts) -> std::io::Result<()> {
         }
     };
     let mut stream = buffered(stream);
-    let request = TreeReceiveRequest {
-        root,
-        force_checksum,
-        no_delete,
-        excludes,
-        accept_worker: std::sync::Arc::new(accept_worker),
-        dry_run,
-        eager,
+    let request = {
+        let mut rq = TreeReceiveRequest::new(root);
+        rq.force_checksum = force_checksum;
+        rq.no_delete = no_delete;
+        rq.excludes = excludes;
+        rq.accept_worker = std::sync::Arc::new(accept_worker);
+        rq.dry_run = dry_run;
+        rq.eager = eager;
+        rq
     };
     let pipeline = PipelineConfig::default();
     let outcome = match tree_receive(&mut stream, &request, &pipeline, &mut |p| display.update(p)) {
@@ -1131,6 +1130,7 @@ impl TreeDisplay {
             TreeProgress::Deleting(n, bytes) => {
                 self.set_line(format!("deleting  {} removed ({})", n, fmt_bytes(bytes)));
             }
+            _ => {}
         }
     }
 
@@ -1166,6 +1166,7 @@ impl TreeDisplay {
             Progress::Verifying => "verifying".to_string(),
             Progress::NothingToDo => "up to date".to_string(),
             Progress::CreatedEmpty => "created (empty file)".to_string(),
+            _ => return,
         };
         self.set_line(format!("sync      {}  {}", file, inner));
     }

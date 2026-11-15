@@ -27,15 +27,8 @@ const BYTES_PER_HASH_WORKER: usize = 4 * 1024 * 1024;
 /// Pipeline concurrency settings. Only concurrency lives here: nothing in
 /// this struct changes the chunk layout.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PipelineConfig {
-    /// Ignored. The region size changes where chunks are cut, so it is the
-    /// fixed protocol constant [`REGION_SIZE`]; setting a different value
-    /// here used to produce chunk lists no peer could match.
-    #[deprecated(
-        since = "1.4.0",
-        note = "ignored: the region size is the protocol constant REGION_SIZE"
-    )]
-    pub read_buffer_size: usize,
     /// Capacity of the bounded work and result channels.
     pub chunk_queue_size: usize,
     /// Upper bound on hash workers (and on chunker threads) per scan. A
@@ -44,11 +37,9 @@ pub struct PipelineConfig {
 }
 
 impl Default for PipelineConfig {
-    #[allow(deprecated)] // the field still has to be initialized
     fn default() -> Self {
         let cores = num_cpus::get();
         Self {
-            read_buffer_size: REGION_SIZE,
             chunk_queue_size: 2000,
             hash_workers: cores,
         }
