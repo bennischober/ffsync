@@ -312,11 +312,14 @@ fn validate_hello(peer: &Hello, ours_role: Role) -> Result<Hello, (ErrorCode, St
         // rejected, not just see a hangup (found by the version-mismatch
         // loopback test: the v0.1 code wrote the ERROR frame into a
         // throwaway buffer).
+        // The text names our release (D25) so the user learns which machine
+        // to upgrade; the release itself never gates a session.
         return Err((
             ErrorCode::Version,
             format!(
-                "unsupported protocol version {} (this peer speaks {})",
+                "unsupported protocol version {} (this peer, ffsync {}, speaks {})",
                 peer.version,
+                env!("CARGO_PKG_VERSION"),
                 super::VERSION
             ),
         ));

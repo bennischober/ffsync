@@ -157,7 +157,10 @@ peer's final frame stays readable; later writes report the failure.
 
 1. Both peers connect and immediately send HELLO.
 2. Validate: magic, version equality (else ERROR 1), role conflict
-   (both 1 or both 2 → ERROR 2).
+   (both 1 or both 2 → ERROR 2). The ERROR 1 text names the rejecting
+   peer's release (D25, 2026-11) so the user knows which side to
+   upgrade. The release number is text only: no peer compares it, and
+   peers that speak the same `version` sync whatever their releases.
 3. CDC parameters: the **sender's** (min, avg, max) are authoritative; the
    receiver **MUST** use them for the temp-file re-scan (§8.2 — different
    parameters produce different chunk layouts and the roots could never
