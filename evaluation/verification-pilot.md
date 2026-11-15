@@ -21,6 +21,12 @@ bug hunts missed, and which TLA+ model would be worth building next.
   second real bug: the receiver did not check that a file conversation was
   for the path it expected, so a lying manifest got one file's bytes
   committed under another name. Fixed, with a regression test.
+- A third suite, the hostile-receiver properties (2026-11-15), drives the
+  real sender against a receiver whose frames are mutated, and checks
+  every frame the sender writes. No lie got the sender to touch its own
+  tree, name a path it does not have, or send bytes that are not its own.
+  Its control case found a third bug: `--eager --dry-run` sent the file's
+  data. Fixed, with a regression test.
 - Three spec and API observations are recorded below. Observation 3 (a
   manifest listing a file `a` and an entry `a/b`) is now fixed; the other
   two need no change.
@@ -335,6 +341,121 @@ that has not returned 20 s later is a hang finding.
 with no mutation, a `--parallel 2` session converges, nothing counts as
 applied, and the watchdog never fires.
 
+## Hostile-receiver properties
+
+`tests/hostile_receiver.rs` is the mirror image: the **real** sender
+(`tree_send`, and through it `sync::send`; plus single-file `sync::send`)
+against the real receiver, over real TCP loopback. Every frame the
+receiver writes passes through `MutatingStream`, which applies one
+scripted mutation per case to the nth frame of one receiver frame type.
+Every frame the sender writes passes through `TapStream`, which forwards
+it unchanged and checks it.
+
+```bash
+cargo test --test hostile_receiver
+PROPTEST_CASES=1500 cargo test --test hostile_receiver
+```
+
+The default is 64 cases per property, about 10 s in a debug build, so
+plain `cargo test` and CI run it. 1500 cases take
+about 4 min 40 s (both properties, debug build) and pass on current code (Windows, 2026-11-15).
+
+**What a receiver can say.** Most receiver frames are claims about its own
+disk: its manifest (TREE_BEGIN reply), its file's size and mtime (per-file
+HELLO), the chunks it has (MANIFEST_CHUNK), what it did (COMMIT_ACK's
+outcome byte, D24) and what it deleted (TREE_END report). The sender
+cannot check any of them, and a receiver that lies about its own state
+only hurts itself. So the properties do not ask the sender to detect lies.
+They ask what a lie must never make the sender do.
+
+**Mutations.** The generic ones of the sender suite (flip, drop,
+duplicate, cut after `keep` bytes, inject a frame of type `0x00..=0x12`),
+a refusal (the frame replaced by a well-formed ERROR: the receiver gives
+up at that point), plus lies that keep the frame well formed:
+
+- TREE_BEGIN reply: an entry's mtime, size, kind or mode; rename an entry
+  (also to `../escape`, `/abs`, `C:/x`, `a/../../x`, `""`); drop one; add
+  a child under an entry; add an entry; flags; `parallel`;
+- TREE_WORKER ack: a wrong index;
+- per-file HELLO: size, mtime, CDC parameters, flags, role, version, path;
+- MANIFEST_CHUNK: offset, length, a flipped hash, a hash the sender has
+  but the receiver does not, or a flood of up to 50 000 copies;
+- COMMIT_ACK payload: empty (pre-D24), `0`, `1`, an unknown byte, two
+  bytes;
+- TREE_END: any delete count and byte total.
+
+The tree property mutates TREE_BEGIN, TREE_WORKER, HELLO, MANIFEST_CHUNK,
+MANIFEST_DONE, COMMIT_ACK and TREE_END; the single-file property mutates
+HELLO, DRY_RUN_ACK, MANIFEST_CHUNK, MANIFEST_DONE, COMMIT_ACK and
+NOT_MODIFIED. A mutation counts as applied only if it changed the bytes on
+the wire.
+
+**Fixture.** The tree fixture of the sender suite, with `--no-delete`,
+`--parallel 1..=3`, `--eager`, `--dry-run` and `--checksum` drawn per case.
+The single-file fixture is one file (empty, small or multi-chunk) against
+an absent, identical, edited or unrelated receiver copy, sometimes with a
+half-written `.ffsync-tmp` from a crashed attempt (D10 resume). The
+watchdog is the sender suite's (1.5 s idle, 20 s to return).
+
+**Heap.** A counting `#[global_allocator]` records the live-heap peak of
+each session. Tests in the binary run concurrently, so another test can
+only hide a spike, never cause a false alarm.
+
+**What must hold:**
+
+1. Neither peer panics or hangs.
+2. The sender's tree is unchanged (content, size, mtime, nothing removed);
+   the only new entries are D15 indexes of its own files. Nothing outside
+   the two roots changes (canary file).
+3. Everything the sender puts on the wire comes from its own tree: every
+   path in its TREE_BEGIN, HELLO and TREE_FILE frames is one of its
+   entries, every DATA payload decompresses to bytes that hash to the
+   announced hash and are a span of one of its files, and a dry-run
+   session writes no DATA at all.
+4. Live-heap growth per session stays under 256 MiB.
+5. No unearned success: when the sender reports success, the receiver
+   did too (unless the mutation forged a whole frame in the receiver's
+   name, which looks the same as a receiver that lies); and unless the
+   mutation touched the receiver's HELLO (its in-sync claim, trusted by
+   design under the §4 fast path), every sender file reached the receiver.
+   A dry-run session leaves the receiver byte-identical. And a refused
+   sender (an ERROR in place of a receiver frame) never reports success.
+   Two narrow exemptions, both found as false alarms at 1500 cases: a
+   single-file fast-path sender (§4) is done once it has sent
+   NOT_MODIFIED and only drains, unread, so a cut or an ERROR on the
+   receiver's side after that fails only the receiver; and in a tree
+   session the receiver deletes before it writes its TREE_END reply
+   (§16.5), so a mutation of that reply can follow an earned delete pass
+   (property 6).
+6. The honest receiver stays safe while the sender reacts to a lie told
+   in its name: its files end as old content or the sender's, and a file
+   disappears only in a successful delete pass or a kind-conflict removal.
+7. When both peers succeed, their reports agree (files, in-sync count,
+   deletes), except in the labels the mutated frame carries.
+8. Control: with the mutation never applied, the session converges.
+
+`proxies_forward_honest_frames_unchanged` checks both proxies: with no
+mutation, a `--parallel 2` session converges with one delete, the tap
+finds nothing, and the watchdog never fires.
+
+**Teeth.** Two checks that the oracles catch real sender bugs. Reverting
+the dry-run eager fix below makes property 3 fail (DATA in a dry-run
+session): that is how the suite found it. A planted bug in `tree_send`
+that reads an ERROR in place of the final TREE_END reply as success, with
+no deletes, passes the generic mutations: a frame-type-`0x0B` injection
+exactly there is about one case in 4000. It is the reason the refusal
+mutation exists. With it, 64 cases still miss the planted bug, and 1500
+cases fail it in 33 s on a refused TREE_END reply. So run 1500 cases
+after sender changes. The default count is a smoke test.
+
+**Limits.** The heap oracle catches allocations sized by a field the
+receiver controls. It cannot catch slow linear growth from a flood far
+longer than a test can send; those bounds (manifest entries capped at the
+source's chunk count, eager bytes at 64 MiB, frames at 64 MiB) are
+checked by reading the code. The oracles do not check what the sender
+*prints*: a lying TREE_END report reaches the sender's summary unchanged,
+by design.
+
 ## Findings
 
 ### Bug (fixed): the tree receiver did not check which file a conversation was for
@@ -484,6 +605,30 @@ failed.
   also come from `wire_path_strategy`. With the check disabled it then
   fails with a shrunk counterexample; with the check in place it passes.
 
+### Bug (fixed): `--eager --dry-run` streamed the file's data
+
+- **Where:** `sync::send` set HELLO flag bit 1 whenever `--eager` was
+  given, dry-run or not. With an opted-in receiver eager went active, and
+  the sender streamed DATA for missing chunks during the manifest
+  exchange. The receiver's would-change answer (§7.1) only comes after the
+  plan. Protocol.md §7.1 says the dry-run sender "requests no DATA".
+- **Minimal example** (shrunk by proptest): the honest control case. One
+  small file, absent on the receiver, `--eager` on both peers,
+  `--dry-run`, no mutation. Both peers reported `WouldChange` and nothing
+  was written, but the tap saw DATA frames (oracle 3).
+- **Impact:** no data reached the receiver's disk. The preview cost the
+  transfer it was meant to avoid, though, and it put file bytes on the
+  wire in a mode that promises it does not. Tree previews were not
+  affected; they run no file conversations.
+- **Fix:** a dry-run sender never offers eager. No wire change: the
+  receiver sees a sender that did not offer eager. Protocol.md §7.1 states
+  the rule. Regression test: `eager_dry_run_sends_no_data` in
+  `tests/loopback.rs` (it fails on the old code with four DATA frames
+  before PLAN).
+- **How it was found:** the first default run of the single-file property,
+  after 59 passing cases. An unmutated control case tripped oracle 3, not a
+  mutation: the combination had no test.
+
 ## TLA+ model of the parallel-session barrier
 
 `concept/tla/ParallelSession.tla` (about 500 lines; the estimate below
@@ -606,5 +751,6 @@ Other follow-ups:
 - ~~Add a scripted hostile sender to the property suite.~~ Done: see
   "Hostile-sender properties". It mutates the real sender's frames rather
   than scripting them, which keeps every case a plausible session.
-- **Extend the hostile suite to a hostile receiver.** The sender side has
-  the same exposure (plans, ACKs, TREE_END reports) and no property yet.
+- ~~Extend the hostile suite to a hostile receiver.~~ Done 2026-11-15:
+  see "Hostile-receiver properties". It found that `--eager --dry-run`
+  sent file data (fixed).
